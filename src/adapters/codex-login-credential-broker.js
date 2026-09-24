@@ -21,7 +21,7 @@ const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const STATUS_TEXT = "Logged in using ChatGPT";
 const STATUS_TIMEOUT_MS = 90_000;
 const STATUS_OUTPUT_LIMIT = 4_096;
-const CLEANUP_TIMEOUT_MS = 10_000;
+const CLEANUP_TIMEOUT_MS = 30_000;
 const STATUS_PREPARATION_TIMEOUT_MS = 30_000;
 const MAX_STATUS_TIMEOUT_MS = 120_000;
 const MAX_STATUS_OPERATION_TIMEOUT_MS = 180_000;
@@ -89,6 +89,12 @@ export class CodexLoginCredentialBrokerError extends Error {
 
 function brokerError(code) {
   return new CodexLoginCredentialBrokerError(code);
+}
+
+function reportProbeFailure(stage) {
+  process.emitWarning(`Codex login probe ${stage}`, {
+    code: "MYDASHBOARD_CODEX_PROBE_FAILURE",
+  });
 }
 
 function failureCode(error) {
@@ -834,6 +840,11 @@ function createBroker(rawOptions, rawDependencies) {
       }
       await session.commit();
     } catch {
+      reportProbeFailure(cleanupSignal.aborted
+        ? "cleanup timed out"
+        : session === null
+          ? "cleanup preparation failed"
+          : "cleanup commit failed");
       try {
         await session?.close?.();
       } catch {
@@ -1158,6 +1169,7 @@ function createBroker(rawOptions, rawDependencies) {
       await dependencies.store.stageProbe({ codexHome, signal });
       const outcome = await runStatus(invocation, codexHome.path, signal);
       if (!outcome.reapConfirmed) {
+        reportProbeFailure("process exit could not be confirmed");
         lifecycleSafe = false;
         cleanupAllowed = false;
         failure = brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");
@@ -1345,6 +1357,7 @@ function createBroker(rawOptions, rawDependencies) {
       const staged = await lease.stage({ invocation, signal });
       const outcome = await runStatus(invocation, staged.codexHome, signal);
       if (!outcome.reapConfirmed) {
+        reportProbeFailure("process exit could not be confirmed");
         cleanupSafe = false;
         cleanupAllowed = false;
         failure = brokerError("STRUCTURED_PROVIDER_CLEANUP_FAILED");

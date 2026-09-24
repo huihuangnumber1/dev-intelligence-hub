@@ -2578,13 +2578,43 @@ test("cleanup retains an invocation whose directory depth exceeds the fixed boun
   );
 });
 
+test("cleanup accepts a Codex invocation larger than the old 16 MiB bound", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-cli-cleanup-real-size-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const events = [];
+  const runner = recordingRunner(async (invocation) => {
+    const profile = path.join(invocation.cwd, "codex-home");
+    await mkdir(profile, { recursive: true });
+    const rollout = path.join(profile, "session-rollout.jsonl");
+    await writeFile(rollout, "");
+    await truncate(rollout, 18 * 1024 * 1024);
+    const resultFile = argumentValue(invocation.args, "--output-last-message");
+    await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(
+    { ...providerOptions("codex-cli"), credentialMode: "codex-login" },
+    {
+      processRunner: runner,
+      commandLocator: recordingLocator(testDescriptor("codex-cli")),
+      environment: {},
+      temporaryRoot,
+      codexLoginCredentialBroker: recordingCodexLoginBroker(events),
+    },
+  );
+
+  await provider.generate(brainRequest());
+  assert.deepEqual(await readdir(temporaryRoot), []);
+  assert.equal(events.at(-1), "release:true");
+});
+
 test("cleanup retains an invocation whose aggregate regular-file bytes exceed the fixed bound", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-bytes-");
   const temporaryRoot = path.join(parent, "runtime");
   const runner = recordingRunner(async (invocation) => {
     const oversized = path.join(invocation.cwd, "oversized.bin");
     await writeFile(oversized, "");
-    await truncate(oversized, 16 * 1024 * 1024 + 1);
+    await truncate(oversized, 64 * 1024 * 1024 + 1);
     const resultFile = argumentValue(invocation.args, "--output-last-message");
     await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
     return successfulProcess();
