@@ -7,6 +7,7 @@ import test from "node:test";
 import { createApplication } from "../src/composition-root.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { createDashboardServer } from "../src/server.js";
+import { ownerWorkRequestForItem } from "../public/manual-work-assignment.js";
 
 const REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
 
@@ -148,10 +149,10 @@ function request(server, {
   });
 }
 
-async function composedServer(store, root, signals) {
+async function composedServer(store, root, signals, configuration = config()) {
   const clock = () => new Date();
   const application = await createApplication({
-    config: config(),
+    config: configuration,
     versionedConfiguration: false,
     externalActions: false,
     store,
@@ -264,6 +265,86 @@ test("real loopback HTTP reaches production routing, feed, ledger, graph, and re
   );
   assert.deepEqual(signals, [{ trigger: "owner_request_created" }]);
   await server.shutdown();
+});
+
+test("manual Issue requirements crosses HTTP intake and replays one durable task after restart", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "owner-issue-http-"));
+  const store = new StateStore(path.join(root, "state"));
+  const signals = [];
+  const configuration = config();
+  configuration.employees.roles["requirements-analyst"] = {
+    ...role(),
+    name: "Requirements analyst",
+    workerId: "employee-requirements-analyst",
+    permissions: { allowedIntents: ["ask_user", "handoff", "submit_delivery", "complete"] },
+  };
+  configuration.workCoordination.policy.capabilityRoles.requirements = "requirements-analyst";
+  let server = await composedServer(store, root, signals, configuration);
+  t.after(async () => {
+    if (server.listening) await server.shutdown();
+    await rm(root, { recursive: true, force: true });
+  });
+  const input = ownerWorkRequestForItem({
+    kind: "issue",
+    repo: "ExampleOrg/ProductApp",
+    number: 13303,
+    title: "Add a scan protocol",
+  }, { workType: "requirements", priority: "high", requestId: REQUEST_ID });
+
+  const untrusted = await request(server, {
+    method: "POST", pathname: "/api/work/requests", body: input,
+  });
+  assert.equal(untrusted.status, 403);
+  const missingIssue = { ...input };
+  delete missingIssue.issue;
+  for (const body of [
+    missingIssue,
+    { ...input, targetRoleId: "developer" },
+    { ...input, issue: { ...input.issue, number: 0 } },
+    { ...input, workType: "pull_request" },
+  ]) {
+    const rejected = await request(server, {
+      method: "POST", pathname: "/api/work/requests", trusted: true, body,
+    });
+    assert.equal(rejected.status, 400);
+  }
+  assert.equal((await request(server, {
+    pathname: "/api/work/requests?limit=10",
+  })).body.items.length, 0);
+
+  const created = await request(server, {
+    method: "POST", pathname: "/api/work/requests", trusted: true, body: input,
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.body.phase, "intaken");
+  assert.deepEqual(created.body.request, input);
+  assert.deepEqual(created.body.assignment.target, { type: "role", id: "requirements-analyst" });
+  const items = await request(server, { pathname: "/api/work/items?limit=10" });
+  assert.equal(items.body.items.length, 1);
+  assert.equal(items.body.items[0].event.eventType, "issue.owner_requested");
+  assert.deepEqual(items.body.items[0].event.subject, {
+    id: "github:issue:ExampleOrg/ProductApp#13303",
+    repository: "ExampleOrg/ProductApp",
+    number: 13303,
+  });
+
+  await server.shutdown();
+  server = await composedServer(store, root, signals, configuration);
+  const replay = await request(server, {
+    method: "POST", pathname: "/api/work/requests", trusted: true, body: input,
+  });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.body.deduplicated, true);
+  assert.equal(replay.body.workItemId, created.body.workItemId);
+  const conflict = await request(server, {
+    method: "POST", pathname: "/api/work/requests", trusted: true,
+    body: { ...input, priority: "urgent" },
+  });
+  assert.equal(conflict.status, 409);
+  assert.equal((await request(server, {
+    pathname: "/api/work/items?limit=10",
+  })).body.items.length, 1);
+  assert.deepEqual(signals, [{ trigger: "owner_request_created" }]);
 });
 
 test("real owner intake accepts the canonical contract maximum and rejects bodies over 72 KiB", async (t) => {
