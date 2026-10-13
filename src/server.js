@@ -3115,7 +3115,7 @@ export function createDashboardServer(
         );
         const input = requireExactJsonFields(
           ownerRequestBody,
-          [2, 3, 4].includes(ownerRequestBody?.schemaVersion)
+          [2, 3, 4, 6].includes(ownerRequestBody?.schemaVersion)
             ? [
                 "schemaVersion",
                 "requestId",
@@ -3124,7 +3124,7 @@ export function createDashboardServer(
                 "title",
                 "description",
                 "acceptanceCriteria",
-                "pullRequest",
+                ownerRequestBody.schemaVersion === 6 ? "issue" : "pullRequest",
                 ...([3, 4].includes(ownerRequestBody?.schemaVersion)
                   ? ["responsiblePerson"]
                   : []),

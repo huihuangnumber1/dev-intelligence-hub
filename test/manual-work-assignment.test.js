@@ -71,7 +71,8 @@ test("detail form coalesces double submits and reuses a failed request after reo
     kindLabel: () => "PR",
     escapeHtml: (value) => String(value ?? ""),
     dingtalkDetailMarkup: () => "", prLifecycleStatusMarkup: () => "",
-    brainAssessment: () => "", githubItemDetailMarkup: () => "", detailRows: () => "",
+    brainAssessment: () => "", issuePrDetailMarkup: () => "",
+    githubItemDetailMarkup: () => "", detailRows: () => "",
     async fetch(_url, options) {
       bodies.push(JSON.parse(options.body));
       return bodies.length === 1 ? firstResponse : {
