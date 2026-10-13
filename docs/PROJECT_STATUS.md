@@ -21,6 +21,8 @@ schemas, and documentation may change before the first stable release.
 Detailed requirements and historical verification notes are maintained in
 [`DEVELOPMENT_PLAN.md`](../DEVELOPMENT_PLAN.md) and the authoritative
 [U1–U12 plan](plans/2026-08-02-001-feat-complete-command-center-plan.md).
+The current product and requirements gaps are tracked in
+[open follow-ups](OPEN_FOLLOWUPS.md).
 Maintainers preparing a public version should also use the
 [release checklist](MAINTAINER_RELEASE_CHECKLIST.md).
 

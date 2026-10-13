@@ -54,7 +54,8 @@ const MAX_RESULT_NODES = 20_000;
 const MAX_RESULT_KEYS = 20_000;
 const MAX_CLEANUP_ENTRIES = 256;
 const MAX_CLEANUP_DEPTH = 16;
-const MAX_CLEANUP_REGULAR_BYTES = 16n * 1024n * 1024n;
+// A normal Codex turn can retain a rollout plus SQLite state above 16 MiB.
+const MAX_CLEANUP_REGULAR_BYTES = 64n * 1024n * 1024n;
 const MAX_RECOVERY_MS = 30_000;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SHARED_ROOT_STATES = new Map();

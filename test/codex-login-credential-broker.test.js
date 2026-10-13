@@ -850,6 +850,34 @@ test("cleanup failure takes precedence over cancellation and fences the broker",
   await current.broker.close();
 });
 
+test("a status probe can finish cleanup after the former ten-second limit", {
+  timeout: 20_000,
+}, async (t) => {
+  let cleanupSignal;
+  const current = await fixture(t, {
+    async prepareCleanupTrees(roots, { signal }) {
+      cleanupSignal = signal;
+      await new Promise((resolve) => setTimeout(resolve, 11_000));
+      if (signal.aborted) throw brokerFailure("STRUCTURED_PROVIDER_CLEANUP_FAILED");
+      return Object.freeze({
+        async commit() {
+          for (const identity of roots) {
+            assert.deepEqual(await directoryIdentity(identity.path), identity);
+            await rm(identity.path, { recursive: true, force: false });
+          }
+        },
+        async close() {},
+      });
+    },
+  });
+
+  assert.equal((await current.broker.readStatus()).state, "available");
+  assert.equal(cleanupSignal.aborted, false);
+  const lease = await current.broker.acquire({ signal: new AbortController().signal });
+  lease.release({ safe: true });
+  await current.broker.close();
+});
+
 test("abort plus reap failure never captures or cleans and permanently fences admission", async (t) => {
   for (const operation of ["readStatus", "checkAvailability"]) {
     await t.test(operation, async (child) => {
