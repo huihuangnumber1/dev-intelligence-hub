@@ -41,6 +41,7 @@ const NODE_TEST_ARGS = Object.freeze([
   ...NODE_SHARED_READ_ARGS,
   ...NODE_SHARED_RUNTIME_ARGS,
   "--test",
+  "--test-reporter=tap",
 ]);
 const NODE_SCRIPT_ARGS = Object.freeze([
   ...NODE_SHARED_READ_ARGS,
@@ -457,6 +458,12 @@ export class DockerTestSandbox {
 
   getProfileFingerprint(profileId) {
     return this.#profile(profileId).fingerprint;
+  }
+
+  async readProfileReadiness({ profileId }) {
+    const profile = this.#profile(profileId);
+    const imageId = await this.probe(profile.definition);
+    return { schemaVersion: 1, profileId, profileConfigDigest: profile.fingerprint, imageId };
   }
 
   async run(request) {

@@ -130,7 +130,19 @@ class FakeRunner {
     }
     const next = this.responses.shift();
     if (next instanceof Error) throw next;
-    const value = typeof next === "function" ? await next(options) : next;
+    let value = typeof next === "function" ? await next(options) : next;
+    if (options.args.includes("graphql") && value?.number !== undefined) value = {
+      data: { repository: { nameWithOwner: value.base?.repo?.full_name, pullRequest: {
+        number: value.number, url: value.html_url, state: value.merged_at ? "MERGED" : String(value.state).toUpperCase(),
+        author: value.user, changedFiles: 1, mergedAt: value.merged_at,
+        mergeCommit: value.merge_commit_sha ? { oid: value.merge_commit_sha } : null, mergedBy: value.merged_by,
+        baseRefName: value.base?.ref, baseRefOid: value.base?.sha,
+        baseRef: { name: value.base?.ref, repository: { nameWithOwner: value.base?.repo?.full_name }, target: { oid: value.base?.liveSha ?? value.base?.sha } },
+        headRefName: value.head?.ref, headRefOid: value.head?.sha,
+        headRef: value.headRefDeleted === true ? null : { name: value.head?.ref, repository: { nameWithOwner: value.head?.repo?.full_name }, target: { oid: value.head?.sha } },
+        headRepository: { nameWithOwner: value.head?.repo?.full_name },
+      } } },
+    };
     if (value?.processResult === true) return value.value;
     return {
       exitCode: 0,
@@ -275,6 +287,14 @@ test("one transport operation gives each subprocess only its remaining budget", 
     })),
     Array.from({ length: 3 }, () => ({ hasSignal: true, isSignal: true })),
   );
+});
+
+test("an aggregate push deadline preserves the configured per-request timeout", async () => {
+  const input = transportInput("push");
+  const runner = new FakeRunner([actorRecord(input), pullRequestRecord(input)]);
+  await actionTransport(runner, { clock: () => 1_000_000, timeoutMs: 60_000 })
+    .observe(input, operation(1_600_000));
+  assert.deepEqual(runner.calls.map(call => call.timeoutMs), [60_000, 60_000]);
 });
 
 test("satisfies the executor transport contract through a complete comment cycle", async () => {
@@ -521,7 +541,7 @@ test("rejects self approval and change requests before mutation while allowing C
     );
     assert.equal(runner.calls.length, 2);
     assert.equal(
-      runner.calls.some((call) => call.args.includes("POST")),
+      runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")),
       false,
     );
   }
@@ -689,8 +709,13 @@ test("updates a branch with expected_head_sha and waits for an exact merge commi
   });
 });
 
-test("delegates push once to the exact frozen controlled publisher port", async () => {
-  const input = transportInput("push");
+for (const reviewRepair of [false, true]) {
+test(`delegates ${reviewRepair ? "single-parent review repair" : "conflict merge"} push once to the exact frozen controlled publisher port`, async () => {
+  const binding = pullRequestExternalActionBinding();
+  const input = transportInput("push", binding, {
+    type: "push",
+    controlledCommitEvidence: externalActionControlledCommit(binding, { reviewRepair }),
+  });
   const published = [];
   const publisher = Object.freeze({
     async publish(request) {
@@ -738,6 +763,39 @@ test("delegates push once to the exact frozen controlled publisher port", async 
     ),
     false,
   );
+});
+}
+
+test("single-parent review repair crosses the real executor and transport without duplicate publication", async () => {
+  const binding = pullRequestExternalActionBinding();
+  const evidence = externalActionControlledCommit(binding, { reviewRepair: true });
+  const plan = pullRequestExternalActionPlan({ type: "push", controlledCommitEvidence: evidence }, { binding });
+  const envelope = pullRequestExternalActionEnvelope(plan);
+  const input = transportInput("push", binding, { type: "push", controlledCommitEvidence: evidence });
+  const before = () => [actorRecord(input), pullRequestRecord(input)];
+  const after = () => [actorRecord(input), pullRequestRecord(input, { headOid: evidence.commit.oid })];
+  const runner = new FakeRunner([...before(), ...before(), ...before(), ...after(), ...after()]);
+  let publications = 0;
+  const executor = createPullRequestExternalActionExecutor({
+    enabledActions: ["push"],
+    credentialSource: credentialSource(),
+    transport: actionTransport(runner, {
+      controlledCommitPublisher: Object.freeze({
+        async publish(request) {
+          publications += 1;
+          assert.deepEqual(request.action.controlledCommitEvidence, evidence);
+          return { status: "applied", receipt: { id: evidence.commit.oid } };
+        },
+      }),
+    }),
+    inputAuthorityVerifier: { async verify() { return structuredClone(binding); } },
+    controlledCommitVerifier: { async verify() { return structuredClone(evidence); } },
+    pushAuthorization: { async verifyPush() { return true; } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "applied", receipt: { id: evidence.commit.oid } });
+  assert.deepEqual(await executor.reconcile(envelope), { status: "already", receipt: { id: evidence.commit.oid } });
+  assert.equal(publications, 1);
+  assert.equal(runner.responses.length, 0);
 });
 
 test("merges with an expected sha before writing a recoverable proof comment", async () => {
@@ -910,6 +968,28 @@ test("actor and Head mismatches stop before every external mutation", async () =
   assert.equal(staleRunner.calls.length, 2);
 });
 
+test("a historical base SHA cannot permit a mutation after its live base moved", async () => {
+  const input = transportInput("comment");
+  const pr = pullRequestRecord(input);
+  pr.base.liveSha = externalActionOid("9");
+  const runner = new FakeRunner([actorRecord(input), pr]);
+  await assert.rejects(actionTransport(runner).perform(input), assertTransportError("GITHUB_TARGET_STALE", "absent"));
+  assert.equal(runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")), false);
+});
+
+test("terminal receipt reconciliation survives a deleted head without permitting another mutation", async () => {
+  const input = transportInput("merge");
+  const mergeCommitOid = externalActionOid("8");
+  const pr = { ...pullRequestRecord(input, { state: "merged", mergeCommitOid }), headRefDeleted: true };
+  const proof = markerRecord(input, { kind: "comment", id: 303, body: mergeProofBody(input, mergeCommitOid) });
+  const observation = await actionTransport(new FakeRunner([actorRecord(input), pr, [proof]])).observe(input);
+  assert.equal(observation.state, "merged");
+  assert.equal(observation.actionEvidence.merge.receipt.id, mergeCommitOid);
+  const runner = new FakeRunner([actorRecord(input), pr]);
+  await assert.rejects(actionTransport(runner).perform(input), assertTransportError("GITHUB_TARGET_STALE", "absent"));
+  assert.equal(runner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")), false);
+});
+
 test("fails closed at the fixed pagination bound", async () => {
   const input = transportInput("comment");
   const fullPage = Array.from({ length: 100 }, (_, index) => ({
@@ -1030,7 +1110,7 @@ test("a merge with a lost proof comment stays unknown after restart", async () =
   });
   assert.equal(recoveryRunner.calls.length, 3);
   assert.equal(
-    recoveryRunner.calls.some((call) => call.args.includes("POST")),
+    recoveryRunner.calls.some((call) => call.args.includes("POST") && !call.args.includes("graphql")),
     false,
   );
 });

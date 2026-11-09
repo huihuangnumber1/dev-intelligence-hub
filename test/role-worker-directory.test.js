@@ -2,6 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 
+test('directory preserves an optional bound admission callback and rejects invalid ports',async()=>{
+  const worker={roleId:'analyst',workerId:'analyst-worker',async view(){return {enabled:true,paused:false};},async decide(){},
+    async withDecisionAdmission(input,operation){assert.equal(this,worker);assert.equal(input.item.itemId,'work-1');return operation();}};
+  const resolved=await new RoleWorkerDirectory({workers:[worker],legacyOwnedRoleIds:[]}).resolve({type:'role',id:'analyst'});
+  assert.equal(await resolved.withDecisionAdmission({item:{itemId:'work-1'}},async()=>42),42);
+  assert.throws(()=>new RoleWorkerDirectory({workers:[{...worker,withDecisionAdmission:true}],legacyOwnedRoleIds:[]}),/admission is invalid/);
+});
+
 test("legacy PR ownership is always reserved from the new proactive loop", async () => {
   let legacyDecisionCalls = 0;
   const legacyEmployee = {

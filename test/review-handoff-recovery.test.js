@@ -40,6 +40,35 @@ test("approved handoff survives a lost browser response and restart before local
   assert.equal(f.executions, 1);
 });
 
+test('automatic approval assigns configured QA without creating a local testing request across restart', async () => {
+  const f = fixture();
+  let queue = f.create(); await queue.recover();
+  const item = await queue.enqueue(plan());
+  await queue.approve(item.id, request(item, { requestId: `auto-review-v1-${'a'.repeat(48)}`, reviewHandoff: selection }));
+  queue = f.create(); await queue.recover();
+  const [pending] = await queue.readReviewHandoffs();
+  assert.equal(pending.request.kind, 'review_testing_assignment');
+  assert.deepEqual(pending.request.responsiblePerson, selection.responsiblePerson);
+  let assigned = 0;
+  const reconciler = new ReviewHandoffReconciler({ confirmations: queue,
+    ownerWorkRequests: { submit: async () => assert.fail('external QA handoff must not create local test work') },
+    testingOwnersByProduct: { qt: ['tester-one'] },
+    githubAssignee: { assignAssignee() { assert.fail('automatic handoff must use the current-Head assignment path'); }, async assignReviewOutcome(input) {
+      assigned++; assert.equal(input.testingOwnerLogin, 'tester-one'); return { assigneeLogin: 'tester-one' };
+    } },
+  });
+  assert.equal((await reconciler.runCycle())[0].status, 'completed');
+  const handoff = f.state().items[0].reviewHandoff;
+  assert.equal(handoff.deliveryKind, 'assignment_only');
+  assert.equal(handoff.workItemId, null);
+  assert.equal(handoff.roleId, null);
+  assert.equal(handoff.assignedLogin, 'tester-one');
+  queue = f.create(); await queue.recover();
+  assert.deepEqual(await queue.readReviewHandoffs(), []);
+  assert.equal(assigned, 1);
+  assert.equal(f.executions, 1);
+});
+
 test("handoff is durable before external execution and immutable on duplicate approval", async () => {
   const f = fixture();
   f.executor.execute = async () => {

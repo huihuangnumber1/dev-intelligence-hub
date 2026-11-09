@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 import { promisify } from "node:util";
 import { GitObjectSnapshotter } from "../src/adapters/git-object-snapshotter.js";
 import { computeRuntimeSourceIdentity } from "../src/lib/runtime-source-identity.js";
@@ -60,11 +61,9 @@ async function commandCandidates(environment) {
   const candidates = [];
   for (const line of output.split(/\r?\n/u).filter(Boolean)) {
     if (!path.isAbsolute(line)) continue;
-    candidates.push(path.resolve(line));
     if (process.platform === "win32") {
-      const installationRoot = path.dirname(path.dirname(line));
-      candidates.push(path.join(installationRoot, "mingw64", "bin", "git.exe"));
-    }
+      candidates.push(...windowsGitImplementationCandidates(line));
+    } else candidates.push(path.resolve(line));
   }
   return [...new Set(candidates.map((candidate) => candidate.toLowerCase()))]
     .map((normalized) =>

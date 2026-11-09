@@ -9,6 +9,7 @@ import {
   manualWorkAssignmentMarkup,
   ownerWorkRequestForItem,
   createManualWorkAssignmentAttempts,
+  bindManualWorkAssignment,
 } from "../public/manual-work-assignment.js";
 
 const pullRequest = {
@@ -40,50 +41,64 @@ test("manual assignment retry keeps its request ID and frozen payload until succ
   assert.equal(attempts.requestFor(pullRequest, options).requestId, "request-5");
 });
 
-test("detail form coalesces double submits and reuses a failed request after reopening", async () => {
+test("detail retries preserve their request and reopening restores the durable assignment", async () => {
   const app = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = app.indexOf("function showDetail(item)");
   const end = app.indexOf("\nfunction codeJobActionFocusIntent", start);
   assert.ok(start >= 0 && end > start);
   let activeForm;
+  let activeContainer;
   function createForm() {
     const button = { disabled: false };
     const status = { textContent: "" };
-    const section = { outerHTML: "" };
     return {
-      button, status, section,
+      button, status,
       values: { workType: "pull_request", priority: "high" },
+      elements: { namedItem(name) { return { value: activeForm.values[name] }; } },
       querySelector(selector) { return selector.startsWith("button") ? button : status; },
-      closest() { return section; },
       addEventListener(_type, handler) { this.submit = handler; },
     };
   }
   let resolveFirst;
   const firstResponse = new Promise((resolve) => { resolveFirst = resolve; });
   const bodies = [];
+  let savedRecords = [];
   let requestIds = 0;
   const context = {
     manualWorkAssignmentAttempts: createManualWorkAssignmentAttempts(() => `id-${++requestIds}`),
-    manualWorkAssignmentMarkup,
-    dialogContent: { querySelector() { return activeForm; } },
+    bindManualWorkAssignment,
+    dialogContent: { querySelector() { return activeContainer; } },
     dialog: { showModal() {} },
-    FormData: class { constructor(form) { this.form = form; } get(key) { return this.form.values[key]; } },
     kindLabel: () => "PR",
     escapeHtml: (value) => String(value ?? ""),
     dingtalkDetailMarkup: () => "", prLifecycleStatusMarkup: () => "",
     brainAssessment: () => "", issuePrDetailMarkup: () => "",
     githubItemDetailMarkup: () => "", detailRows: () => "",
-    async fetch(_url, options) {
+    async fetch(url, options) {
+      if (options.method !== "POST") {
+        assert.equal(new URL(url, "http://localhost").searchParams.get("sourceUrl"), pullRequest.url);
+        assert.equal(options.cache, "no-store");
+        return { ok: true, async json() { return { items: savedRecords, nextCursor: null }; } };
+      }
       bodies.push(JSON.parse(options.body));
       return bodies.length === 1 ? firstResponse : {
         ok: true, status: 200,
-        async json() { return { requestId: bodies.at(-1).requestId, workItemId: "one-work-item", assignment: { target: { id: "pr-engineer" } } }; },
+        async json() {
+          const result = { requestId: bodies.at(-1).requestId, phase: "intaken", request: bodies.at(-1), workItemId: "one-work-item", assignment: { target: { id: "pr-engineer" } } };
+          savedRecords = [result];
+          return result;
+        },
       };
     },
   };
   runInNewContext(app.slice(start, end), context);
-  activeForm = createForm();
-  context.showDetail(pullRequest);
+  function reopen(item) {
+    if (activeContainer) activeContainer.isConnected = false;
+    activeForm = createForm();
+    activeContainer = { isConnected: true, innerHTML: "", querySelectorAll() { return [activeForm]; } };
+    return context.showDetail(item);
+  }
+  await reopen(pullRequest);
   const firstForm = activeForm;
   const submit = (form) => form.submit({ currentTarget: form, preventDefault() {} });
   const pending = submit(firstForm);
@@ -95,12 +110,136 @@ test("detail form coalesces double submits and reuses a failed request after reo
   assert.equal(firstForm.button.disabled, false);
   assert.equal(firstForm.button.textContent, "重试原请求");
 
-  activeForm = createForm();
-  context.showDetail({ ...pullRequest, title: "Updated title" });
+  await reopen({ ...pullRequest, title: "Updated title" });
   await submit(activeForm);
   assert.deepEqual(bodies[1], bodies[0]);
-  assert.match(activeForm.section.outerHTML, /one-work-item/);
+  assert.match(activeContainer.innerHTML, /one-work-item/);
   assert.equal(requestIds, 1);
+
+  // Even a fresh browser controller must recover the assignment from the server.
+  context.manualWorkAssignmentAttempts = createManualWorkAssignmentAttempts(() => `fresh-${++requestIds}`);
+  await reopen({ ...pullRequest, title: "Reopened after assignment" });
+  assert.match(activeContainer.innerHTML, /已分配工作/);
+  assert.match(activeContainer.innerHTML, /one-work-item/);
+  assert.match(activeContainer.innerHTML, /PR 工程师/);
+  assert.match(activeContainer.innerHTML, /<details>\s*<summary>另行分配工作/);
+  assert.doesNotMatch(activeContainer.innerHTML, /<details open/);
+  assert.equal(bodies.length, 2);
+});
+
+test("assignment history loads every page and ignores detached dialogs", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  const calls = [];
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl(url) {
+      calls.push(new URL(url, "http://localhost").searchParams.get("cursor"));
+      return { ok: true, async json() { return { items: [{ requestId: `record-${calls.length}`, request: { workType: "testing" }, phase: "intaken", assignment: { target: { id: "tester" } } }], nextCursor: calls.length === 1 ? "next-page" : null }; } };
+    },
+  });
+  assert.deepEqual(calls, [null, "next-page"]);
+  assert.match(container.innerHTML, /record-1/);
+  assert.match(container.innerHTML, /record-2/);
+  let resolve;
+  const pending = bindManualWorkAssignment(container, pullRequest, {
+    fetchImpl: () => new Promise((done) => { resolve = done; }),
+  });
+  container.isConnected = false;
+  container.innerHTML = "different dialog";
+  resolve({ ok: true, async json() { return { items: [], nextCursor: null }; } });
+  await pending;
+  assert.equal(container.innerHTML, "different dialog");
+});
+
+test("assignment detail shows current blocking and folds retired tasks into history", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  const record = (id, status, statusReason) => ({
+    requestId: id, workItemId: `work-${id}`, phase: "intaken", request: { workType: "general" },
+    assignment: { target: { id: "pr-engineer" } },
+    progress: { status, statusReason, currentTarget: { type: "role", id: "developer" } },
+  });
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() { return { ok: true, async json() { return { items: [
+      record("active", "blocked", "pr_source_cross_root_cutover_pending:predecessor"),
+      record("retired", "blocked", "pr_source_cross_root_cutover_retired"),
+      record("replaced", "superseded", "pr_source_cross_root_cutover_replaced"),
+      { ...record("unknown", "queued"), progress: null },
+    ], nextCursor: null }; } }; },
+  });
+  const [current, history] = container.innerHTML.split('<details data-assignment-history>');
+  assert.match(current, /当前分配/);
+  assert.match(current, /等待旧任务交接/);
+  assert.match(current, /开发工程师/);
+  assert.match(current, /台账状态暂不可用/);
+  assert.doesNotMatch(current, /work-retired|work-replaced/);
+  assert.match(history, /历史分配（2）/);
+  assert.match(history, /已停用/);
+  assert.match(history, /已被替代/);
+  assert.doesNotMatch(container.innerHTML, /<details[^>]* open/);
+});
+
+test("old assignments show their dates and do not imply automatic work is absent", async () => {
+  const container = { isConnected: true, innerHTML: "", querySelectorAll() { return []; } };
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() { return { ok: true, async json() { return { items: [{
+      requestId: 'old-request', workItemId: 'old-work', phase: 'intaken', request: { workType: 'general' },
+      createdAt: '2026-10-04T08:00:00.000Z', updatedAt: '2026-10-17T09:04:02.000Z',
+      assignment: { target: { id: 'orchestrator' } }, progress: { status: 'superseded' },
+    }], nextCursor: null }; } }; },
+  });
+  assert.match(container.innerHTML, /当前没有进行中的分配请求/);
+  assert.match(container.innerHTML, /创建于/);
+  assert.match(container.innerHTML, /2026-10-04/);
+  assert.match(container.innerHTML, /更新于/);
+  assert.match(container.innerHTML, /2026-10-17/);
+  assert.doesNotMatch(container.innerHTML, /<details[^>]* open/);
+});
+
+test("failed assignment lookup offers a read retry without an unverified create form", async () => {
+  let retry;
+  let reads = 0;
+  const container = { isConnected: true, innerHTML: "", querySelector() { return { addEventListener(_event, handler) { retry = handler; } }; } };
+  await bindManualWorkAssignment(container, pullRequest, {
+    async fetchImpl() {
+      reads++;
+      return { ok: false, status: 503 };
+    },
+  });
+  assert.match(container.innerHTML, /未能读取分配记录/);
+  assert.doesNotMatch(container.innerHTML, /<form/);
+  assert.equal(reads, 1);
+  assert.equal(typeof retry, "function");
+});
+
+test("reopened pending assignment resumes its stored urgent development request", async () => {
+  const input = ownerWorkRequestForItem(pullRequest, {
+    workType: "development", priority: "urgent", requestId: "saved-request-id",
+  });
+  const saved = { phase: "routed", requestId: input.requestId, request: input, assignment: { target: { id: "developer" } } };
+  let submit;
+  const button = { disabled: false };
+  const status = { textContent: "" };
+  const form = {
+    dataset: { manualWorkAssignmentResume: input.requestId },
+    querySelector(selector) { return selector.startsWith("button") ? button : status; },
+    addEventListener(_event, handler) { submit = handler; },
+  };
+  const container = { isConnected: true, innerHTML: "", querySelector() { return form; }, querySelectorAll() { return [form]; } };
+  const posts = [];
+  await bindManualWorkAssignment(container, pullRequest, {
+    attempts: createManualWorkAssignmentAttempts(() => { throw new Error("Must reuse the saved request"); }),
+    async fetchImpl(_url, options) {
+      if (options.method !== "POST") return { ok: true, async json() { return { items: [saved], nextCursor: null }; } };
+      posts.push(JSON.parse(options.body));
+      return { ok: true, async json() { return { ...saved, phase: "intaken", workItemId: "resumed-work" }; } };
+    },
+  });
+  assert.match(container.innerHTML, /分配请求已保存/);
+  assert.match(container.innerHTML, /继续原分配/);
+  assert.doesNotMatch(container.innerHTML, /<h3>已分配工作/);
+  await submit({ preventDefault() {} });
+  assert.deepEqual(posts, [input]);
+  assert.match(container.innerHTML, /已分配工作/);
+  assert.match(container.innerHTML, /resumed-work/);
 });
 
 test("PR detail offers a manual assignment form with a direct review option", () => {
@@ -111,6 +250,18 @@ test("PR detail offers a manual assignment form with a direct review option", ()
   assert.match(markup, /开发实现/);
   assert.match(markup, /测试验证/);
   assert.match(markup, /data-manual-work-assignment/);
+});
+
+test("closed PR manual assignment offers only non-code coordination work", () => {
+  for (const state of ["closed", "MERGED"]) {
+    const markup = manualWorkAssignmentMarkup({ ...pullRequest, state });
+
+    assert.doesNotMatch(markup, /PR Review \/ 推进/);
+    assert.doesNotMatch(markup, /开发实现/);
+    assert.doesNotMatch(markup, /测试验证/);
+    assert.match(markup, /需求梳理/);
+    assert.match(markup, /已关闭/);
+  }
 });
 
 test("a PR review assignment freezes the structured PR target", () => {
@@ -127,6 +278,23 @@ test("a PR review assignment freezes the structured PR target", () => {
   });
   assert.match(request.description, /github\.com\/ExampleOrg\/SoftwareApp\/pull\/23991/);
   assert.equal(request.acceptanceCriteria.length, 2);
+});
+
+test("unassigned PR development and testing keep the structured PR target", () => {
+  for (const workType of ["development", "testing"]) {
+    const request = ownerWorkRequestForItem(pullRequest, {
+      workType,
+      priority: "high",
+      requestId: "12345678-1234-4123-8123-123456789abc",
+    });
+
+    assert.equal(request.schemaVersion, 2);
+    assert.deepEqual(request.pullRequest, {
+      repository: pullRequest.repo,
+      number: pullRequest.number,
+    });
+    assert.equal("responsiblePerson" in request, false);
+  }
 });
 
 test("an Issue development assignment becomes an audited capability request", () => {
@@ -271,6 +439,7 @@ test("work view exposes an explicit historical task form", () => {
   assert.match(markup, /name="workType"/);
   assert.match(markup, /data-manual-historical-work/);
   assert.match(markup, /不会扩大自动扫描范围/);
+  assert.match(markup, /OPEN/);
 });
 
 test("manual Issue work keeps its canonical GitHub identity", () => {

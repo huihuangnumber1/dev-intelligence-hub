@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { normalizeChangePackageControlledCommitRequest } from "../src/domain/change-package-controlled-commit.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   createControlledCommitEvidence,
@@ -252,6 +253,34 @@ function fixture({ behavior, store = new MemoryStore() } = {}) {
   };
 }
 
+for (const existingIntent of [false, true]) {
+  test(`empty repair packages neither create a commit intent nor prevent restart (${existingIntent})`, async () => {
+    const executionSource = createReviewRepairCodeExecutionSource({ inputBinding: source().inputBinding, writablePaths: ["src"] });
+    const manifest = createChangePackage({ job: { id: "code-job-empty", revision: 1, recordDigest: "e".repeat(64) },
+      proposal: { id: "proposal-empty", contentDigest: "f".repeat(64) }, grant: { digest: "0".repeat(64) },
+      workspace: { id: "workspace-empty", sourceRevision: "d".repeat(64), workspaceRevision: "d".repeat(64) },
+      passedProfiles: [profile("d".repeat(64))], created: [], modified: [], deleted: [] }).manifest;
+    const request = requestFor(executionSource, manifest);
+    const store = new MemoryStore();
+    if (existingIntent) store.value = { schemaVersion: 1, revision: 1,
+      deliveries: [{ request, status: "intent", evidenceId: null, receipt: null }] };
+    const original = structuredClone(store.value);
+    let lookups = 0;
+    const service = new ChangePackageControlledCommitService({ store,
+      packageReader: { async get() { return manifest; }, async readFile() { assert.fail("no blobs to read"); } },
+      controlledCommitBuilder: { async find() { lookups++; createControlledCommitMessage({ executionSource, manifest }); },
+        async create() { assert.fail("no empty commit"); }, async verify() { assert.fail("no evidence exists"); } },
+      exclusiveLease: { async run(fn) { return fn(); } } });
+    assert.deepEqual(await service.recover(), existingIntent ? {
+      deliveries: 1, committed: 0, pending: 1,
+      emptyChangeDeliveryIds: [normalizeChangePackageControlledCommitRequest(request).deliveryId],
+    } : { deliveries: 0, committed: 0, pending: 0 });
+    await assert.rejects(service.delivery().deliver(request), { code: "CONTROLLED_COMMIT_DELIVERY_NO_CHANGES" });
+    assert.equal(lookups, 0);
+    assert.deepEqual(store.value, original);
+  });
+}
+
 test("delivery loads sealed blobs internally, verifies evidence, and reuses its durable receipt", async () => {
   const setup = fixture();
   assert.deepEqual(await setup.service.recover(), {
@@ -358,4 +387,59 @@ test("recovery fails closed before serving a tampered durable receipt", async ()
     (error) => error?.code === "CONTROLLED_COMMIT_DELIVERY_NOT_READY",
   );
   assert.equal(setup.builder.state.createCalls, 1);
+});
+
+test("sealed historical delivery recovery defers Git verification and cannot authorize delivery", async () => {
+  const setup = fixture();
+  await setup.service.recover();
+  await setup.service.delivery().deliver(setup.request);
+  const stored = structuredClone(setup.store.value);
+  const verifyCalls = setup.builder.state.verifyCalls;
+  let reads = 0;
+  setup.builder.port.readSealed = async () => { reads++; return structuredClone(setup.evidence); };
+  setup.builder.port.verify = async () => { throw Object.assign(new Error("current preparation unavailable"), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" }); };
+  const restarted = new ChangePackageControlledCommitService({
+    packageReader: setup.packageReader, controlledCommitBuilder: setup.builder.port,
+    store: setup.store, exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  assert.deepEqual(await restarted.recover(), { deliveries: 1, committed: 1, pending: 0 });
+  assert.equal(reads, 1);
+  assert.equal(setup.builder.state.verifyCalls, verifyCalls);
+  assert.deepEqual(setup.store.value, stored);
+  await assert.rejects(restarted.delivery().deliver(setup.request), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+  setup.store.value.deliveries[0].receipt.commitOid = "f".repeat(40);
+  await assert.rejects(restarted.recover(), { code: "CONTROLLED_COMMIT_DELIVERY_STATE_CORRUPTED" });
+});
+
+test("stale preparation history does not block recovery or authorize delivery", async () => {
+  const setup = fixture();
+  await setup.service.recover();
+  const receipt = await setup.service.delivery().deliver(setup.request);
+  const stored = structuredClone(setup.store.value);
+  const verify = setup.builder.port.verify;
+  setup.builder.port.verify = async () => {
+    throw Object.assign(new Error("preparation changed"), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+  };
+  const restarted = new ChangePackageControlledCommitService({
+    packageReader: setup.packageReader, controlledCommitBuilder: setup.builder.port,
+    store: setup.store, exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  assert.deepEqual(await restarted.recover(), {
+    deliveries: 1, committed: 0, pending: 1, stalePreparationDeliveryIds: [receipt.deliveryId],
+  });
+  assert.deepEqual(setup.store.value, stored);
+  await assert.rejects(restarted.delivery().deliver(setup.request), { code: "CONTROLLED_GIT_BOUNDARY_CHANGED" });
+  assert.equal(setup.builder.state.createCalls, 1);
+  setup.store.value.deliveries[0].receipt.commitOid = "f".repeat(40);
+  await assert.rejects(restarted.recover(), { code: "CONTROLLED_COMMIT_DELIVERY_STATE_CORRUPTED" });
+  setup.store.value = structuredClone(stored);
+  setup.builder.port.verify = verify;
+  // The recovered service captured its verification port; a fresh runtime
+  // must verify again before it can return the historical receipt.
+  const current = new ChangePackageControlledCommitService({
+    packageReader: setup.packageReader, controlledCommitBuilder: setup.builder.port,
+    store: setup.store, exclusiveLease: { async run(operation) { return operation(); } },
+  });
+  await current.recover();
+  assert.deepEqual(await current.delivery().deliver(setup.request), receipt);
 });

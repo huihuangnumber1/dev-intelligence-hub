@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
+import { executionIdentityFields, executionIdentityKeys, isExecutionIdentityProof } from "./test-runtime-identity.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
@@ -211,10 +212,13 @@ function normalizePassedProfiles(value, workspaceRevision, limits) {
       "workspaceRevision",
       "actionId",
       "attemptNumber",
-      "imageId",
+      ...executionIdentityKeys(profile),
       "artifacts",
     ]);
     exactObject(profile.artifacts, ["output", "stdout", "stderr"]);
+    if (!isExecutionIdentityProof(profile, IMAGE_ID) || (profile.runtimeIdentity && profile.runtimeIdentity.actionId !== profile.actionId)) {
+      throw invalid("passedProfiles 执行身份无效");
+    }
     const result = {
       id: boundedText(profile.id, "passedProfiles.id", 128, SAFE_ID),
       configDigest: sha256Text(profile.configDigest, "passedProfiles.configDigest"),
@@ -228,7 +232,7 @@ function normalizePassedProfiles(value, workspaceRevision, limits) {
         "passedProfiles.attemptNumber",
         1,
       ),
-      imageId: boundedText(profile.imageId, "passedProfiles.imageId", 256, IMAGE_ID),
+      ...executionIdentityFields(profile),
       artifacts: {
         output: normalizeArtifact(profile.artifacts.output, "artifacts.output", limits),
         stdout: normalizeArtifact(profile.artifacts.stdout, "artifacts.stdout", limits),
@@ -369,7 +373,7 @@ function createDraftChanges(value, limits) {
 
 function manifestContent({ job, proposal, grant, workspace, passedProfiles, changes }) {
   return {
-    schemaVersion: 1,
+    schemaVersion: passedProfiles.some((profile) => profile.runtimeIdentity) ? 2 : 1,
     job,
     proposal,
     grant,
@@ -392,6 +396,10 @@ function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
   for (const child of Object.values(value)) deepFreeze(child);
   return Object.freeze(value);
+}
+
+export function hasChangePackageChanges(manifest) {
+  return manifest.changes.created.length > 0 || manifest.changes.modified.length > 0 || manifest.changes.deleted.length > 0;
 }
 
 export function createChangePackage(value, { limits: limitsValue = {} } = {}) {
@@ -443,7 +451,7 @@ export function normalizeChangePackageManifest(
     "packageId",
     "packageDigest",
   ]);
-  if (value.schemaVersion !== 1) throw invalid("change package schemaVersion 无效");
+  if (![1, 2].includes(value.schemaVersion)) throw invalid("change package schemaVersion 无效");
   const job = normalizeJob(value.job);
   const proposal = normalizeProposal(value.proposal);
   const grant = normalizeGrant(value.grant);
@@ -455,6 +463,7 @@ export function normalizeChangePackageManifest(
   );
   const changes = normalizeStoredChanges(value.changes, limits);
   const content = manifestContent({ job, proposal, grant, workspace, passedProfiles, changes });
+  if (value.schemaVersion !== content.schemaVersion) throw invalid("change package schemaVersion 与执行身份不一致");
   const packageDigest = sha256Text(value.packageDigest, "packageDigest");
   const packageId = normalizeChangePackageId(value.packageId);
   if (

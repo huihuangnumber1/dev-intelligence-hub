@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
 
 import {
   RoleContextAssembler,
@@ -8,6 +9,9 @@ import {
 import { deliveryAcceptanceContractDigest } from "../src/domain/delivery-evidence-contract.js";
 import { createWorkGraphSnapshot } from "../src/domain/work-graph-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerWorkRequestEvent, createOwnerIssueEvent } from "../src/domain/owner-work-request.js";
+import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
+import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   appendPullRequestWorkSource,
   createPullRequestWorkSource,
@@ -377,6 +381,13 @@ async function assemble(fixture, options = {}) {
     ...(options.evidenceCatalog
       ? { evidenceCatalog: options.evidenceCatalog }
       : {}),
+    ...(options.failedCodeJobContextReader
+      ? { failedCodeJobContextReader: options.failedCodeJobContextReader }
+      : {}),
+    ...(options.internalReviewHandoffReader ? { internalReviewHandoffReader: options.internalReviewHandoffReader } : {}),
+    ...(options.conflictInspectionReader ? { conflictInspectionReader: options.conflictInspectionReader } : {}),
+    ...(options.ciDiagnosticReader ? { ciDiagnosticReader: options.ciDiagnosticReader } : {}),
+    ...(options.publicationReuseReader ? { publicationReuseReader: options.publicationReuseReader } : {}),
   });
   const roleId = options.roleId ?? "developer";
   return assembler.assemble({
@@ -616,6 +627,24 @@ test("adds only a validated persisted agent answer to the memory data class", as
   assert.match(packet.contextDigest, /^[a-f0-9]{64}$/);
 });
 
+test("internal review receives the server handoff as unverified developer evidence for the current Head", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  fixture.item.currentTarget.id = "pr-engineer";
+  fixture.snapshot.graph.tasks.find((task) => task.taskId === fixture.item.itemId).responsibility.id = "pr-engineer";
+  const handoff = { kind: "developer_handoff", headRefOid: "abc123", brief: "Verify the existing repair", evidence: ["developer-report:1"], evidenceAuthority: "developer_report" };
+  const options = { roleId: "pr-engineer", internalReviewHandoffReader: { async read(input) {
+    assert.deepEqual(input, { itemId: fixture.item.itemId });
+    return structuredClone(handoff);
+  } } };
+  const packet = await assemble(fixture, options);
+  assert.deepEqual(packet.context.code.internalReview, handoff);
+  assert.equal(packet.context.code.authoritativeEvidence, undefined);
+  handoff.headRefOid = "old-head";
+  await assert.rejects(assemble(fixture, options), { code: "ROLE_CONTEXT_STALE" });
+  const developer = graphFixture({ pullRequest: true });
+  await assemble(developer, { internalReviewHandoffReader: { read() { throw new Error("not a reviewer"); } } });
+});
+
 test("classifies PR source and fresh facts as code while keeping requirements present", async () => {
   const fixture = graphFixture({ pullRequest: true });
   const factCalls = [];
@@ -714,6 +743,7 @@ test("a PR source root binds context and facts to its active Head revision", asy
   const advanced = appendPullRequestWorkSource(
     initial.source,
     pullRequestAssignment(2, eventB),
+    { attemptAtActivation: 0 },
   );
   fixture.item = {
     ...fixture.item,
@@ -773,7 +803,23 @@ test("a PR source root binds context and facts to its active Head revision", asy
   }]);
 });
 
-test("PR review material is checked against the atomic target reconstructed from the source event", async () => {
+test("conflict material readers are scoped to developer conflict tasks and failures stay explicit", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  fixture.item.event.payload.nextAction = "resolve_conflict";
+  let calls = 0;
+  const conflictInspectionReader = { async read(input) {
+    calls += 1;
+    assert.deepEqual(input, { itemId: fixture.item.itemId, itemRevision: fixture.item.revision, inputDigest: fixture.item.inputDigest });
+    throw new Error("sealed material is unavailable");
+  } };
+  await assert.rejects(assemble(fixture, { conflictInspectionReader }),
+    error => error.code === "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE");
+  fixture.item.event.payload.nextAction = "address_review";
+  await assemble(fixture, { conflictInspectionReader });
+  assert.equal(calls, 1);
+});
+
+function atomicPullRequestFixture() {
   const fixture = graphFixture({ pullRequest: true });
   const headRefOid = "b".repeat(40);
   const gitTarget = {
@@ -842,6 +888,173 @@ test("PR review material is checked against the atomic target reconstructed from
       patchTruncated: false,
     },
   };
+  return { fixture, gitTarget, pullRequestContext };
+}
+
+test("required external Review context exposes reuse candidates without treating them as accepted evidence", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+  current.acceptanceContracts = [contract(1, [expected("reuse-review", "review-report")])];
+  pullRequestContext.materialDigest = DIGEST_C;
+  let requests = 0;
+  const candidate = { candidateId: "review-publication-candidate-" + DIGEST_A, materialDigest: DIGEST_C,
+    deliverableId: "reuse-review", verdict: "approve", requiresCurrentReview: true };
+  const packet = await assemble(fixture, { roleId: "pr-engineer", pullRequestContextReader: { async read() { return pullRequestContext; } },
+    publicationReuseReader: { async listCandidates(input) {
+      requests++; assert.deepEqual(input, { taskId: fixture.item.itemId, materialDigest: DIGEST_C });
+      return { complete: true, candidates: [candidate] };
+    } } });
+  assert.equal(requests, 1);
+  assert.deepEqual(packet.context.code.reviewPublicationReuse.candidates, [candidate]);
+  assert.equal(packet.context.code.authoritativeEvidence?.some(value => value.referenceId === candidate.candidateId) ?? false, false);
+  assert.equal(Object.isFrozen(packet.context.code.reviewPublicationReuse), true);
+});
+
+test("verified standard Review result removes inline code but preserves the whole residual task contract", async t => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+  current.acceptanceContracts = [contract(1, [expected("review", "review-report"), expected("qa-note", "text-report")])];
+  pullRequestContext.materialDigest = DIGEST_C;
+  pullRequestContext.reviewMaterial.patch = "diff preview ".repeat(5000);
+  const candidate = { candidateId: "review-publication-candidate-" + DIGEST_A, materialDigest: DIGEST_C,
+    deliverableId: "review", verdict: "approve", requiresCurrentReview: true };
+  let verifiedResult;
+  const options = { roleId: "pr-engineer", pullRequestContextReader: { async read() { return pullRequestContext; } },
+    publicationReuseReader: { async listCandidates() { return { complete: true, candidates: [candidate], ...(verifiedResult ? { verifiedResult } : {}) }; } } };
+  const full = await assemble(fixture, options);
+  verifiedResult = { ...candidate, readProofId: "review-read-proof-" + DIGEST_B, coverageDigest: DIGEST_B };
+  const reused = await assemble(fixture, options);
+  assert.equal(reused.context.code.pullRequest.reviewMaterial, undefined);
+  assert.deepEqual(reused.context.requirements.currentTask, full.context.requirements.currentTask);
+  assert.equal(reused.context.requirements.currentTask.acceptanceContract.expectedDeliverables.length, 2);
+  assert.ok(JSON.stringify(full.context).length - JSON.stringify(reused.context).length > 60000);
+  assert.equal(reused.context.code.authoritativeEvidence?.length ?? 0, 0, "candidate is not an accepted delivery");
+  t.diagnostic(JSON.stringify({ fixture: "same-current-task-context", fullContextBytes: Buffer.byteLength(JSON.stringify(full.context)),
+    reusedContextBytes: Buffer.byteLength(JSON.stringify(reused.context)), remainingDeliverables: 2 }));
+});
+
+test("root Review recovery uses current host candidates rather than one historical rejection code", async (t) => {
+  for (const code of ["ROLE_DECISION_PR_REVIEW_REQUIRED", "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION"]) await t.test(code, async () => {
+    const { fixture, pullRequestContext, gitTarget } = atomicPullRequestFixture();
+    const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.owner_requested",
+      occurredAt: fixture.item.event.occurredAt, source: { provider: "local-owner", scopeId: "owner-request:00000000-0000-4000-8000-000000000001" },
+      subject: fixture.item.event.subject, payload: { gitTarget, gitTargetAvailable: true, headRefOid: gitTarget.headRefOid,
+        workType: "general", nextAction: "rereview", suggestedCapability: "pr-review", expectedHeadRefOid: gitTarget.headRefOid } });
+    const envelope = pullRequestAssignment(1, event);
+    envelope.assignment.target.id = "orchestrator";
+    const source = createPullRequestWorkSource(envelope).source;
+    fixture.item = { ...fixture.item, event, source, inputDigest: source.current.inputDigest, currentTarget: { type: "role", id: "orchestrator" } };
+    const current = fixture.snapshot.graph.tasks.find(value => value.taskId === fixture.item.itemId);
+    current.parentTaskId = null; current.responsibility.id = "orchestrator"; current.dependsOn = [];
+    fixture.snapshot.graph.tasks.push(task({ taskId: "blocked-review", revision: 17, status: "failed", roleId: "pr-engineer",
+      parentTaskId: current.taskId, contracts: [contract(1, [expected("review", "review-report")])] }));
+    const childState = { ...state("blocked-review", 17), ledgerStatus: "blocked", statusReason: "decision_attempts_exhausted",
+      decisionFailure: { code, stage: "decision", taskRevision: 17, timelineId: `work-timeline-${DIGEST_A}`,
+        timelineDigest: DIGEST_A, recordedAt: "2026-08-03T07:00:00.000Z" } };
+    fixture.snapshot.taskStates.push(childState);
+    pullRequestContext.materialDigest = DIGEST_C;
+    let reads = 0, candidates = [{ candidateId: `review-publication-candidate-${DIGEST_B}`, materialDigest: DIGEST_C,
+      deliverableId: "review", verdict: "approve", reviewUrl: "https://github.com/octo/repo/pull/12#pullrequestreview-123", requiresCurrentReview: true }];
+    const options = { roleId: "orchestrator", pullRequestContextReader: { async read() { return pullRequestContext; } },
+      publicationReuseReader: { async listCandidates(input) {
+        reads++; assert.deepEqual(input, { taskId: "blocked-review", materialDigest: DIGEST_C });
+        return { complete: true, candidates };
+      } } };
+    const recovery = (await assemble(fixture, options)).context.code.reviewPublicationRecovery;
+    assert.equal(reads, 1);
+    assert.equal(recovery.childTaskId, "blocked-review");
+    assert.equal(recovery.childTaskRevision, 17);
+    assert.equal(recovery.requiresTaskControlChecks, true);
+    assert.match(recovery.candidates[0].replacementChildKey, /^review-reuse-[a-f0-9]{64}$/);
+    assert.equal(Object.isFrozen(recovery), true);
+    childState.ledgerStatus = "paused"; childState.decisionFailure = null;
+    assert.equal((await assemble(fixture, options)).context.code.reviewPublicationRecovery, undefined);
+    assert.equal(reads, 1, "paused work does not request recovery candidates");
+    childState.ledgerStatus = "blocked"; childState.decisionFailure = { code, stage: "decision", taskRevision: 17,
+      timelineId: `work-timeline-${DIGEST_A}`, timelineDigest: DIGEST_A, recordedAt: "2026-08-03T07:00:00.000Z" };
+    candidates = [];
+    assert.equal((await assemble(fixture, options)).context.code.reviewPublicationRecovery, undefined);
+  });
+});
+
+test("CI diagnostics retain the GitHub digest and bind the complete role context to the current Head", async () => {
+  const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();
+  const read = { async read() { return structuredClone(pullRequestContext); } };
+  const baseline = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: read });
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: read,
+    ciDiagnosticReader: { async read(request) {
+      assert.equal(request.repository, 'octo/repo'); assert.equal(request.headRefOid, gitTarget.headRefOid);
+      assert.equal(request.headRefName, gitTarget.headRefName); assert.ok(request.maximumBytes <= 12000);
+      const diagnostic = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+        reports: [{ state: 'available', result: 'FAILURE', untrustedEvidence: true, failures: [{ name: 'Formatting', text: 'actual failure' }] }] };
+      return { ...diagnostic, contentDigest: canonicalJsonDigest(diagnostic) };
+    } } });
+  assert.deepEqual(packet.context.code.pullRequest, baseline.context.code.pullRequest);
+  assert.equal(packet.context.code.pullRequest.contentDigest, pullRequestContext.contentDigest);
+  assert.equal(packet.context.code.ciDiagnostics.reports[0].result, 'FAILURE');
+  assert.notEqual(packet.contextDigest, baseline.contextDigest);
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= 128 * 1024);
+});
+
+test("CI outages, stale evidence and oversized evidence do not block the role or leak adapter errors", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  for (const read of [async () => { throw new Error('private fixture-password'); }, async () => ({ schemaVersion: 1, repository: 'other/repo', headRefOid: '9'.repeat(40), reports: [], contentDigest: '0'.repeat(64) }),
+    async () => ({ oversized: 'x'.repeat(200000) })]) {
+    const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: { async read() { return pullRequestContext; } }, ciDiagnosticReader: { read } });
+    assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+    assert.ok(!JSON.stringify(packet).includes('fixture-password'));
+  }
+});
+
+test("legacy PR contexts without an atomic Git target skip optional CI without blocking the role", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...oldEvent } = fixture.item.event;
+  const { gitTarget, ...payload } = oldEvent.payload;
+  const event = normalizeWorkflowEvent({ ...oldEvent, payload: { ...payload, gitTargetAvailable: false } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  fixture.item = { ...fixture.item, event, source, inputDigest: source.current.inputDigest };
+  let reads = 0;
+  delete pullRequestContext.reviewMaterial;
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: { async read() { return pullRequestContext; } },
+    ciDiagnosticReader: { async read() { reads++; throw new Error('must not read legacy target'); } } });
+  assert.equal(reads, 0);
+  assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+});
+
+test("otherwise current CI material must keep its digest and fit the whole packet budget", async () => {
+  const { fixture, pullRequestContext } = atomicPullRequestFixture();
+  const reader = { async read() { return pullRequestContext; } };
+  for (const mode of ['changed-digest', 'too-large']) {
+    const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader,
+      ciDiagnosticReader: { async read(request) {
+        const material = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+          reports: [{ state: 'available', text: mode === 'too-large' ? 'x'.repeat(request.maximumBytes) : 'original' }] };
+        const result = { ...material, contentDigest: canonicalJsonDigest(material) };
+        if (mode === 'changed-digest') result.reports[0].text = 'tampered';
+        return result;
+      } } });
+    assert.equal(packet.context.code.ciDiagnostics.state, 'unavailable');
+  }
+  for (const task of fixture.snapshot.graph.tasks.filter(task => ['task-requirements', 'task-implementation'].includes(task.taskId))) {
+    for (const delivery of task.deliveries.filter(delivery => ['submitted', 'accepted'].includes(delivery.status))) delivery.summary = 'x'.repeat(15000);
+  }
+  const baseline = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader });
+  pullRequestContext.reviewMaterial.patch += 'x'.repeat(128 * 1024 - Buffer.byteLength(JSON.stringify(baseline)) - 2000);
+  let requestedBudget;
+  const packet = await assemble(fixture, { roleId: 'pr-engineer', pullRequestContextReader: reader,
+    ciDiagnosticReader: { async read(request) {
+      requestedBudget = request.maximumBytes;
+      const material = { schemaVersion: 1, repository: request.repository, headRefOid: request.headRefOid,
+        reports: [{ state: 'available', text: 'x'.repeat(request.maximumBytes - 350) }] };
+      return { ...material, contentDigest: canonicalJsonDigest(material) };
+    } } });
+  assert.ok(requestedBudget >= 256 && requestedBudget < 3000);
+  assert.equal(packet.context.code.ciDiagnostics.reports[0].state, 'available');
+  assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= 128 * 1024);
+});
+
+test("PR review material is checked against the atomic target reconstructed from the source event", async () => {
+  const { fixture, gitTarget, pullRequestContext } = atomicPullRequestFixture();
 
   const packet = await assemble(fixture, {
     roleId: "pr-engineer",
@@ -903,6 +1116,7 @@ test("a PR graph child gives its brain the inherited exact Head binding", async 
   const advanced = appendPullRequestWorkSource(
     initial.source,
     pullRequestAssignment(2, eventB),
+    { attemptAtActivation: 0 },
   );
   const sourceBinding = currentWorkItemInputBinding({
     itemId: "pr-source-root",
@@ -1735,6 +1949,16 @@ test("does not project specialist rejection feedback from a root task", async ()
   assert.equal(JSON.stringify(packet).includes("SECRET-ROOT-REJECTION"), false);
 });
 
+test("a root orchestrator receives recovered Review diagnostics without a synthetic Review delivery", async () => {
+  const fixture = rootOrchestratorFixture();
+  fixture.item.decisionContext = { source: "proposal", referenceId: `work-intent-${DIGEST_A}`, outcome: "stale",
+    value: { kind: "host_review_diagnostic", code: "REVIEW_AUTHORIZATION_CHANGED", invalidationReason: "authorization_changed",
+      publicationExecuted: false, contractSatisfied: false }, observedAt: "2026-08-03T05:00:00.000Z", contentDigest: DIGEST_B };
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  assert.deepEqual(packet.context.code.decisionContext, fixture.item.decisionContext);
+  assert.equal(packet.context.requirements.decisionContext, undefined);
+});
+
 test("a configured root orchestrator receives exact direct-child coordination by data class", async () => {
   const fixture = rootOrchestratorFixture();
   const packet = await assemble(fixture, { roleId: "orchestrator" });
@@ -1772,6 +1996,8 @@ test("a configured root orchestrator receives exact direct-child coordination by
       "taskId",
       "taskRevision",
       "status",
+      "ledgerStatus",
+      "blockingCondition",
       "responsibility",
       "work",
       "directDependencyTaskIds",
@@ -1779,6 +2005,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
       "contractRevision",
       "deliverableCount",
       "hasMoreDeliverables",
+      "hasAcceptedRequiredReview",
       "deliverables",
     ]);
   }
@@ -1824,6 +2051,7 @@ test("a configured root orchestrator receives exact direct-child coordination by
     ({ taskId }) => taskId === "task-tester",
   );
   assert.equal(paused.status, "paused");
+  assert.equal(paused.ledgerStatus, "paused");
   assert.deepEqual(paused.directDependencyTaskIds, ["task-implementation"]);
   assert.deepEqual(paused.deliverables, [
     {
@@ -1910,6 +2138,101 @@ test("a configured root orchestrator receives exact direct-child coordination by
   assert.equal(Object.isFrozen(coordination.directChildren), true);
   assert.equal(Object.isFrozen(paused.deliverables[0]), true);
   assert.equal(Object.isFrozen(packet.context.code.childDeliveries[0]), true);
+});
+
+test("root coordination exposes a proven pre-dispatch conflict failure without raw host diagnostics", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  state.dispatchFailure = { intentId: "work-intent-conflict", code: "conflict-source-stale", downstreamCreated: false };
+  state.rawError = "PRIVATE-HOST-TRACE";
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, "conflict-source-stale");
+  assert.deepEqual(visible.dispatchFailure, state.dispatchFailure);
+  assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
+});
+
+test("root coordination exposes an unbound policy failure without claiming its cause or recovery", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  state.dispatchFailure = { intentId: "work-intent-policy", code: "policy-binding-invalid", downstreamCreated: false };
+  state.rawError = "PRIVATE-HOST-TRACE";
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const child = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(child.blockingCondition, "policy-binding-invalid");
+  assert.deepEqual(child.dispatchFailure, state.dispatchFailure);
+  assert.equal(JSON.stringify(packet).includes("PRIVATE-HOST-TRACE"), false);
+  state.dispatchFailure.downstreamCreated = true;
+  await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), error => error.code === "ROLE_CONTEXT_INVALID");
+});
+
+test("root coordination explains a verification delivery mismatch while preserving the original package contract", async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+  state.ledgerStatus = "blocked";
+  state.statusReason = "intent_failed";
+  const contract = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === state.taskId).acceptanceContracts.at(-1);
+  state.dispatchFailure = { intentId: "work-intent-verification", code: "delivery-evidence-incompatible", downstreamCreated: false,
+    operation: "verify", contractRevision: contract.revision, contractDigest: deliveryAcceptanceContractDigest(contract),
+    compatibleEvidenceKinds: ["test-report"], expectedDeliverables: contract.expectedDeliverables.map(({ deliverableId, kind }) => ({ deliverableId, kind })) };
+  const packet = await assemble(fixture, { roleId: "orchestrator" });
+  const child = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(child.blockingCondition, "delivery-evidence-incompatible");
+  assert.deepEqual(child.dispatchFailure, state.dispatchFailure);
+  for (const variant of ["contract", "operation", "output-kinds", "expected-kind", "downstream"]) {
+    const previous = structuredClone(state.dispatchFailure);
+    if (variant === "contract") state.dispatchFailure.contractRevision++;
+    if (variant === "operation") state.dispatchFailure.operation = "inspect";
+    if (variant === "output-kinds") state.dispatchFailure.compatibleEvidenceKinds = ["change-package"];
+    if (variant === "expected-kind") state.dispatchFailure.expectedDeliverables[0].kind = "test-report";
+    if (variant === "downstream") state.dispatchFailure.downstreamCreated = true;
+    await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), error => error.code === "ROLE_CONTEXT_INVALID", variant);
+    state.dispatchFailure = previous;
+  }
+});
+
+test("root coordination distinguishes settled ledger work from coarse graph progress", async (t) => {
+  for (const ledgerStatus of ["queued", "retry_wait", "blocked", "working", "waiting_external"]) {
+    await t.test(ledgerStatus, async () => {
+      const fixture = rootOrchestratorFixture();
+      const child = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === "task-current");
+      child.status = ledgerStatus === "queued" ? "pending" : "in_progress";
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === child.taskId).ledgerStatus = ledgerStatus;
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === child.taskId).statusReason = "proposal_stale";
+      const packet = await assemble(fixture, { roleId: "orchestrator" });
+      const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === child.taskId);
+      assert.equal(visible.status, child.status);
+      assert.equal(visible.ledgerStatus, ledgerStatus);
+      assert.equal(visible.blockingCondition, ledgerStatus === "blocked" ? "proposal-stale" : null);
+      assert.equal(Object.keys(visible).some((key) => ["ownerId", "leaseUntil", "statusReason"].includes(key)), false);
+    });
+  }
+  await t.test("missing legacy status stays unknown", async () => {
+    const fixture = rootOrchestratorFixture();
+    delete fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current").ledgerStatus;
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    assert.equal(packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === "task-current").ledgerStatus, null);
+  });
+  await t.test("unknown raw blocking reasons stay private", async () => {
+    const fixture = rootOrchestratorFixture();
+    const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current");
+    state.ledgerStatus = "blocked";
+    state.statusReason = "proposal_stale\nPRIVATE-DIAGNOSTIC";
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    assert.equal(packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === "task-current").blockingCondition, null);
+    assert.equal(JSON.stringify(packet).includes("PRIVATE-DIAGNOSTIC"), false);
+  });
+  for (const ledgerStatus of ["in_progress", "blocked\nSECRET-STATUS", {}]) {
+    await t.test(`invalid ledger status ${JSON.stringify(ledgerStatus)}`, async () => {
+      const fixture = rootOrchestratorFixture();
+      fixture.snapshot.taskStates.find(({ taskId }) => taskId === "task-current").ledgerStatus = ledgerStatus;
+      await assert.rejects(assemble(fixture, { roleId: "orchestrator" }), { code: "ROLE_CONTEXT_INVALID" });
+    });
+  }
 });
 
 test("root coordination excludes bounded superseded-Head history", async () => {
@@ -2018,6 +2341,36 @@ test("root coordination exposes one deterministic submitted-delivery window", as
     Buffer.byteLength(projectedCurrent.work.description, "utf8") <= 512,
     true,
   );
+});
+
+test("root coordination derives accepted required Review proof from every slot before previewing four", async (t) => {
+  for (const variant of ["accepted", "optional", "submitted", "none", "local-only"]) await t.test(variant, async () => {
+    const fixture = rootOrchestratorFixture();
+    const current = fixture.snapshot.graph.tasks.find(({ taskId }) => taskId === "task-current");
+    current.acceptanceContracts = [contract(1, [
+      ...Array.from({ length: 4 }, (_, index) => expected(`aa-support-${index}`, "text-report")),
+      expected("zz-review", variant === "local-only" ? "text-report" : "github-review", variant !== "optional"),
+    ])];
+    current.deliveries = [];
+    for (let index = 0; index < 4; index++) current.deliveries.push(...acceptedPair({
+      deliverableId: `aa-support-${index}`, contractRevision: 1, submittedRevision: index * 2 + 1,
+      submittedSummary: "Local support", acceptanceReason: "Support accepted",
+      records: [evidence("artifact", `support:${index}`, DIGEST_A)] }));
+    if (variant !== "none") {
+      const pair = acceptedPair({ deliverableId: "zz-review", contractRevision: 1, submittedRevision: 9,
+        submittedSummary: "Review receipt", acceptanceReason: "Review accepted",
+        records: [evidence(variant === "local-only" ? "artifact" : "github-review", "review:42", DIGEST_A)] });
+      current.deliveries.push(...(variant === "submitted" ? pair.slice(0, 1) : pair));
+    }
+    current.revision = 10;
+    fixture.snapshot.taskStates.find(({ taskId }) => taskId === current.taskId).taskRevision = 10;
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    const projected = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === current.taskId);
+    assert.equal(projected.deliverables.length, 4);
+    assert.equal(projected.hasMoreDeliverables, true);
+    assert.equal(projected.deliverables.every(({ kind }) => kind === "text-report"), true);
+    assert.equal(projected.hasAcceptedRequiredReview, variant === "accepted");
+  });
 });
 
 test("root coordination is canonical, digest-bound, detached, and root-only", async () => {
@@ -2147,6 +2500,37 @@ test("classifies proposal decision context as code instead of requirements", asy
   );
 });
 
+test("a failed PR repair includes its execution failure and explicit retry context", async () => {
+  const fixture = graphFixture({ pullRequest: true });
+  const event = pullRequestEvent("a".repeat(40), "2026-08-03T04:00:00.000Z");
+  const { source } = createPullRequestWorkSource(pullRequestAssignment(1, event));
+  fixture.item = {
+    ...fixture.item, event, source, inputDigest: source.current.inputDigest,
+    decisionContext: {
+      source: "proposal", outcome: "failed", referenceId: "proposal-failed",
+      value: { kind: "code_action_proposal", evidence: ["code-job:previous-job"] },
+      observedAt: "2026-08-03T04:30:00.000Z", contentDigest: DIGEST_A,
+    },
+  };
+  const failedExecution = {
+    jobId: "previous-job", failureCode: "GIT_SNAPSHOT_TIMEOUT",
+    ownerRetry: { at: "2026-08-03T04:45:00.000Z", note: "Snapshot repair verified; retry." },
+  };
+  const calls = [];
+  const packet = await assemble(fixture, {
+    failedCodeJobContextReader: { async read(input) {
+      calls.push(input);
+      return failedExecution;
+    } },
+  });
+  assert.deepEqual(packet.context.code.failedExecution, failedExecution);
+  assert.equal(packet.context.requirements.failedExecution, undefined);
+  assert.equal(calls[0].inputBinding.headRefOid, "a".repeat(40));
+  assert.equal(calls[0].itemId, fixture.item.itemId);
+  failedExecution.failureCode = "MUTATED";
+  assert.equal(packet.context.code.failedExecution.failureCode, "GIT_SNAPSHOT_TIMEOUT");
+});
+
 test("rejects a context larger than 128 KiB without truncating it", async () => {
   const fixture = graphFixture({ pullRequest: true });
   fixture.item.event.payload.large = "x".repeat(128 * 1_024);
@@ -2193,5 +2577,219 @@ test("constructor rejects accessor ports without invoking them", () => {
       new RegExp(`${portName} is invalid`),
     );
     assert.equal(getterCalls, 0);
+  }
+});
+
+test("root coordination derives owner goal controls without treating payload claims or inherited child events as ownership", async () => {
+  const request = { schemaVersion: 1, requestId: "11111111-1111-4111-8111-111111111111", workType: "general", priority: "high",
+    title: "Continue the goal", description: "Replace child plans while retaining the owner goal.", acceptanceCriteria: ["Verified delivery"] };
+  for (const kind of ["work", "issue"]) {
+    const fixture = rootOrchestratorFixture();
+    fixture.item.event = kind === "work" ? createOwnerWorkRequestEvent(request, "2026-08-03T00:00:00.000Z") :
+      createOwnerIssueEvent({ ...request, schemaVersion: 6, issue: { repository: "octo/repo", number: 42 } }, "2026-08-03T00:00:00.000Z");
+    const packet = await assemble(fixture, { roleId: "orchestrator" });
+    const coordination = packet.context.requirements.coordination;
+    assert.deepEqual(coordination.goalControl, { rootTaskId: fixture.item.itemId, owner: "local-owner",
+      cancellableTaskIds: coordination.directChildren.map(child => child.taskId).sort() });
+    assert.equal(coordination.goalControl.cancellableTaskIds.includes(fixture.item.itemId), false);
+  }
+  const nonOwner = rootOrchestratorFixture();
+  nonOwner.item.event.payload.goalControl = { owner: "local-owner" };
+  assert.equal((await assemble(nonOwner, { roleId: "orchestrator" })).context.requirements.coordination.goalControl, undefined);
+  const child = graphFixture();
+  child.item.event = createOwnerWorkRequestEvent(request, "2026-08-03T00:00:00.000Z");
+  assert.equal((await assemble(child)).context.requirements.coordination, undefined);
+});
+
+test('root coordination exposes a settled proposal failure without inferring an unstarted or safe-to-retry job', async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+  state.ledgerStatus = 'blocked'; state.statusReason = 'proposal_failed';
+  state.proposalFailure = { code: 'CODE_ACTION_PROPOSAL_FAILED', stage: 'proposal', taskRevision: state.taskRevision,
+    timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+  state.rawError = 'PRIVATE-EXECUTION-TRACE';
+  const packet = await assemble(fixture, { roleId: 'orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, 'CODE_ACTION_PROPOSAL_FAILED');
+  assert.deepEqual(visible.proposalFailure, state.proposalFailure);
+  assert.equal(Object.hasOwn(visible.proposalFailure, 'downstreamCreated'), false);
+  assert.equal(JSON.stringify(packet).includes('PRIVATE-EXECUTION-TRACE'), false);
+  state.proposalFailure.taskRevision++;
+  await assert.rejects(assemble(fixture, { roleId: 'orchestrator' }), error => error.code === 'ROLE_CONTEXT_INVALID');
+});
+
+test('root coordination exposes a retained decision rejection without claiming a delivery or granting a retry', async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+  state.ledgerStatus = 'blocked'; state.statusReason = 'decision_attempts_exhausted';
+  state.decisionFailure = { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED', stage: 'decision', taskRevision: state.taskRevision,
+    timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+  state.rawError = 'PRIVATE-DECISION-TRACE';
+  const packet = await assemble(fixture, { roleId: 'orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, 'ROLE_DECISION_PR_REVIEW_REQUIRED');
+  assert.deepEqual(visible.decisionFailure, state.decisionFailure);
+  assert.equal(Object.hasOwn(visible.decisionFailure, 'downstreamCreated'), false);
+  assert.equal(JSON.stringify(packet).includes('PRIVATE-DECISION-TRACE'), false);
+});
+
+for (const variant of ['revision', 'stage', 'code', 'timeline', 'timestamp', 'extra-field', 'accessor']) {
+  test(`decision diagnostic context rejects an invalid ${variant}`, async () => {
+    const fixture = rootOrchestratorFixture();
+    const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+    state.ledgerStatus = 'blocked'; state.statusReason = 'decision_attempts_exhausted';
+    const failure = { code: 'ROLE_DECISION_PR_REVIEW_REQUIRED', stage: 'decision', taskRevision: state.taskRevision,
+      timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+    let reads = 0;
+    if (variant === 'revision') failure.taskRevision++;
+    if (variant === 'stage') failure.stage = 'delivery';
+    if (variant === 'code') failure.code = { toString: 'not-code' };
+    if (variant === 'timeline') failure.timelineId = `work-timeline-${'b'.repeat(64)}`;
+    if (variant === 'timestamp') failure.recordedAt = 'not-a-timestamp';
+    if (variant === 'extra-field') failure.downstreamCreated = false;
+    if (variant === 'accessor') Object.defineProperty(failure, 'code', { enumerable: true, get() { reads++; return 'ROLE_DECISION_PR_REVIEW_REQUIRED'; } });
+    state.decisionFailure = failure;
+    const run = variant === 'accessor' ? new RoleContextAssembler({ graphReader: { async getSnapshot() {
+      return { ...fixture.snapshot, graph: createWorkGraphSnapshot({ graphId: fixture.snapshot.graph.graphId,
+        revision: fixture.snapshot.graph.revision, tasks: fixture.snapshot.graph.tasks }) };
+    } } }).assemble({ roleId: 'orchestrator', item: fixture.item, trigger: 'employee:orchestrator' })
+      : assemble(fixture, { roleId: 'orchestrator' });
+    await assert.rejects(run, error => error.code === 'ROLE_CONTEXT_INVALID');
+    assert.equal(reads, 0);
+  });
+}
+
+test('root coordination exposes the retained delivery failure without presenting it as an unstarted proposal', async () => {
+  const fixture = rootOrchestratorFixture();
+  const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+  state.ledgerStatus = 'blocked'; state.statusReason = 'delivery_attempts_exhausted';
+  state.deliveryFailure = { code: 'ORCHESTRATOR_EVIDENCE_REJECTED', stage: 'delivery', taskRevision: state.taskRevision,
+    timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+  state.rawError = 'PRIVATE-HOST-TRACE';
+  const packet = await assemble(fixture, { roleId: 'orchestrator' });
+  const visible = packet.context.requirements.coordination.directChildren.find(({ taskId }) => taskId === state.taskId);
+  assert.equal(visible.blockingCondition, 'ORCHESTRATOR_EVIDENCE_REJECTED');
+  assert.deepEqual(visible.deliveryFailure, state.deliveryFailure);
+  assert.equal(Object.hasOwn(visible.deliveryFailure, 'downstreamCreated'), false);
+  assert.equal(JSON.stringify(packet).includes('PRIVATE-HOST-TRACE'), false);
+});
+
+for (const variant of ['revision', 'stage', 'code', 'timeline', 'timestamp', 'extra-field', 'accessor']) {
+  test(`delivery diagnostic context rejects an invalid ${variant}`, async () => {
+    const fixture = rootOrchestratorFixture();
+    const state = fixture.snapshot.taskStates.find(({ taskId }) => taskId === 'task-current');
+    state.ledgerStatus = 'blocked'; state.statusReason = 'delivery_attempts_exhausted';
+    const failure = { code: 'ORCHESTRATOR_EVIDENCE_REJECTED', stage: 'delivery', taskRevision: state.taskRevision,
+      timelineId: `work-timeline-${'a'.repeat(64)}`, timelineDigest: 'a'.repeat(64), recordedAt: '2026-08-03T07:00:00.000Z' };
+    let reads = 0;
+    if (variant === 'revision') failure.taskRevision++;
+    if (variant === 'stage') failure.stage = 'dispatch';
+    if (variant === 'code') failure.code = { toString: 'not-code' };
+    if (variant === 'timeline') failure.timelineId = `work-timeline-${'b'.repeat(64)}`;
+    if (variant === 'timestamp') failure.recordedAt = 'not-a-timestamp';
+    if (variant === 'extra-field') failure.downstreamCreated = false;
+    if (variant === 'accessor') Object.defineProperty(failure, 'code', { enumerable: true, get() { reads++; return 'ORCHESTRATOR_EVIDENCE_REJECTED'; } });
+    state.deliveryFailure = failure;
+    const run = variant === 'accessor' ? new RoleContextAssembler({ graphReader: { async getSnapshot() {
+      return { ...fixture.snapshot, graph: createWorkGraphSnapshot({ graphId: fixture.snapshot.graph.graphId,
+        revision: fixture.snapshot.graph.revision, tasks: fixture.snapshot.graph.tasks }) };
+    } } }).assemble({ roleId: 'orchestrator', item: fixture.item, trigger: 'employee:orchestrator' })
+      : assemble(fixture, { roleId: 'orchestrator' });
+    await assert.rejects(run, error => error.code === 'ROLE_CONTEXT_INVALID');
+    assert.equal(reads, 0);
+  });
+}
+
+
+test("development receives conflict materials after a typed internal repair handoff without nextAction", async () => {
+  const { fixture: f } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...old } = f.item.event;
+  const event = normalizeWorkflowEvent({ ...old, eventType: "pull_request.internal_review_requested",
+    source: { provider: "internal-review-repair", scopeId: "internal-review:123e4567-e89b-42d3-a456-426614174000" },
+    payload: { ...old.payload, workType: "pull_request", state: "open",
+      internalReview: { kind: "own_pr_ci_repair", headRefOid: old.payload.headRefOid,
+        feedbackDigest: "c".repeat(64), publicationConfirmationId: "prior-publication", controlledCommitEvidenceId: "prior-commit" } } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  f.item = { ...f.item, currentTarget: { type: "role", id: "developer" }, event, source, inputDigest: source.current.inputDigest };
+  f.snapshot.graph.tasks.find(t => t.taskId === f.item.itemId).responsibility.id = "developer";
+  let calls = 0;
+  await assert.rejects(assemble(f, { conflictInspectionReader: { async read() { calls++; throw new Error("sealed material unavailable"); } } }),
+    { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  assert.equal(calls, 1);
+});
+
+test("owner CI development receives sealed conflict material with the original fix_ci action", async () => {
+  const { fixture: f, gitTarget } = atomicPullRequestFixture();
+  const { eventId, contentDigest, ...old } = f.item.event;
+  const event = normalizeWorkflowEvent({ ...old, eventType: "pull_request.owner_requested",
+    source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    payload: { ...old.payload, workType: "general", nextAction: "fix_ci", suggestedCapability: "development",
+      expectedHeadRefOid: gitTarget.headRefOid } });
+  const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+  f.item = { ...f.item, currentTarget: { type: "role", id: "developer" }, event, source, inputDigest: source.current.inputDigest };
+  f.snapshot.graph.tasks.find(t => t.taskId === f.item.itemId).responsibility.id = "developer";
+  const inputBinding = createPullRequestExecutionBinding({ sourceBinding: currentWorkItemInputBinding(f.item), event });
+  const preparationBinding = createConflictPreparationBinding({ gitTarget, preparation: {
+    schemaVersion: 1, preparationId: DIGEST_A, status: "conflicted",
+    baseCommitOid: gitTarget.baseRefOid, headCommitOid: gitTarget.headRefOid,
+    mergeBaseOid: "c".repeat(40), resultTreeOid: "d".repeat(40),
+    conflicts: [{ path: "src/review.js", mode: "100644" }], boundaryDigest: DIGEST_B,
+    evidenceDigest: DIGEST_C, resultObjectDigest: DIGEST_D, materialization: "full-tree",
+  } });
+  const inspection = { inputBinding, preparationBinding, files: [{ path: "src/review.js", content: "sealed conflict bytes" }] };
+  let calls = 0;
+  let material = inspection;
+  const options = { conflictInspectionReader: { async read(input) {
+    calls++;
+    assert.deepEqual(input, { itemId: f.item.itemId, itemRevision: f.item.revision, inputDigest: f.item.inputDigest });
+    if (material instanceof Error) throw material;
+    return material;
+  } } };
+  const packet = await assemble(f, options);
+  assert.equal(calls, 1);
+  assert.deepEqual(packet.context.code.conflictInspection, inspection);
+  assert.equal(packet.context.code.sourceEvent.payload.nextAction, "fix_ci");
+  material = null;
+  assert.equal((await assemble(f, options)).context.code.conflictInspection, undefined);
+  material = new Error("sealed material unavailable");
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  material = { ...inspection, inputBinding: { ...inputBinding, headRefOid: "e".repeat(40) } };
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  material = { ...inspection, preparationBinding: { ...preparationBinding,
+    gitTarget: { ...gitTarget, baseRefOid: "e".repeat(40) } } };
+  await assert.rejects(assemble(f, options), { code: "ROLE_CONTEXT_CONFLICT_INSPECTION_UNAVAILABLE" });
+  const sourceBinding = currentWorkItemInputBinding(f.item);
+  f.item = { ...f.item, kind: "graph_task", source: null, assignment: { graphTask: { sourceBinding } } };
+  material = inspection;
+  assert.deepEqual((await assemble(f, options)).context.code.conflictInspection, inspection);
+  assert.equal(calls, 6);
+});
+
+test("owner CI conflict materials remain limited to development and exact repair provenance", async (t) => {
+  for (const variant of ["other-role", "other-action", "other-capability", "stale-head", "other-relation"]) {
+    await t.test(variant, async () => {
+      const { fixture: f, gitTarget } = atomicPullRequestFixture();
+      const { eventId, contentDigest, ...old } = f.item.event;
+      const payload = { ...old.payload, workType: "general", nextAction: "fix_ci", suggestedCapability: "development",
+        expectedHeadRefOid: gitTarget.headRefOid };
+      if (variant === "other-action") payload.nextAction = "address_review";
+      if (variant === "other-capability") payload.suggestedCapability = "pr-review";
+      if (variant === "stale-head") payload.expectedHeadRefOid = "e".repeat(40);
+      if (variant === "other-relation") payload.relation = "assigned";
+      const rawEvent = { ...old, eventType: "pull_request.owner_requested",
+        source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" }, payload };
+      if (variant === "stale-head") {
+        assert.throws(() => normalizeWorkflowEvent(rawEvent), { code: "INVALID_WORKFLOW_EVENT" });
+        return;
+      }
+      const event = normalizeWorkflowEvent(rawEvent);
+      const source = createPullRequestWorkSource(pullRequestAssignment(1, event)).source;
+      const roleId = variant === "other-role" ? "pr-engineer" : "developer";
+      f.item = { ...f.item, currentTarget: { type: "role", id: roleId }, event, source, inputDigest: source.current.inputDigest };
+      f.snapshot.graph.tasks.find(task => task.taskId === f.item.itemId).responsibility.id = roleId;
+      let calls = 0;
+      await assemble(f, { roleId, conflictInspectionReader: { async read() { calls++; throw new Error("must not read"); } } });
+      assert.equal(calls, 0);
+    });
   }
 });

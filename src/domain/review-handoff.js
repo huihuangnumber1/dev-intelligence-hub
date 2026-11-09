@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeOwnerWorkRequest } from "./owner-work-request.js";
+import { isAutomaticReviewExecution } from "./automatic-review-policy.js";
 
 const REVIEW_KINDS = new Set(["github.work-proposal-review", "github.pull-request-review"]);
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
@@ -17,7 +18,7 @@ function exact(value, keys) {
 }
 export function normalizeReviewHandoffSelection(value) {
   exact(value, ["workType", "responsiblePerson"]);
-  if (!["development", "testing", "pull_request"].includes(value.workType)) throw invalid();
+  if (!["development", "testing", "pull_request", "assignment"].includes(value.workType)) throw invalid();
   let responsiblePerson = null;
   if (value.responsiblePerson !== null) {
     exact(value.responsiblePerson, ["login", "product"]);
@@ -26,6 +27,7 @@ export function normalizeReviewHandoffSelection(value) {
     responsiblePerson = { login, product };
   }
   if (value.workType === "testing" && !responsiblePerson) throw invalid();
+  if (value.workType === "assignment" && responsiblePerson !== null) throw invalid();
   return { workType: value.workType, responsiblePerson };
 }
 export function reviewHandoffRequestId(item) {
@@ -33,19 +35,33 @@ export function reviewHandoffRequestId(item) {
   return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-8${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
 }
 export function normalizeReviewHandoff(value, item = null) {
-  exact(value, ["selection", "requestId", "acceptedRequestId", "status", "attempts", "diagnosticCode", "workItemId", "roleId"]);
+  exact(value, ["selection", "requestId", "acceptedRequestId", "status", "attempts", "diagnosticCode", "workItemId", "roleId", ...(Object.hasOwn(value, "assignedLogin") ? ["assignedLogin"] : []),
+    ...(Object.hasOwn(value, "deliveryKind") ? ["deliveryKind"] : [])]);
+  if (Object.hasOwn(value, "assignedLogin") && (value.status !== "completed" || !LOGIN.test(value.assignedLogin))) throw invalid();
   const selection = normalizeReviewHandoffSelection(value.selection);
+  if (value.deliveryKind !== undefined && value.deliveryKind !== "assignment_only") throw invalid();
+  const assignmentOnly = selection.workType === "assignment" || value.deliveryKind === "assignment_only";
+  if (assignmentOnly && (!/^auto-review-v1-[a-f0-9]{48}$/.test(value.acceptedRequestId) ||
+      (item && (item.kind !== "github.work-proposal-review" ||
+        !(["REQUEST_CHANGES", "COMMENT"].includes(item.action?.reviewEvent) ||
+          (item.action?.reviewEvent === "APPROVE" && selection.workType === "testing" && selection.responsiblePerson)))))) throw invalid();
   if (!UUID.test(value.requestId) || typeof value.acceptedRequestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{6,127}$/.test(value.acceptedRequestId) ||
-      !["pending", "retrying", "completed"].includes(value.status) || !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
+      !["pending", "retrying", "completed", "stale"].includes(value.status) || !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
       (value.diagnosticCode !== null && (typeof value.diagnosticCode !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/.test(value.diagnosticCode))) ||
       [value.workItemId, value.roleId].some((entry) => entry !== null && (typeof entry !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(entry)))) throw invalid();
-  if (value.status === "completed" ? !value.workItemId || !value.roleId || value.diagnosticCode !== null : value.workItemId !== null || value.roleId !== null) throw invalid();
+  if (value.status === "completed"
+    ? value.diagnosticCode !== null || (assignmentOnly
+      ? value.workItemId !== null || value.roleId !== null || !LOGIN.test(value.assignedLogin || "")
+      : !value.workItemId || !value.roleId)
+    : value.workItemId !== null || value.roleId !== null) throw invalid();
   if (item && (!REVIEW_KINDS.has(item.kind) || item.action?.type !== "pull_request_review" || value.requestId !== reviewHandoffRequestId(item))) throw invalid();
   return { ...value, selection };
 }
 export function createReviewHandoff(item, request, policy) {
   if (!REVIEW_KINDS.has(item.kind) || item.action?.type !== "pull_request_review") throw invalid("只有 GitHub Review 可以绑定交接");
   const selection = normalizeReviewHandoffSelection(request.reviewHandoff);
+  if (selection.workType === "assignment" && (!/^auto-review-v1-[a-f0-9]{48}$/.test(request.requestId) ||
+      item.kind !== "github.work-proposal-review" || !["REQUEST_CHANGES", "COMMENT"].includes(item.action.reviewEvent))) throw invalid("只有自动 Review 修改意见或评论可以只交接作者分配");
   const person = selection.responsiblePerson;
   if (person && selection.workType === "development") {
     if (person.login.toLowerCase() !== item.actor.accountId.toLowerCase()) {
@@ -56,6 +72,8 @@ export function createReviewHandoff(item, request, policy) {
     if (!policy?.[field]?.[person.product]?.some((login) => login.toLowerCase() === person.login.toLowerCase())) throw invalid("负责人不在当前配置的交接名单中");
   }
   const result = { selection, requestId: reviewHandoffRequestId(item), acceptedRequestId: request.requestId, status: "pending", attempts: 0, diagnosticCode: null, workItemId: null, roleId: null };
+  if (selection.workType === "assignment" || (selection.workType === "testing" && item.action.reviewEvent === "APPROVE" &&
+      isAutomaticReviewExecution({ ...item, execution: { requestId: request.requestId } }))) result.deliveryKind = "assignment_only";
   reviewHandoffWorkRequest({ ...item, reviewHandoff: result });
   return result;
 }
@@ -64,6 +82,17 @@ export function reviewHandoffWorkRequest(item) {
   const match = /^([^#]+)#([1-9]\d*)$/.exec(item.target.resourceId);
   if (!match) throw invalid("Review 交接缺少明确的 PR 目标");
   const { workType, responsiblePerson } = handoff.selection;
+  if (workType === "testing" && item.action.reviewEvent === "APPROVE" &&
+      (handoff.deliveryKind === "assignment_only" || isAutomaticReviewExecution(item))) {
+    return { schemaVersion: 1, kind: "review_testing_assignment", requestId: handoff.requestId,
+      pullRequest: { repository: match[1], number: Number(match[2]) }, headRefOid: item.target.version,
+      reviewEvent: "APPROVE", responsiblePerson };
+  }
+  if (workType === "assignment" || handoff.deliveryKind === "assignment_only" ||
+      (isAutomaticReviewExecution(item) && ["REQUEST_CHANGES", "COMMENT"].includes(item.action.reviewEvent) && workType === "pull_request")) {
+    return { schemaVersion: 1, kind: "review_author_assignment", requestId: handoff.requestId,
+      pullRequest: { repository: match[1], number: Number(match[2]) }, headRefOid: item.target.version, reviewEvent: item.action.reviewEvent };
+  }
   return normalizeOwnerWorkRequest({
     schemaVersion: responsiblePerson ? workType === "testing" ? 3 : 4 : 2,
     requestId: handoff.requestId,

@@ -11,6 +11,21 @@ function batch(sequence = 1) {
   };
 }
 
+test("reconciler archives retired questions only after applying recorded answers", async () => {
+  const calls = [];
+  const reconciler = new AttentionResultReconciler({
+    attentionConsumer: { readOutbox: async () => batch() },
+    attentionMaintenance: { archiveRetired: async () => { calls.push("archive"); },
+      retrySystemQuestions: async () => { calls.push("retry"); } },
+    ledger: {
+      getSummary: async () => ({ attentionCursor: 0 }),
+      applyAttentionBatch: async () => { calls.push("apply"); return { applied: 1 }; },
+    },
+  });
+  assert.deepEqual(await reconciler.runCycle(), { applied: 1 });
+  assert.deepEqual(calls, ["apply", "retry", "archive"]);
+});
+
 test("reconciler releases the attention read before mutating the ledger", async () => {
   const calls = [];
   let reading = false;

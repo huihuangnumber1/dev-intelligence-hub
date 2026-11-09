@@ -2,19 +2,32 @@ import assert from "node:assert/strict";
 import {
   access,
   mkdir,
+  lstat,
   mkdtemp,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { GitHubAdapter } from "../src/adapters/github-adapter.js";
+import { createNativeCodexBrainProvider } from "../src/adapters/native-codex-brain-provider.js";
+import { runJson } from "../src/lib/command-runner.js";
+import { createPullRequestWorkSource, currentWorkItemExecutionBinding } from "../src/services/work-ledger-pr-source.js";
+import { createPullRequestReadFacts, createPullRequestReadIdentity, projectPullRequestReadFactsContext } from "../src/domain/pull-request-read-facts.js";
+import { ReviewPublicationAdoptionStore } from "../src/services/published-review-adoption.js";
+import { loadNativeReviewSkill } from "../src/lib/native-review-skill.js";
+import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 import {
   runBoundedValidationCommand,
 } from "../scripts/system-validation-command.mjs";
 import { OllamaBrain } from "../src/adapters/ollama-brain.js";
+import { RoutedDingTalkSummaryBrain } from "../src/adapters/routed-dingtalk-summary-brain.js";
 import { OllamaPrEmployeeReviewer } from "../src/adapters/ollama-pr-employee-reviewer.js";
 import {
   SupervisedCliBrainProvider,
@@ -30,6 +43,15 @@ import {
   createPrTriageHandoff,
 } from "../src/composition-root.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import {
+  CodeActionProposalHandler,
+  createCodeActionProposalRunnerService,
+} from "../src/services/code-action-proposal-handler.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
+import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
+import { createLocalWorkLedgerCandidateProcessor } from
+  "../src/services/work-ledger-candidate-processor.js";
 import {
   KnownCliLocator,
   materializeVerifiedCliDescriptor,
@@ -68,9 +90,6 @@ const COMMITTED_CONFIGURATION = JSON.parse(
   await readFile(path.join(import.meta.dirname, "..", "config.example.json"), "utf8"),
 );
 const OFFLINE_FIXTURE_COMMAND_TIMEOUT_MS = 30_000;
-const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
-  ? "requires a configured Windows workstation"
-  : false;
 const OFFLINE_FIXTURE_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const POWERSHELL_EXE = path.join(
   process.env.SystemRoot || process.env.WINDIR || "C:\\Windows",
@@ -128,6 +147,36 @@ test("composition triage handoff creates durable orchestrator-bound PR work", as
     createPrTriageHandoff(() => null).submit({}),
     (error) => error.code === "PR_TRIAGE_HANDOFF_NOT_READY",
   );
+});
+
+test("triage reuses current automatic Review work instead of creating a competing owner root", async () => {
+  const reads = [];
+  const input = { requestKey: "review-triage", targetRoleId: "pr-engineer", repository: "acme/repo", number: 42,
+    nextAction: "review", expectedHeadRefOid: "a".repeat(40), gitTarget: { marker: "trusted-snapshot-target" } };
+  const existing = { workItemId: "work-item-existing-review" };
+  const handoff = createPrTriageHandoff(() => ({ submit() { assert.fail("must not create another source root"); } }),
+    () => ({ async readCurrentAutomaticReviewWork(query) { reads.push(query); return existing; } }));
+  assert.deepEqual(await handoff.submit(input), existing);
+  assert.deepEqual(reads, [{ repository: input.repository, number: input.number,
+    headRefOid: input.expectedHeadRefOid, gitTarget: input.gitTarget }]);
+});
+
+test("triage falls back only when no current automatic Review matches and preserves read failures", async () => {
+  const input = { requestKey: "review-triage", targetRoleId: "pr-engineer", repository: "acme/repo", number: 42,
+    nextAction: "review", expectedHeadRefOid: "a".repeat(40), gitTarget: { marker: "trusted-snapshot-target" } };
+  let submissions = 0, reads = 0;
+  const owner = { async submit() { submissions++; return { workItemId: "work-item-new-owner" }; } };
+  let fail = false;
+  const handoff = createPrTriageHandoff(() => owner, () => ({ async readCurrentAutomaticReviewWork() {
+    reads++; if (fail) throw Object.assign(new Error("read unavailable"), { code: "EIO" }); return null;
+  } }));
+  assert.deepEqual(await handoff.submit(input), { workItemId: "work-item-new-owner" });
+  fail = true;
+  await assert.rejects(handoff.submit(input), { code: "EIO" });
+  assert.equal(submissions, 1);
+  assert.deepEqual(await handoff.submit({ ...input, targetRoleId: "developer", nextAction: "fix_ci" }),
+    { workItemId: "work-item-new-owner" });
+  assert.equal(reads, 2, "repair handoffs never reuse a Review task");
 });
 
 test("application exposes one operations runtime bound to explicit local directories", async () => {
@@ -349,7 +398,7 @@ function codeJobControlPort() {
 }
 
 function codeJobWorkerPort() {
-  return { async runCycle() {} };
+  return { async runCycle() {}, async runReady() {} };
 }
 
 function codeJobProjectionSourcePort() {
@@ -482,6 +531,8 @@ function localCoordinationStubs({ calls, closeCalls, runners }) {
     consumer: { async readOutbox() {} },
     browser: {
       async next() {},
+      async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
       async answer() {},
       async reject() {},
       async later() {},
@@ -585,14 +636,110 @@ function memoryStore() {
   };
 }
 
-async function within(milliseconds, promise) {
+test("versioned automatic composition wires durable continuations to the shared ledger and reconcilers", async () => {
+  const config = structuredClone(defaultCodeJobConfiguration());
+  config.codeExecutor = { enabled: false };
+  config.workCoordination.policy.workspaceByRepository = {};
+  config.githubActions = { ...workCoordinationConfig().githubActions, enabledActions: [], automaticReview: true };
+  const closeCalls = [], calls = {};
+  const stubs = localCoordinationStubs({ calls, closeCalls, runners: {} });
+  const ledger = await stubs.workLedgerRuntimeFactory({});
+  let scans = 0, reconciled = 0, conditions = 0;
+  Object.assign(ledger, {
+    async listClaimCandidates() { scans += 1; return { items: [], facts: [], nextCursor: null }; },
+    async readItemProgress() { return []; },
+  });
+  const application = await createApplication({
+    ...stubs, config, store: memoryStore(), versionedConfiguration: true,
+    codeJobRuntimeDependencies: { createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }) },
+    confirmationRuntimeDependencies: { createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }) },
+    configurationRuntimeFactory: configurationRuntimeFactory(config, closeCalls),
+    workLedgerRuntimeFactory: async () => ledger,
+    workProposalResultReconcilerFactory: () => ({ async runCycle() { reconciled += 1; } }),
+    workConditionWakerFactory: () => ({ async runCycle() { conditions += 1; } }),
+  });
+  try {
+    assert.ok(application.workContinuationScheduler);
+    assert.deepEqual(await application.workContinuationScheduler.runCycle({ dispatch: async () => { assert.fail('no ready work'); } }), { started: 0, skipped: null });
+    assert.deepEqual([scans, reconciled, conditions], [1, 1, 1]);
+  } finally { await application.close(); }
+});
+
+test("review handoff admits the configured GitHub and local resolution budgets", async () => {
+  const config = workCoordinationConfig();
+  config.githubActions.timeoutMs = 60_000;
+  const application = await createApplication({
+    config, store: memoryStore(),
+    ...localCoordinationStubs({
+      calls: {}, closeCalls: [],
+      runners: { "github-review-runner": { async claim() {}, async advance() {} } },
+    }),
+    confirmationRuntimeFactory: async () => ({
+      queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
+      reviewHandoffs: { async readReviewHandoffs() { return []; }, async recordReviewHandoff() {} },
+      async close() {},
+    }),
+    githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+  try {
+    const handoff = application.reviewHandoffReconciler;
+    assert.ok(handoff.timeoutMs >= 2 * config.githubActions.timeoutMs + config.workCoordination.resolveTimeoutMs);
+    assert.ok(handoff.cycleTimeoutMs > handoff.timeoutMs);
+  } finally { await application.close(); }
+});
+
+test("automatic Review publication and final execution share the trusted ledger admission reader", async () => {
+  const calls = {}, closeCalls = [];
+  const config = workCoordinationConfig();
+  config.githubActions.automaticReview = true;
+  const stubs = localCoordinationStubs({ calls, closeCalls,
+    runners: { "github-review-runner": { async claim() {}, async advance() {} } } });
+  const ledger = await stubs.workLedgerRuntimeFactory({});
+  let reads = 0;
+  ledger.readAutomaticReviewAdmission = async inputBinding => {
+    reads++;
+    return { inputBinding, admission: { kind: "owner_requested", admittedAt: "2026-10-09T09:50:00Z" } };
+  };
+  const application = await createApplication({ config, store: memoryStore(), ...stubs,
+    roleContextAssemblerFactory: options => { calls.settlementContext = options; return { async assemble() {} }; },
+    workLedgerRuntimeFactory: async () => ledger,
+    workCoordinationDependencies: { clock: () => "2026-10-09T10:00:00.000Z" },
+    confirmationRuntimeFactory: async (_config, dependencies) => {
+      calls.guard = dependencies.automaticReviewGuard;
+      return { queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(), async close() {} };
+    },
+    githubReviewProposalRunnerFactory: options => {
+      calls.publisher = options.automaticReviewPublisher;
+      return { async runCycle() {} };
+    },
+    workProposalRunnerGroupFactory: () => ({ async runCycle() {} }),
+  });
+  try {
+    assert.strictEqual(calls.settlementContext.settlementEvidenceVerifier, application.deliveryEvidence);
+    assert.equal(typeof calls.settlementContext.settlementInputAuthorityVerifier.verify, "function");
+    const head = "a".repeat(40);
+    const binding = { schemaVersion: 2, repository: "acme/repo", pullRequestNumber: 42,
+      headRefOid: head, gitTarget: { sourceAccountId: "review-account" } };
+    const item = { actor: { accountId: "review-account" }, target: { resourceId: "acme/repo#42", version: head },
+      action: { inputBinding: binding } };
+    const facts = { kind: "pull_request", state: "open", isDraft: false, ciStatus: "FAILURE", author: "developer",
+      headRefOid: head, incomingReviewFactsAvailable: true, reviewRecipient: "review-account", reviewReceivedFrom: "developer",
+      reviewReceivedAt: "2026-10-01T09:00:00Z", reviewReceivedVia: "assignee", reviewRequestEventId: "AE_42" };
+    assert.equal(await calls.publisher.eligible(facts, item), true);
+    assert.equal(await calls.guard.eligible(facts, item), true);
+    assert.equal(reads, 2);
+  } finally { await application.close(); }
+});
+
+async function within(milliseconds, promise, phase = "operation") {
   let timer;
   try {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
         timer = setTimeout(
-          () => reject(new Error("operation exceeded its test bound")),
+          () => reject(new Error(`${phase} exceeded its test bound (${milliseconds} ms)`)),
           milliseconds,
         );
       }),
@@ -974,7 +1121,7 @@ async function createOfflineProductionCliFixture(t, name) {
   });
 }
 
-function defaultCodeJobConfiguration() {
+function defaultCodeJobConfiguration({ offlineCliTimeoutMs = 30_000 } = {}) {
   const value = structuredClone(COMMITTED_CONFIGURATION);
   value.trackedRepositories = ["acme/repo"];
   value.codeExecutor = {
@@ -1016,7 +1163,7 @@ function defaultCodeJobConfiguration() {
     "offline-cli": {
       kind: "codex-cli",
       remote: true,
-      timeoutMs: 30_000,
+      timeoutMs: offlineCliTimeoutMs,
       maxResponseBytes: 128 * 1024,
       maxRequestBytes: 256 * 1024,
     },
@@ -1282,6 +1429,28 @@ test("brain provider factory keeps the role independent from its model", () => {
   assert.equal(createBrain({ enabled: false }), null);
 });
 
+test("global brain routes DingTalk summaries to the configured primary and keeps Ollama fallback", () => {
+  const brain = createBrain({
+    enabled: true,
+    provider: "ollama",
+    model: "qwen3.5:9b",
+    baseUrl: "http://127.0.0.1:11434",
+    primaryBrain: {
+      provider: "codex-login-cli",
+      model: "gpt-6-luna",
+      reasoningEffort: "medium",
+      remoteData: { requirements: false, code: false, memory: false, dingtalk: true },
+    },
+    allowRemoteDingTalkSummary: true,
+  }, { router: { async generate() { throw new Error("not invoked during construction"); } } });
+
+  assert.ok(brain instanceof RoutedDingTalkSummaryBrain);
+  assert.equal(brain.provider, "codex-login-cli");
+  assert.equal(brain.model, "gpt-6-luna");
+  assert.equal(brain.fallback.provider, "ollama");
+  assert.equal(brain.fallback.model, "qwen3.5:9b");
+});
+
 test("unknown brain providers fail explicitly", () => {
   assert.throws(
     () => createBrain({ enabled: true, provider: "future-provider" }),
@@ -1304,6 +1473,25 @@ test("the PR employee can use its own model without changing its role", () => {
   assert.equal(reviewer.provider, "ollama");
   assert.equal(reviewer.model, "special-review-model");
   assert.equal(reviewer.contextTokens, 4096);
+});
+
+test("application wires the PR promoter primary router and owns its shutdown", async () => {
+  const config = applicationConfig();
+  config.brain = { enabled: true, provider: "ollama", model: "qwen3.5:9b" };
+  config.employees.prReviewer = { enabled: true, initialPaused: true, allowRemoteCodeContext: true,
+    primaryBrain: { provider: "codex-login-cli", model: "gpt-5.6-luna", remoteData: { requirements: true, code: true, memory: false } } };
+  let constructions = 0; let closes = 0;
+  const application = await createApplication({ config, store: memoryStore(),
+    prEmployeeBrainRouterFactory() {
+      constructions += 1;
+      return { async generate() { throw new Error("No generation during construction"); }, async close() { closes += 1; } };
+    },
+  });
+  assert.equal(constructions, 1);
+  assert.equal(application.prEmployee.reviewer.model, "gpt-5.6-luna");
+  assert.equal(application.prEmployee.reviewer.fallback.model, "qwen3.5:9b");
+  await application.close();
+  assert.equal(closes, 1);
 });
 
 test("employee registry keeps role instances discoverable by id", () => {
@@ -1446,6 +1634,8 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   const attentionProducer = { async create() {} };
   const attentionConsumer = { async readOutbox() {} };
   const attentionBrowser = {
+    async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
     async next() {
       return { id: "attention-1" };
     },
@@ -1501,6 +1691,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
     workLedgerRuntimeFactory: async (options) => {
       runtimeOrder.push("ledger");
       calls.ledger = options;
+      assert.equal(await options.confirmationSettlementReader.read({ confirmationId: "before-runtime" }), undefined);
+      assert.equal(await options.obsoleteCodeJobSettler.settle({}), null);
+      assert.equal(await options.hostContextRecoveryReader.read({ itemId: "before-runtime" }), null);
       return ledgerRuntime;
     },
     dailyWorkLedgerViewFactory: ({ ledger, activeWindowDays }) => {
@@ -1551,6 +1744,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
       return {
         queue: confirmationQueue,
         producerQueue: confirmationProducerPort(),
+        confirmationSettlementReader: {
+          async read(input) { return { source: "private-confirmation", input }; },
+        },
         async close() {
           closeCalls.push("confirmation");
         },
@@ -1672,6 +1868,15 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   ]);
   assert.strictEqual(calls.ledger.store, store);
   assert.strictEqual(calls.ledger.assignmentSource, workflowRouting);
+  assert.deepEqual(await calls.ledger.confirmationSettlementReader.read({ confirmationId: "after-runtime" }), {
+    source: "private-confirmation", input: { confirmationId: "after-runtime" },
+  });
+  assert.equal(Object.isFrozen(calls.ledger.confirmationSettlementReader), true);
+  assert.equal("confirmationSettlementReader" in application, false);
+  assert.equal(Object.isFrozen(calls.ledger.obsoleteCodeJobSettler), true);
+  assert.equal("obsoleteCodeJobSettler" in application, false);
+  assert.equal(Object.isFrozen(calls.ledger.hostContextRecoveryReader), true);
+  assert.equal("hostContextRecoveryReader" in application, false);
   assert.notStrictEqual(calls.ownerWorkRetry.ledger, ledgerRuntime);
   assert.deepEqual(Object.keys(calls.ownerWorkRetry.ledger).sort(), [
     "readItemForReconciliation",
@@ -1839,7 +2044,9 @@ test("enabled work coordination composes private runtimes into frozen applicatio
   assert.deepEqual(Object.keys(application.attentionBrowser).sort(), [
     "answer",
     "later",
+    "listMaintenance",
     "next",
+    "readStatus",
     "reject",
   ]);
   assert.deepEqual(Object.keys(application.attentionCoordinator), ["next"]);
@@ -2083,6 +2290,131 @@ test("work coordination normalizes omitted timing before composing the loop and 
     );
 
     await application.close();
+  }
+});
+
+test("composed intent dispatch honors configured leases and fences expired acknowledgements", async (t) => {
+  const cases = [
+    { name: "configured lease accommodates slow delivery", leaseDurationMs: 180_000, delayMs: 35_000, delivered: 1 },
+    { name: "omitted lease preserves the dispatcher default", delayMs: 35_000, delivered: 0 },
+    { name: "configured lease still expires", leaseDurationMs: 180_000, delayMs: 180_001, delivered: 0 },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      let now = Date.parse("2026-10-14T04:00:00.000Z");
+      const clock = () => new Date(now).toISOString();
+      const config = workCoordinationConfig({ externalActions: false });
+      if (scenario.leaseDurationMs === undefined) {
+        delete config.workCoordination.leaseDurationMs;
+      } else {
+        config.workCoordination.leaseDurationMs = scenario.leaseDurationMs;
+      }
+      const event = normalizeWorkflowEvent({
+        schemaVersion: 1,
+        eventType: "issue.created",
+        occurredAt: clock(),
+        source: { provider: "github", scopeId: "lease-regression" },
+        subject: { id: "github:issue:acme/repo#42", repository: "acme/repo", number: 42 },
+        payload: { title: "Clarify acceptance", state: "open" },
+      });
+      const assignment = {
+        sequence: 1,
+        assignment: {
+          assignmentId: "workflow-assignment-lease-regression",
+          eventId: event.eventId,
+          target: { type: "role", id: "requirements-analyst" },
+          reason: "requirements",
+          createdAt: clock(),
+        },
+        event,
+      };
+      const calls = {};
+      const stubs = localCoordinationStubs({ calls, closeCalls: [], runners: {} });
+      delete stubs.workIntentDispatcherFactory;
+      delete stubs.workIntentPolicyFactory;
+      let ledger;
+      let attentionCreates = 0;
+      const application = await createApplication({
+        config,
+        store: storedValues({}),
+        externalActions: false,
+        ...stubs,
+        workCoordinationDependencies: { clock },
+        workflowRoutingRuntimeFactory: async () => ({
+          async readAssignmentBatch({ afterSequence }) {
+            return {
+              items: afterSequence === 0 ? [assignment] : [],
+              nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1,
+            };
+          },
+          async close() {},
+        }),
+        workLedgerRuntimeFactory: async (options) => {
+          ledger = await createWorkLedgerRuntime({
+            ...options,
+            clock,
+            createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+            createGuard: () => ({ ...inProcessExclusiveGuard(), async acquire() {} }),
+          });
+          return ledger;
+        },
+        attentionInboxRuntimeFactory: async () => ({
+          producer: {
+            async create() {
+              attentionCreates += 1;
+              now += scenario.delayMs;
+              return { requestId: "attention-lease-regression" };
+            },
+          },
+          consumer: { async readOutbox() {} },
+          browser: {
+            async next() {}, async answer() {}, async reject() {}, async later() {},
+            async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
+          },
+          async close() {},
+        }),
+      });
+      t.after(() => application.close());
+      await ledger.intake();
+      const queued = (await ledger.listItems()).items[0];
+      const claimed = await ledger.claim({
+        itemId: queued.itemId, expectedRevision: queued.revision,
+        workerId: "employee-requirements-analyst", leaseDurationMs: 60_000,
+      });
+      await ledger.stageIntent({
+        itemId: claimed.itemId, expectedRevision: claimed.revision,
+        leaseId: claimed.leaseId, actorId: claimed.ownerId, roleId: "requirements-analyst",
+        intent: {
+          schemaVersion: 1, type: "ask_user", summary: "Clarify acceptance", reason: "Evidence is incomplete",
+          question: "Continue with this acceptance criterion?",
+          choices: [
+            { id: "yes", label: "Continue", description: "Keep the criterion" },
+            { id: "no", label: "Revise", description: "Revise the criterion" },
+          ],
+        },
+      });
+
+      const result = await calls.coordination.dispatcher.dispatchPending();
+
+      assert.equal(attentionCreates, 1);
+      assert.equal(result.delivered, scenario.delivered, JSON.stringify(result));
+      assert.equal(result.uncertain, 1 - scenario.delivered);
+      const persisted = (await ledger.listOutbox()).items[0];
+      assert.equal(persisted.status, scenario.delivered ? "delivered" : "dispatching");
+      const item = await ledger.readItemForReconciliation({ itemId: queued.itemId });
+      assert.equal(item.status, scenario.delivered ? "waiting_user" : "dispatch_pending");
+      if (scenario.delivered) {
+        assert.equal((await calls.coordination.dispatcher.dispatchPending()).scanned, 0);
+        assert.equal(attentionCreates, 1);
+      } else {
+        assert.equal(result.items[0].code, "ack-result-uncertain");
+        assert.equal(
+          Date.parse(persisted.dispatchLeaseUntil) - Date.parse("2026-10-14T04:00:00.000Z"),
+          scenario.leaseDurationMs ?? 30_000,
+        );
+      }
+    });
   }
 });
 
@@ -2347,6 +2679,8 @@ test("enabled unified memory exposes search only and projects the existing work 
       consumer: { async readOutbox() {} },
       browser: {
         async next() {}, async answer() {}, async reject() {}, async later() {},
+        async listMaintenance() { return { items: [], total: 0 }; },
+      async readStatus() { return null; },
       },
       async close() {},
     }),
@@ -3189,6 +3523,28 @@ test("non-versioned Code Job startup adopts partial configured directory cleanup
   await lifecycle.close();
   assert.equal(cleanupAttempts, 2);
   assert.equal(lifecycle.readStatus().complete, true);
+});
+
+test("Code Job composition forwards controlled reading support through the frozen brain boundary", async () => {
+  for (const versioned of [false, true]) {
+    const config = defaultCodeJobConfiguration();
+    const calls = {}; const closeCalls = [];
+    const application = await createApplication({
+      ...defaultCodeJobApplicationOptions({ config, calls, closeCalls,
+        lifecycle: createApplicationRuntimeLifecycle(), versioned }),
+      codeJobBrainDirectoryFactory() {
+        return { async decide() {}, describe(roleId) {
+          assert.equal(roleId, "developer");
+          return { supportsCodeReading: true };
+        }, hiddenWrite() { assert.fail("must not be exposed"); }, async close() {} };
+      },
+    });
+    assert.equal(Object.isFrozen(calls.codeJobRuntime.brainDirectory), true);
+    assert.equal(typeof calls.codeJobRuntime.brainDirectory.describe, "function");
+    assert.equal((await calls.codeJobRuntime.brainDirectory.describe("developer")).supportsCodeReading, true);
+    assert.equal(Object.hasOwn(calls.codeJobRuntime.brainDirectory, "hiddenWrite"), false);
+    await application.close();
+  }
 });
 
 test("default non-versioned Code Job validates every role before CLI acquisition", async (t) => {
@@ -4073,6 +4429,310 @@ test("an explicit empty PR action allow-list remains inert and never reads trans
   await application.close();
 });
 
+test("composition keeps the Head ancestry producer private and uses its real runtime receipt path", async t => {
+  const config = structuredClone(defaultCodeJobConfiguration());
+  config.workflowRouting.enabled = true;
+  config.changePackages = { enabled: true, gitCommand: config.codeExecutor.gitCommand };
+  config.githubActions = { enabled: true, actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN",
+    ghCommand: process.execPath, automaticOwnPrRepair: true, enabledActions: [] };
+  let head = "a".repeat(40), runtime, hostile = 0;
+  const account = config.githubActions.actorAccountId, target = () => ({ schemaVersion: 1, provider: "github", sourceAccountId: account,
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid: head });
+  const calls = [], closeCalls = [];
+  t.mock.method(GitHubAdapter.prototype, "readPullRequestRoleHandoffFacts", async input => {
+    assert.equal(input.account, account); calls.push("live");
+    return { state: "open", isDraft: false, author: account, assignees: [account], gitTarget: target() };
+  });
+  t.mock.method(GitHubAdapter.prototype, "isCommitAncestor", async input => {
+    assert.equal(input.ancestorOid, "a".repeat(40)); assert.equal(input.headRefOid, head); calls.push("ancestry"); return true;
+  });
+  const base = defaultCodeJobApplicationOptions({ config, calls: {}, closeCalls, versioned: true });
+  const application = await createApplication({ ...base, store: storedValues({}),
+    codeExecutorRuntimeFactory: async () => ({ ...await base.codeExecutorRuntimeFactory(),
+      changePackageTargets: [{ workspaceId: "dashboard" }], completedChangeExporter: { async export() {} },
+      auditArtifactReader: { async read() {} },
+      controlledCommitBuilder: { async create() {}, async find() {}, async verify() {} },
+      controlledCommitPublisher: { async publish() { assert.fail("No GitHub writes"); } },
+    }),
+    changePackageRuntimeFactory: async () => ({
+      packageProducer: { async create() {} }, packageReader: { async get() {} }, applicationProducer: { async prepareConfirmation() {} },
+      applicationExecutor: { async execute() {}, async reconcile() {} }, applicationReader: { async getResult() {} },
+      applicationProjectionReader: { async getForJob() {} }, applicationProjectionWriter: { async getCheckpoint() {}, async applySnapshot() {} }, async close() {},
+    }),
+    changePackageApplicationResultReconcilerFactory: () => ({ async runCycle() {}, async runThrough() {} }),
+    codeJobEvidenceReaderFactory: () => ({ async read() {} }),
+    codeJobRuntimeFactory: async options => ({ ...await base.codeJobRuntimeFactory(options),
+      changePackageDelivery: { async runCycle() {} }, pauseRecovery: { async runCycle() {} },
+    }),
+    confirmationRuntimeFactory: async () => ({ ...await base.confirmationRuntimeFactory(),
+      applicationResultSource: { async readSnapshot() {} },
+    }),
+    workProposalRuntimeFactory: async options => {
+      const runner = { async claim() {}, async advance() {} };
+      return workProposalRuntimePort({ runners: { "code-action-runner": runner, "github-pr-action-runner": runner, "github-review-runner": runner } });
+    },
+    versionedCodeJobAuthorityFactory: () => ({ async create() {}, async verify(value) { return value; }, async decide() {}, async close() {} }),
+    githubCredentialSourceFactory: async () => Object.freeze({ async acquire() { assert.fail("No external action credentials"); } }),
+    pullRequestExternalActionDependencies: { transport: { async observe() {}, async perform() { assert.fail("No external actions"); } } },
+    pullRequestExternalActionExecutorFactory: () => ({ async execute() { assert.fail("No external actions"); }, async reconcile() {}, async close() {} }),
+    pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+    githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+    privateRuntimeDirectory: path.join(tmpdir(), "mydashboard-ancestry-composition"),
+    workLedgerDependencies: { attachHostHeadAncestry() { hostile++; } },
+    workflowRoutingDependencies: { headAncestryReader: { async read() { hostile++; return []; } } },
+    workLedgerRuntimeFactory: async options => {
+      runtime = await createWorkLedgerRuntime({ ...options, createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+        createGuard: () => ({ ...inProcessExclusiveGuard(), acquire: async () => {} }) }); return runtime;
+    },
+    workflowRoutingRuntimeFactory: (configuration, dependencies) => createWorkflowRoutingRuntime(configuration, {
+      ...dependencies, createGuard: () => ({ ...inProcessExclusiveGuard(), acquire: async () => {} }),
+    }),
+  });
+  try {
+    const ingest = async (included, time) => {
+      const snapshot = { refreshedAt: time, sourceStatus: { githubPullRequests: { ok: true, stale: false, complete: true }, githubIssues: { ok: true } },
+        items: included ? [{ id: "github:pr:acme/repo#42", kind: "pull_request", repo: "acme/repo", number: 42, title: "Bounded ancestry",
+          state: "open", isDraft: false, author: account, assignees: [account], relation: "authored", actionState: "action_now",
+          nextAction: "address_review", headRefOid: head, gitTargetAvailable: true, gitTarget: target() }] : [] };
+      await application.workflowRouting.ingestSnapshot({ snapshot }); await runtime.intake();
+    };
+    await ingest(true, "2026-08-02T01:00:00.000Z"); await ingest(false, "2026-08-02T01:01:00.000Z");
+    head = "b".repeat(40); await ingest(true, "2026-08-02T01:02:00.000Z");
+    const roots = (await runtime.listItems()).items.filter(item => item.kind === "source_root");
+    assert.equal(roots.length, 1); assert.equal(roots[0].source.current.headRefOid, head);
+    assert.ok(roots[0].source.revisions.some(revision => revision.headAncestryProof));
+    assert.deepEqual(calls, ["live", "ancestry", "live"]); assert.equal(hostile, 0);
+    assert.equal(application.headAncestryReader, undefined); assert.equal(application.recordHostHeadAncestry, undefined);
+    assert.equal(runtime.recordHostHeadAncestry, undefined); assert.equal(runtime.attachHostHeadAncestry, undefined);
+  } finally { await application.close(); }
+});
+
+test("automatic own PR repair composes internal push with ownership guards and complete feedback readers", async (t) => {
+  const scenarios = [
+    { name: "generic push disabled", explicitPush: false, expectedBudget: 119_000 },
+    { name: "generic push enabled", explicitPush: true, expectedBudget: 119_000 },
+    {
+      name: "automatic preparation can finish after the ordinary handler deadline",
+      leaseDurationMs: 1_080_000, resolveTimeoutMs: 30_000, decisionTimeoutMs: 60_000,
+      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 1_079_000,
+      elapsedMs: 240_000, expectedStatus: "succeeded",
+    },
+    {
+      name: "automatic preparation still times out before its lease expires",
+      leaseDurationMs: 90_000, resolveTimeoutMs: 5_000, decisionTimeoutMs: 10_000,
+      githubTimeoutMs: 60_000, gitTimeoutMs: 30_000, expectedBudget: 89_000,
+      elapsedMs: 89_000, expectedStatus: "waiting_retry",
+    },
+    {
+      name: "network preparation remains bounded by a short configured lease",
+      leaseDurationMs: 120_000, resolveTimeoutMs: 5_000, decisionTimeoutMs: 10_000,
+      githubTimeoutMs: 5_000, gitTimeoutMs: 2_000, expectedBudget: 119_000,
+    },
+  ];
+  for (const scenario of scenarios) {
+    const explicitPush = scenario.explicitPush === true;
+    await t.test(scenario.name, async (t) => {
+      const config = structuredClone(defaultCodeJobConfiguration());
+      config.githubActions = {
+        enabled: true, actorAccountId: "review-account", tokenEnv: "TEST_GITHUB_TOKEN",
+        ghCommand: process.execPath, automaticOwnPrRepair: true,
+        enabledActions: explicitPush ? ["push"] : [],
+      };
+      for (const field of ["leaseDurationMs", "resolveTimeoutMs", "decisionTimeoutMs"]) {
+        if (scenario[field] !== undefined) config.workCoordination[field] = scenario[field];
+      }
+      if (scenario.githubTimeoutMs !== undefined) config.githubActions.timeoutMs = scenario.githubTimeoutMs;
+      if (scenario.gitTimeoutMs !== undefined) config.codeExecutor.gitTimeoutMs = scenario.gitTimeoutMs;
+      config.changePackages = { enabled: true, gitCommand: "C:\\Program Files\\Git\\cmd\\git.exe" };
+      config.workCoordination.codeJobLimit = 9;
+      config.workCoordination.policy.configurationChangeRoles = [];
+      const calls = {};
+      const closeCalls = [];
+      const repairEnvelope = {
+        id: "unowned-repair-push", kind: "github.pull-request-push",
+        requestedBy: { roleId: "developer", workItemId: "work-42" },
+        action: { controlledCommitEvidence: { executionSource: { kind: "review_repair", inputBinding: {} } } },
+      };
+      const conflictEnvelope = {
+        ...repairEnvelope, id: "ordinary-conflict-push",
+        action: { controlledCommitEvidence: { executionSource: { kind: "conflict_preparation" } } },
+      };
+      const ciEnvelope = { ...repairEnvelope, id: 'unowned-ci-push',
+        action: { controlledCommitEvidence: { executionSource: { kind: 'ci_repair', inputBinding: {} } } } };
+      const base = defaultCodeJobApplicationOptions({
+        config, calls, closeCalls, versioned: true,
+        lifecycle: createApplicationRuntimeLifecycle(),
+        confirmationRuntimeFactory: async (_config, dependencies) => {
+          calls.confirmation = dependencies;
+          assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
+          assert.throws(() => calls.externalExecutor.pushAuthorization.verifyPush(ciEnvelope), { code: 'GITHUB_AUTHORIZATION_UNAVAILABLE' });
+          return {
+            reviewHandoffAssignee: { async assignAssignee() { throw new Error("No live assignment in composition test"); } },
+            queue: confirmationQueuePort(), producerQueue: confirmationProducerPort(),
+            memoryProjectionSource: confirmationMemoryProjectionSourcePort(),
+            applicationResultSource: { async readSnapshot() {} },
+            async close() { await dependencies.pullRequestExternalActionExecutor.close(); },
+          };
+        },
+      });
+      const application = await createApplication({
+        ...base,
+        privateRuntimeDirectory: path.join(tmpdir(), 'mydashboard-jenkins-composition', projectIdentityDigest({ projectRoot: path.resolve(import.meta.dirname, '..') })),
+        roleContextAssemblerFactory: options => { calls.contextAssembler = options; return { async assemble() {} }; },
+        workLedgerRuntimeFactory: async (options) => ({
+          ...await base.workLedgerRuntimeFactory(options),
+          async readPullRequestExecutionContext() { throw new Error("unused in composition test"); },
+        }),
+        workProposalRuntimeFactory: async (options) => {
+          calls.proposalRuntime = options;
+          const runner = { async claim() {}, async advance() {} };
+          return workProposalRuntimePort({ runners: {
+            "code-action-runner": runner, "github-pr-action-runner": runner, "github-review-runner": runner,
+          } });
+        },
+        versionedCodeJobAuthorityFactory: () => ({ async create() {}, async verify(value) { return value; }, async decide() {}, async close() {} }),
+        codeExecutorRuntimeFactory: async () => ({
+          ...await base.codeExecutorRuntimeFactory(),
+          changePackageTargets: [{ workspaceId: "dashboard" }],
+          completedChangeExporter: { async export() {} },
+          controlledCommitBuilder: { async create() {}, async find() {}, async verify() {} },
+          controlledCommitPublisher: { async publish() {} },
+          auditArtifactReader: { async read() {} },
+        }),
+        codeJobRuntimeFactory: async (options) => ({
+          ...await base.codeJobRuntimeFactory(options),
+          worker: { ...codeJobWorkerPort(), async runReady(request, runOperation) {
+            calls.codeWorkerRequest = request; calls.codeWorkerOwner = runOperation; return { processed: 1 };
+          } },
+          pauseRecovery: { async runCycle(value) { calls.pauseRecoveryRequest = value; return { resumed: 1 }; } },
+          changePackageDelivery: { async runCycle() {} },
+        }),
+        changePackageRuntimeFactory: async () => ({
+          packageProducer: { async create() {} }, packageReader: { async get() {} },
+          applicationProducer: { async prepareConfirmation() {} },
+          applicationExecutor: { async execute() {}, async reconcile() {} },
+          applicationReader: { async getResult() {} },
+          applicationProjectionReader: { async getForJob() {} },
+          applicationProjectionWriter: { async getCheckpoint() {}, async applySnapshot() {} },
+          async close() {},
+        }),
+        changePackageApplicationResultReconcilerFactory: () => ({ async runCycle() {}, async runThrough() {} }),
+        codeJobEvidenceReaderFactory: () => ({ async read() {} }),
+        githubCredentialSourceFactory: async () => Object.freeze({ async acquire() {} }),
+        pullRequestExternalActionDependencies: { transport: { async observe() {}, async perform() {} } },
+        pullRequestExternalActionExecutorFactory(options) {
+          calls.externalExecutor = options;
+          return { async execute() {}, async reconcile() {}, async close() {} };
+        },
+        pullRequestExternalActionProposalRunnerFactory: () => ({ async runCycle() {} }),
+        githubReviewProposalRunnerFactory: () => ({ async runCycle() {} }),
+        codeActionProposalRunnerFactory(options) {
+          calls.codeRunner = options;
+          return createCodeActionProposalRunnerService(options);
+        },
+      });
+      try {
+        assert.equal(calls.coordination.codeJobRunner, null, 'housekeeping must not own long automatic code execution');
+        assert.equal(Object.isFrozen(application.codeJobExecution), true);
+        assert.deepEqual(Object.keys(application.codeJobExecution), ['runCycle']);
+        const workerSignal = new AbortController().signal;
+        const owner = operation => operation();
+        assert.deepEqual(await application.codeJobExecution.runCycle({ signal: workerSignal }, owner), { processed: 1 });
+        assert.strictEqual(calls.codeWorkerOwner, owner);
+        assert.equal(calls.codeWorkerRequest.limit, 9);
+        assert.strictEqual(calls.codeWorkerRequest.signal, workerSignal);
+        assert.deepEqual(Object.keys(application.localCodeProposalRecovery), ["runCycle"]);
+        assert.deepEqual(Object.keys(application.jenkinsConnection), ['status', 'connect']);
+        assert.equal(Object.isFrozen(application.jenkinsConnection), true);
+        assert.equal(await calls.contextAssembler.ciDiagnosticReader.read({ repository: 'acme/repo', headRefOid: 'a'.repeat(40), headRefName: 'main', checks: [], maximumBytes: 1000 }), null);
+        assert.equal(Object.isFrozen(calls.codeJobRuntime.automaticPauseRecovery), true);
+        assert.equal(await calls.codeJobRuntime.automaticPauseRecovery.canRecover({}), false);
+        assert.deepEqual(await calls.codeJobRuntime.automaticPauseRecovery.withNativeQuiescence({}, () => {
+          throw new Error('unbound native recovery must stay closed');
+        }), { executed: false });
+        assert.equal(Object.isFrozen(calls.coordination.codeJobPauseRecovery), true);
+        assert.deepEqual(await calls.coordination.codeJobPauseRecovery.runCycle({ limit: 2 }), { resumed: 1 });
+        assert.deepEqual(calls.pauseRecoveryRequest, { limit: 2 });
+        assert.equal(Object.isFrozen(application.localCodeProposalRecovery), true);
+        assert.equal(calls.codeRunner.handlerTimeoutMs, scenario.expectedBudget);
+        assert.equal(calls.codeRunner.leaseDurationMs, scenario.leaseDurationMs ?? 120_000);
+        assert.ok(calls.codeRunner.handlerTimeoutMs < calls.codeRunner.leaseDurationMs);
+        if (scenario.elapsedMs !== undefined) {
+          const proposal = normalizeBoundWorkProposal({
+            proposalId: "automatic-code-preparation-budget", policyVersion: 1,
+            kind: "code_action_proposal", requestedBy: { roleId: "developer", workItemId: "work-budget" },
+            source: { assignmentId: "assignment-budget", eventId: "event-budget" },
+            binding: { repository: "acme/repo" }, payload: { operation: "modify" },
+          });
+          let claimed = false;
+          let start;
+          let release;
+          const started = new Promise((resolve) => { start = resolve; });
+          const preparing = new Promise((resolve) => { release = resolve; });
+          const advances = [];
+          t.mock.method(CodeActionProposalHandler.prototype, "handle", async () => {
+            start();
+            await preparing;
+            return { status: "succeeded", summary: "Automatic preparation completed", evidence: [] };
+          });
+          const runner = createCodeActionProposalRunnerService({
+            ...calls.codeRunner,
+            runner: {
+              async claim({ leaseDurationMs }) {
+                assert.equal(leaseDurationMs, scenario.leaseDurationMs);
+                if (claimed) return null;
+                claimed = true;
+                return {
+                  proposal, status: "pending_delivery", revision: 1, attempt: 1, downstreamRef: null,
+                  lease: { runnerId: "code-action-runner", leaseId: "lease-budget", leaseUntil: "2026-10-14T04:30:00.000Z" },
+                };
+              },
+              async advance(value) { advances.push(value); },
+            },
+          });
+          t.mock.timers.enable({ apis: ["setTimeout"] });
+          try {
+            const execution = runner.runCycle({ limit: 1 });
+            await started;
+            t.mock.timers.tick(30_001);
+            await Promise.resolve();
+            assert.equal(advances.length, 0, "automatic preparation must not time out at the ordinary deadline");
+            t.mock.timers.tick(scenario.elapsedMs - 30_001);
+            if (scenario.expectedStatus === "succeeded") release();
+            const result = await execution;
+            assert.equal(result.outcomes[0].status, scenario.expectedStatus);
+            if (scenario.expectedStatus === "waiting_retry") {
+              assert.equal(advances[0].transition.reason, "WORK_PROPOSAL_HANDLER_TIMEOUT");
+            }
+          } finally {
+            release();
+            t.mock.timers.reset();
+            t.mock.restoreAll();
+          }
+        }
+        const { AutomaticLocalCodeAuthorization } = await import('../src/services/automatic-local-code-authorization.js');
+        assert.ok(calls.codeRunner.automaticOwnPrRepair instanceof AutomaticLocalCodeAuthorization);
+        const { CiRepairContextReader } = await import('../src/services/ci-repair-context-reader.js');
+        assert.ok(calls.codeRunner.automaticOwnPrRepair.specialized.ciRepairContextReader instanceof CiRepairContextReader);
+        assert.deepEqual(await application.reviewHandoffReconciler.runCycle(), [{ assigned: 0, already: 0, pending: 0 }]);
+        assert.equal(application.prEmployee.config.automaticOwnPrRepair, true);
+        assert.equal(calls.codeJobRuntime.workerLimits.concurrency, 2);
+        assert.deepEqual(calls.externalExecutor.enabledActions, ["push"]);
+        assert.deepEqual(config.githubActions.enabledActions, explicitPush ? ["push"] : []);
+        assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.read, "function");
+        assert.equal(typeof calls.codeJobRuntime.reviewRepairContextReader.readBinding, "function");
+        assert.strictEqual(calls.loop.reviewRepairContextReader, calls.codeJobRuntime.reviewRepairContextReader);
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(repairEnvelope), false);
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(ciEnvelope), false, 'explicit generic push cannot bypass CI repair provenance');
+        assert.equal(await calls.externalExecutor.pushAuthorization.verifyPush(conflictEnvelope), explicitPush);
+      } finally {
+        await application.close();
+      }
+    });
+  }
+});
+
 test("an explicit Review keeps legacy intake while unified execution owns work-proposal side effects", async () => {
   const calls = {};
   const closeCalls = [];
@@ -4697,6 +5357,7 @@ test("local code and change package composition injects only frozen delivery por
       completedChangeExporter: { async export() {} },
       controlledCommitBuilder: {
         async create() {}, async find() {}, async verify() {},
+        async readSealed(value) { calls.sealedCommitRead = value; return { evidenceId: value.evidenceId }; },
       },
       auditArtifactReader: {
         async read(value) { return Buffer.from(JSON.stringify(value)); },
@@ -4794,8 +5455,10 @@ test("local code and change package composition injects only frozen delivery por
 
   assert.deepEqual(
     Object.keys(calls.changePackageRuntime.controlledCommitBuilder),
-    ["create", "find", "verify"],
+    ["create", "find", "verify", "readSealed"],
   );
+  assert.deepEqual(await calls.changePackageRuntime.controlledCommitBuilder.readSealed({ evidenceId: "historical-commit" }), { evidenceId: "historical-commit" });
+  assert.deepEqual(calls.sealedCommitRead, { evidenceId: "historical-commit" });
   assert.equal(
     Object.isFrozen(calls.changePackageRuntime.controlledCommitBuilder),
     true,
@@ -5218,6 +5881,203 @@ test("production composition shares one Codex login broker across every configur
   assert.deepEqual(closeOrder, ["broker"]);
 });
 
+test("native login diagnostics use the selected route even when the legacy broker is blocked", async () => {
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const config = normalizeConfigurationDocument(rawConfig);
+  const calls = {};
+  const closeCalls = [];
+  const lifecycle = createApplicationRuntimeLifecycle();
+  let legacyStatusCalls = 0;
+  let nativeOptions;
+  const nativeStatus = Object.freeze({
+    schemaVersion: 1, state: "available", cliAvailable: true,
+    fileLoginAvailable: true, credentialMode: "codex-native-login",
+  });
+  const application = await createApplication({
+    ...defaultCodeJobApplicationOptions({ config, calls, closeCalls, lifecycle, versioned: false }),
+    codexLoginCredentialBrokerFactory: () => ({
+      async acquire() { throw new Error("legacy broker blocked"); },
+      async checkAvailability() { throw new Error("legacy broker blocked"); },
+      async readStatus() { legacyStatusCalls += 1; return { state: "broker_blocked" }; },
+      async close() { closeCalls.push("legacy-broker"); },
+    }),
+    nativeCodexStatusProviderFactory: (options, grant) => {
+      nativeOptions = options;
+      const facts = grant.consume((value) => value);
+      assert.ok(facts.protectedRoots.includes(path.resolve(".")));
+      return {
+        async readStatus() { return nativeStatus; },
+        async close() { closeCalls.push("native-status"); },
+      };
+    },
+  });
+  assert.equal(nativeOptions.credentialMode, "codex-native-login");
+  assert.equal(nativeOptions.cliKind, "codex-cli");
+  assert.deepEqual(Object.keys(application.brainProviderStatus), ["readStatus"]);
+  assert.deepEqual(await application.brainProviderStatus.readStatus(), nativeStatus);
+  assert.equal(legacyStatusCalls, 0);
+  await application.close();
+  assert.ok(closeCalls.indexOf("native-status") < closeCalls.indexOf("legacy-broker"));
+});
+
+test("production native grants keep captured feedback read-only when automatic repair is disabled", async () => {
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const config = normalizeConfigurationDocument(rawConfig);
+  const head = "a".repeat(40);
+  const feedback = { changeRequests: [{ id: "original-review", author: "reviewer", body: "Keep unsaved edits",
+    submittedAt: "2026-10-15T00:00:00.000Z", reviewedHeadRefOid: head }], threads: [] };
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: "acme/repo", number: 1,
+    context: { schemaVersion: 1, headRefOid: head, reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: head, observedAt: "2026-10-15T00:00:00.000Z" } });
+  let privateReader;
+  let currentFeedbackReader;
+  let feedbackWrites = 0;
+  const application = await createApplication({
+    ...defaultCodeJobApplicationOptions({ config, calls: {}, closeCalls: [],
+      lifecycle: createApplicationRuntimeLifecycle(), versioned: false }),
+    store: {
+      async read(key, fallback) { return key === "automatic-own-pr-repair-state"
+        ? structuredClone({ schemaVersion: 1, repairs: [], published: [], feedbackSnapshots: [snapshot] }) : fallback; },
+      async write(key) { if (key === "automatic-own-pr-repair-state") feedbackWrites += 1; },
+    },
+    nativeCodexStatusProviderFactory(_options, grant) {
+      const facts = grant.consume((value) => value);
+      privateReader = facts.originalRepairFeedbackReader;
+      currentFeedbackReader = facts.currentReviewFeedbackReader;
+      assert.deepEqual(Object.keys(currentFeedbackReader), ["read"]);
+      assert.equal(Object.isFrozen(currentFeedbackReader), true);
+      assert.deepEqual(Object.keys(privateReader), ["read"]);
+      assert.equal(Object.isFrozen(privateReader), true);
+      return { async readStatus() { return { state: "available" }; }, async close() {} };
+    },
+  });
+  try {
+    assert.notEqual(config.githubActions?.automaticOwnPrRepair, true);
+    assert.equal("originalRepairFeedbackReader" in application, false);
+    assert.equal("currentReviewFeedbackReader" in application, false);
+    const query = { snapshotId: snapshot.snapshotId, repository: snapshot.repository, number: snapshot.number,
+      feedbackDigest: snapshot.feedbackDigest, originalHeadRefOid: snapshot.originalHeadRefOid };
+    assert.deepEqual(await privateReader.read(query), snapshot);
+    await assert.rejects(privateReader.read({ ...query, feedbackDigest: "0".repeat(64) }),
+      { code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE" });
+    assert.equal(feedbackWrites, 0);
+  } finally { await application.close(); }
+});
+
+test("production composition factory carries real native completed reads into private durable proof", async t => {
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo",
+    headRepository: "acme/repo", baseRefName: "main", headRefName: "feature", baseRefOid: "a".repeat(40), headRefOid: "b".repeat(40) };
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.updated", occurredAt: "2026-11-09T01:00:00.000Z",
+    source: { provider: "github", scopeId: "github-dashboard" }, subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { relation: "review_requested", gitTarget, gitTargetAvailable: true, headRefOid: gitTarget.headRefOid } });
+  const assignment = { assignmentId: "native-proof-assignment", eventId: event.eventId, target: { type: "role", id: "pr-engineer" } };
+  const admitted = createPullRequestWorkSource({ sequence: 1, assignment, event });
+  const item = { itemId: "native-proof-root", kind: "source_root", revision: 1, status: "working", sourceQuarantine: null,
+    currentTarget: assignment.target, assignmentId: assignment.assignmentId, assignment, event, source: admitted.source,
+    inputDigest: admitted.source.current.inputDigest, createdAt: event.occurredAt, activeIntentId: null,
+    graph: { acceptanceContracts: [{ revision: 1, acceptanceCriteria: [], expectedDeliverables: [] }] } };
+  const binding = currentWorkItemExecutionBinding(item);
+  const facts = createPullRequestReadFacts({ identity: createPullRequestReadIdentity({ executionBinding: binding, event }),
+    observedAt: "2026-11-09T01:01:00.000Z", reviewDecision: "REVIEW_REQUIRED", comments: [], reviews: [], reviewThreads: [], checks: [],
+    truncation: { comments: false, reviews: false, reviewThreads: false, checks: false, byteBudget: false } });
+  const store = storedValues({}), calls = {}, closeCalls = [];
+  const rawConfig = structuredClone(defaultCodeJobConfiguration());
+  rawConfig.brainProviders["offline-cli"].credentialMode = "codex-native-login";
+  const appOptions = defaultCodeJobApplicationOptions({ config: normalizeConfigurationDocument(rawConfig), calls, closeCalls,
+    lifecycle: createApplicationRuntimeLifecycle(), versioned: false });
+  let productionFactory, factReads = 0, opened = 0, session;
+  const application = await createApplication({ ...appOptions, store,
+    async workLedgerRuntimeFactory(options) {
+      const ledger = await appOptions.workLedgerRuntimeFactory(options);
+      return { ...ledger, async readItemForReconciliation() { return item; },
+        async readReviewAdoptionContext() { return { item, root: item, activeDispatch: null }; } };
+    },
+    prEngineerServiceFactory: () => ({ async recover() {}, async context() {}, async get() { return facts; },
+      async refresh() { factReads++; return facts; } }),
+    nativeCodexStatusProviderFactory(_options, grant) {
+      const runtime = grant.consume(value => value);
+      assert.deepEqual(Object.keys(runtime.currentReviewFeedbackReader), ["read"]);
+      productionFactory = runtime.reviewReaderFactory;
+      return { async readStatus() { return { state: "available" }; }, async close() {} };
+    },
+  });
+  t.after(() => application.close());
+  const skill = await loadNativeReviewSkill();
+  const open = GitHubReviewReader.prototype.open;
+  // Only the test harness replaces network I/O, after verifying that the actual
+  // composition factory ignored all caller-supplied transport/source/policy.
+  t.mock.method(GitHubReviewReader.prototype, "open", async function(target, options) {
+    opened++;
+    assert.equal(this.run, runJson);
+    assert.deepEqual(options.skillDocuments, skill.documents);
+    this.run = async (_command, args) => {
+      const endpoint = args[3];
+      if (endpoint === "user") return { login: "reviewer" };
+      if (endpoint === "graphql") return { data: { repository: { nameWithOwner: "acme/repo", pullRequest: {
+        number: 42, url: "https://github.com/acme/repo/pull/42", state: "OPEN", author: { login: "developer" }, changedFiles: 1,
+        baseRefName: "main", baseRefOid: gitTarget.baseRefOid, headRefName: "feature", headRefOid: gitTarget.headRefOid,
+        baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: gitTarget.baseRefOid } },
+        headRef: { name: "feature", repository: { nameWithOwner: "acme/repo" }, target: { oid: gitTarget.headRefOid } },
+        headRepository: { nameWithOwner: "acme/repo" } } } } };
+      if (endpoint === "repos/acme/repo/pulls/42/files?per_page=100") return [[{ filename: "src/app.js", status: "modified", additions: 1, deletions: 1 }]];
+      if (endpoint === "repos/acme/repo/pulls/42") return { number: 42, title: "Qt Test", body: "", html_url: "https://github.com/acme/repo/pull/42",
+        head: { sha: gitTarget.headRefOid }, base: { repo: { full_name: "acme/repo" } } };
+      assert.fail(`Unexpected fixture endpoint: ${endpoint}`);
+    };
+    this.runText = async () => "diff --git a/src/app.js b/src/app.js\n-old\n+new\n";
+    session = await Reflect.apply(open, this, [target, options]);
+    return session;
+  });
+  const root = await mkdtemp(path.join(tmpdir(), "native-private-proof-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = path.join(root, "home"); await mkdir(home); await writeFile(path.join(home, "auth.json"), "offline-auth");
+  const intent = { type: "propose_github_review", verdict: "approve", body: "Reviewed current code" };
+  let sequence = 0;
+  const provider = createNativeCodexBrainProvider({ id: "native-private-proof", cliKind: "codex-cli", credentialMode: "codex-native-login", timeoutMs: 3000 }, {
+    environment: { ...process.env, CODEX_HOME: home, DIH_CODEX_NATIVE_TRANSPORT: "exec" }, temporaryRoot: path.join(root, "runtime"),
+    commandLocator: { async resolve() { return { command: process.execPath, prefixArgs: [] }; } },
+    rootDirectoryManager: { async prepare({ directory, validateLocation, signal }) {
+      signal?.throwIfAborted(); await validateLocation(); await mkdir(directory, { recursive: true });
+      const stat = await lstat(directory, { bigint: true });
+      return { path: await realpath(directory), device: String(stat.dev), inode: String(stat.ino) };
+    } },
+    reviewReaderFactory: (target, options) => productionFactory(target, { ...options,
+      run: () => assert.fail("Untrusted transport"), currentReviewFeedbackReader: { read() { assert.fail("Untrusted facts"); } },
+      skillDocuments: { "review-skill/manifest.json": "forged" }, onCompleteReviewRead() { assert.fail("Untrusted completion callback"); } }),
+    processRunner: { async run(invocation) {
+      const rpc = async (method, params = {}) => {
+        const response = await fetch(session.url, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: ++sequence, method, params }) });
+        return (await response.json()).result;
+      };
+      const tools = await rpc("tools/list");
+      assert.deepEqual(tools.tools.map(value => value.name), ["read_document", "read_source", "list_directory"]);
+      for (const document of tools.tools[0].inputSchema.properties.document.enum) {
+        let offset = 0;
+        do {
+          const page = await rpc("tools/call", { name: "read_document", arguments: { document, offset } });
+          assert.notEqual(page.isError, true);
+          offset = JSON.parse(page.content[0].text).nextOffset;
+        } while (offset !== null);
+      }
+      await writeFile(invocation.args[invocation.args.indexOf("--output-last-message") + 1], JSON.stringify({ result: JSON.stringify({ intent }) }));
+      return { exitCode: 0, signal: null, stdout: "", stderr: "", stdoutBytes: Buffer.alloc(0), stderrBytes: Buffer.alloc(0) };
+    } },
+  });
+  t.after(() => provider.close());
+  const result = JSON.parse(await provider.generate({ model: "offline", reasoningEffort: "high", messages: [{ role: "user", content: "Review current code" }],
+    schema: { type: "object", properties: { intent: { type: "object" } }, required: ["intent"], additionalProperties: false },
+    reviewTarget: { gitTarget, pullRequestNumber: 42, feedbackSnapshot: { taskId: item.itemId, materialDigest: projectPullRequestReadFactsContext(facts).materialDigest } } }));
+  assert.deepEqual(result.intent, intent);
+  assert.equal(opened, 1); assert.ok(factReads >= 2);
+  const persisted = await new ReviewPublicationAdoptionStore({ store }).readProofs();
+  assert.equal(persisted.records.length, 1);
+  assert.equal(persisted.records[0].producerTaskId, item.itemId);
+  assert.equal(persisted.records[0].policyDigest, skill.digest);
+});
+
 test("application close stays bounded and incomplete while a configured provider activity never settles", async (t) => {
   const temporaryRoot = await mkdtemp(
     path.join(tmpdir(), "supervised-cli-application-close-"),
@@ -5513,7 +6373,11 @@ async function assertDefaultCodeJobLifecycle(t, {
       ? "versioned-default-code-job-cli"
       : "default-code-job-cli",
   );
-  const config = defaultCodeJobConfiguration();
+  const config = defaultCodeJobConfiguration({ offlineCliTimeoutMs: 60_000 });
+  // This fixture holds the real CLI until release to test lifecycle ownership.
+  // Its settlement bound covers the request plus the provider's 30s recovery
+  // window; provider deadline behavior has separate deterministic tests.
+  const decisionSettlementBoundMs = 90_000;
   const calls = {};
   const closeCalls = [];
   const lifecycle = createApplicationRuntimeLifecycle();
@@ -5539,7 +6403,7 @@ async function assertDefaultCodeJobLifecycle(t, {
         });
       }
       if (decisionOutcome !== null) {
-        await attempt(() => within(10_000, decisionOutcome));
+        await attempt(() => within(decisionSettlementBoundMs, decisionOutcome, "fixture teardown decision"));
       }
       if (application !== null) {
         let applicationCleanupFailure = null;
@@ -5641,7 +6505,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     const firstClose = application.close();
     assert.strictEqual(application.close(), firstClose);
-    const firstFailure = await within(1_000, firstClose).then(
+    const firstFailure = await within(1_000, firstClose, "first application close").then(
       () => null,
       (error) => error,
     );
@@ -5656,7 +6520,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     await fixture.release(invocation);
     released = true;
-    const decision = await within(10_000, decisionOutcome);
+    const decision = await within(decisionSettlementBoundMs, decisionOutcome, "decision after release");
     if (versioned) {
       assert.equal(decision.error?.code, "INVALID_CODE_JOB_AUTHORITY");
     } else {
@@ -5668,7 +6532,7 @@ async function assertDefaultCodeJobLifecycle(t, {
 
     const retry = application.close();
     assert.strictEqual(application.close(), retry);
-    await within(1_000, retry);
+    await within(1_000, retry, "retry application close");
     const countsAfterRecovery = observedCloses.length;
     await application.close();
     assert.equal(observedCloses.length, countsAfterRecovery);
@@ -5701,21 +6565,15 @@ async function assertDefaultCodeJobLifecycle(t, {
   if (teardownFailure) throw teardownFailure;
 }
 
-test("default non-versioned Code Job owns one real offline CLI lifecycle", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("default non-versioned Code Job owns one real offline CLI lifecycle", async (t) => {
   await assertDefaultCodeJobLifecycle(t, { versioned: false });
 });
 
-test("default versioned Code Job owns one lazy real offline CLI lifecycle", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("default versioned Code Job owns one lazy real offline CLI lifecycle", async (t) => {
   await assertDefaultCodeJobLifecycle(t, { versioned: true });
 });
 
-test("real offline CLI teardown survives an injected post-start failure", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("real offline CLI teardown survives an injected post-start failure", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI composition is Windows x64 only");
     return;
@@ -5759,7 +6617,9 @@ test("real offline CLI teardown survives an injected post-start failure", {
     assert.equal(processExists(processId), false, processId);
   }
   assert.equal(lifecycle.readStatus().complete, true);
-  assert.deepEqual((await within(100, decisionOutcome)).value?.action, {
+  const settledDecision = await within(100, decisionOutcome);
+  assert.equal(settledDecision.error, null, settledDecision.error?.stack);
+  assert.deepEqual(settledDecision.value?.action, {
     type: "read_text",
     path: "src/app.js",
   });
@@ -6038,6 +6898,7 @@ test("local code composition keeps CLI authority private from injected factories
     },
   ]);
   assert.strictEqual(calls.codeJobRuntime.store, application.store);
+  assert.equal(Object.hasOwn(calls.codeRunner, "handlerTimeoutMs"), false);
   assert.equal(Object.isFrozen(calls.codeJobRuntime.executor), true);
   assert.deepEqual(Object.keys(calls.codeJobRuntime.executor).sort(), [
     "getActionResult",

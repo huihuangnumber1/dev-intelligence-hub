@@ -80,7 +80,7 @@ test("process management is PID and health bound and never kills an arbitrary li
   assert.match(manager, /MYDASHBOARD_OFFLINE_RESTORE_PROJECT_DIGEST/);
   assert.match(launcher, /detached: true/);
   assert.match(launcher, /windowsHide: true/);
-  assert.match(launcher, /stdio: "ignore"/);
+  assert.match(launcher, /stdio: \["ignore", "ignore", stderrDescriptor \?\? "ignore"\]/);
   assert.match(launcher, /createHmac/);
   assert.match(launcher, /realpathSync\.native/);
   assert.match(launcher, /managedEntryScript/);

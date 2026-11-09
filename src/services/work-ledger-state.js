@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validBrainRecoveryStamp } from "./brain-recovery-intent.js";
 import { normalizeWorkIntent } from "../domain/work-intent.js";
 import {
   LEGACY_UNKNOWN_WORK_INTENT_BINDING,
@@ -13,6 +14,7 @@ import {
   "../domain/pull-request-execution-binding.js";
 import {
   boundedLedgerString,
+  boundedLedgerText,
   canonicalLedgerValue,
   cloneLedgerValue,
   hasExactLedgerKeys,
@@ -38,6 +40,8 @@ import {
   migrateLegacyWorkGraphMemoryProjection,
   migrateWorkGraphMemoryProjection,
   normalizeWorkGraphMemoryProjection,
+  migrateSchema11WorkGraphMemoryAuthority,
+  migrateSchema12WorkGraphMemoryAuthority,
   reconcileMigratedWorkGraphMemoryAuthority,
 } from "./work-ledger-graph-memory.js";
 import {
@@ -60,7 +64,7 @@ import {
 } from "./work-ledger-pr-source.js";
 
 export const WORK_LEDGER_STATE_KEY = "work-ledger-state";
-export const WORK_LEDGER_STATE_SCHEMA_VERSION = 11;
+export const WORK_LEDGER_STATE_SCHEMA_VERSION = 13;
 const GRAPH_MEMORY_STATE_SCHEMA_VERSION = 7;
 const DISPATCH_BINDING_STATE_SCHEMA_VERSION = 8;
 const PR_INPUT_BINDING_STATE_SCHEMA_VERSION = 9;
@@ -526,6 +530,32 @@ function sourceRootCapacityView(state) {
     .map(workItemCapacityView);
 }
 
+export function retainWorkLedgerTimelineForCapacity(previousState, candidate, limits) {
+  const currentBytes = prettySerializedLedgerBytes(workLedgerCapacityView(candidate));
+  if (currentBytes <= limits.stateByteBudget) return candidate;
+
+  const previousBySequence = new Map(previousState.timeline.map(entry => [entry.sequence, entry]));
+  let removed = 0;
+  let releasedBytes = 0;
+  const targetBytes = Math.floor(limits.stateByteBudget * 0.9);
+  for (const entry of candidate.timeline) {
+    if (currentBytes - releasedBytes <= targetBytes) break;
+    // Only rotate genuine existing history. Never discard this transaction's
+    // receipts or hide altered history before the normal validation runs.
+    const previous = previousBySequence.get(entry.sequence);
+    if (entry.sequence >= previousState.nextTimelineSequence || previous === undefined ||
+        JSON.stringify(entry) !== JSON.stringify(previous)) break;
+    const serialized = JSON.stringify(entry, null, 2);
+    const lines = 1 + (serialized.match(/\n/g)?.length ?? 0);
+    releasedBytes += Buffer.byteLength(serialized, 'utf8') + lines * 4 + 2;
+    removed += 1;
+  }
+  if (removed === 0) return candidate;
+  const timeline = candidate.timeline.slice(removed);
+  return { ...candidate, timeline,
+    timelineStartSequence: timeline[0]?.sequence ?? candidate.nextTimelineSequence };
+}
+
 function assertGraphDeliveryHistory(items) {
   for (const item of items) {
     let pending = null;
@@ -606,11 +636,9 @@ function assertGraphTaskProvenance(
     128,
   );
   const title = safeString(assignment.work.title, "graphTask.work.title", 256);
-  const description = safeString(
-    assignment.work.description,
-    "graphTask.work.description",
-    16 * 1024,
-  );
+  let description;
+  try { description = boundedLedgerText(assignment.work.description, "graphTask.work.description", 16 * 1024); }
+  catch { throw corrupted("graphTask.work.description 损坏"); }
   let sourceBinding = null;
   if (assignment.graphTask.sourceBinding !== null) {
     try {
@@ -803,6 +831,9 @@ function normalizeItem(value, stateRevision, limits) {
     value.attempt < 0
   ) {
     throw corrupted("员工工作项状态损坏");
+  }
+  if (source?.decisionBudget && source.decisionBudget.attemptOffset > value.attempt) {
+    throw corrupted("PR decision budget 超过累计领取计数");
   }
   assertGraphTaskProvenance(
     value.kind,
@@ -1060,7 +1091,7 @@ function normalizeRequestedBy(value) {
 }
 
 function normalizeOutboxEntry(value, stateRevision, limits) {
-  if (!hasExactLedgerKeys(value, OUTBOX_KEYS)) {
+  if (!hasExactLedgerKeys(value, OUTBOX_KEYS) && !hasExactLedgerKeys(value, [...OUTBOX_KEYS, "brainRecovery"])) {
     throw corrupted("员工工作 outbox 字段损坏");
   }
   const intent = normalizeIntent(value.intent);
@@ -1136,6 +1167,7 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     inputDigest,
     requestedBy,
     intent,
+    ...(Object.hasOwn(value, "brainRecovery") ? { brainRecovery: value.brainRecovery } : {}),
     sourceBinding,
     dispatchBinding,
     status: value.status,
@@ -1150,6 +1182,9 @@ function normalizeOutboxEntry(value, stateRevision, limits) {
     createdAt: timestamp(value.createdAt, "outbox.createdAt"),
     updatedAt: timestamp(value.updatedAt, "outbox.updatedAt"),
   };
+  if (Object.hasOwn(entry, "brainRecovery") && !validBrainRecoveryStamp(entry)) {
+    throw corrupted("员工工作意图恢复来源绑定损坏");
+  }
   if (prettySerializedLedgerBytes(entry.intent) > limits.intentByteBudget) {
     throw corrupted("员工工作意图超过容量");
   }
@@ -1375,15 +1410,18 @@ export function assertWorkLedgerCapacity(state, limits) {
     ).length,
   );
   const graphPending = state.graphMemoryProjection.pending;
+  const policyObservationAllowance = graphPending.at(-1)?.schemaVersion === 2 &&
+    graphPending.at(-1)?.kind === "authority_observed" ? 1 : 0;
   const graphPendingWithinCapacity =
-    graphPending.length <= limits.graphMemoryOutboxLimit ||
-    (graphPending.length <=
-        limits.graphMemoryOutboxLimit + graphMigrationAllowance &&
-      graphPending.slice(limits.graphMemoryOutboxLimit).every(
-        (event) =>
-          event.schemaVersion === 2 &&
-          ["authority_invalidated", "authority_observed"].includes(event.kind),
-      ));
+    graphPending.length <= MAX_WORK_GRAPH_MEMORY_EVENTS && (
+      graphPending.length <= limits.graphMemoryOutboxLimit ||
+      (graphPending.length <=
+          limits.graphMemoryOutboxLimit + graphMigrationAllowance + policyObservationAllowance &&
+        graphPending.slice(limits.graphMemoryOutboxLimit).every(
+          (event) =>
+            event.schemaVersion === 2 &&
+            ["authority_invalidated", "authority_observed"].includes(event.kind),
+        )));
   if (
     operationalItemCount > limits.itemLimit ||
     sourceRootCount > limits.sourceRootLimit ||
@@ -1841,7 +1879,9 @@ function migrateResultAttestationState(value, limits) {
   );
   return {
     ...value,
-    schemaVersion: WORK_LEDGER_STATE_SCHEMA_VERSION,
+    // Keep the historical intermediate fixed so every older state also
+    // receives the schema 11 authority-policy compatibility validation.
+    schemaVersion: 11,
     timeline: normalized.map(migrateUnattestedResultTimeline),
   };
 }
@@ -2136,7 +2176,7 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
     : null;
   if (
     !hasCurrentStateFields ||
-    value.schemaVersion !== WORK_LEDGER_STATE_SCHEMA_VERSION ||
+    ![11, 12, WORK_LEDGER_STATE_SCHEMA_VERSION].includes(value.schemaVersion) ||
     !Number.isSafeInteger(value.revision) ||
     value.revision < 0 ||
     !Number.isSafeInteger(value.intakeCursor) ||
@@ -2213,12 +2253,16 @@ export function normalizeWorkLedgerPersistedState(value, limitsInput) {
       : value.graphMemoryProjection;
     state = {
       ...state,
-      graphMemoryProjection: normalizeWorkGraphMemoryProjection(
-        graphMemoryProjection,
-        state.revision,
-        state.items,
-        limits,
-      ),
+      graphMemoryProjection: value.schemaVersion === 11
+        ? migrateSchema11WorkGraphMemoryAuthority(graphMemoryProjection, state, limits)
+        : value.schemaVersion === 12
+          ? migrateSchema12WorkGraphMemoryAuthority(graphMemoryProjection, state, limits)
+        : normalizeWorkGraphMemoryProjection(
+            graphMemoryProjection,
+            state.revision,
+            state.items,
+            limits,
+          ),
     };
   } catch {
     throw corrupted("任务图记忆投影状态损坏");

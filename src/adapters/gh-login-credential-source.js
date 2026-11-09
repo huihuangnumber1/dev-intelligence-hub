@@ -24,7 +24,7 @@ import {
 const MAX_CREDENTIAL_TIMEOUT_MS = 15_000;
 const MAX_STDOUT_BYTES = 4_096;
 const MAX_STDERR_BYTES = 8_192;
-const CLEANUP_TIMEOUT_MS = 5_000;
+const CLEANUP_TIMEOUT_MS = 30_000;
 const SAFE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TEST_CONSTRUCTION_TOKEN = Object.freeze({});
 const LOGIN_ENVIRONMENT_NAMES = Object.freeze([
@@ -168,20 +168,24 @@ async function recoverDirectoryIdentity(
 function createCleanupSignal(request, clock) {
   const controller = new AbortController();
   const abort = () => controller.abort();
-  const remaining = request.deadline - clock();
   request.signal?.addEventListener("abort", abort, { once: true });
   let timer = null;
-  if (request.signal?.aborted || remaining <= 0) {
-    abort();
-  } else {
+  function arm(maximumMs) {
+    if (timer !== null) clearTimeout(timer);
+    const remaining = request.deadline - clock();
+    if (request.signal?.aborted || remaining <= 0) abort();
+    if (controller.signal.aborted) return;
     timer = setTimeout(
       abort,
-      Math.min(remaining, CLEANUP_TIMEOUT_MS),
+      Math.min(remaining, maximumMs, 2_147_483_647),
     );
     timer.unref?.();
   }
+  arm(CLEANUP_TIMEOUT_MS);
   return Object.freeze({
     signal: controller.signal,
+    waitForCredential() { arm(Infinity); },
+    beginCleanup() { arm(CLEANUP_TIMEOUT_MS); },
     close() {
       if (timer !== null) clearTimeout(timer);
       request.signal?.removeEventListener("abort", abort);
@@ -259,6 +263,9 @@ async function prepareCleanupSession(
     ) {
       throw cleanupFailedError();
     }
+    // Holding the prepared cleanup session must not spend its cleanup budget
+    // while the separately bounded credential process is still running.
+    signalOwner.waitForCredential();
     return Object.freeze({ session, signalOwner });
   } catch {
     signalOwner.close();
@@ -578,6 +585,7 @@ export class GhLoginCredentialSource {
     if (identity !== null) {
       try {
         if (cleanup === null) throw cleanupFailedError();
+        cleanup.signalOwner.beginCleanup();
         await cleanup.session.commit();
       } catch {
         try {

@@ -16,6 +16,14 @@ import path from "node:path";
 import test from "node:test";
 
 import { BackupService, BackupServiceError } from "../src/services/backup-service.js";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import {
+  createOriginalRepairFeedbackArchiveRecord,
+  createOriginalRepairFeedbackSnapshot,
+  originalRepairFeedbackArchiveKey,
+} from "../src/domain/original-repair-feedback.js";
+import { DataDirectoryCheckpointService } from "../src/services/data-directory-checkpoint-service.js";
+import { OperationalQuiescenceGate } from "../src/services/operational-quiescence-gate.js";
 import {
   createProductionRestoreMigrationRegistry,
 } from "../src/services/production-restore-migration-registry.js";
@@ -106,6 +114,120 @@ test("backup closes through one checkpoint, copies exact files, and verifies", a
     (await service.verifyBackup(created.manifest.backupId)).manifest,
     created.manifest,
   );
+});
+
+test("real checkpoints back up and restore executor dotfiles and 300 immutable feedback archives", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "mydashboard-executor-backup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = path.join(root, "data");
+  await mkdir(source);
+  const expected = new Map();
+  for (let number = 1; number <= 300; number += 1) {
+    const feedback = { changeRequests: [{ id: `review-${number}`, author: "reviewer", body: `Fix defect ${number}` }], threads: [] };
+    const snapshot = createOriginalRepairFeedbackSnapshot({
+      repository: "owner/project", number,
+      context: { schemaVersion: 1, headRefOid: "a".repeat(40), reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+      provenance: { kind: "captured_before_repair", observedHeadRefOid: "a".repeat(40), observedAt: NOW },
+    });
+    expected.set(`${originalRepairFeedbackArchiveKey(snapshot.snapshotId)}.json`,
+      Buffer.from(`${JSON.stringify(createOriginalRepairFeedbackArchiveRecord(snapshot))}\n`));
+  }
+  const runId = "b".repeat(64);
+  for (const relative of [
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/.clang-tidy",
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/.gitattributes",
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/.gitignore",
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/Scripts/Test/.gitattributes",
+    `code-executor/workspaces/.test-library/${"a".repeat(64)}/test.mjs`,
+    `code-executor/windows-tests/${runId}/data/workspace/.github/workflows/test.yml`,
+    `code-executor/windows-tests/${runId}/data/workspace/Packages/test/AC/Temp/.cache/result.bin`,
+    `code-executor/windows-tests/${runId}/data/resources/test-assets/.config/settings.json`,
+    `code-executor/windows-tests/${runId}/pending.json`,
+  ]) expected.set(relative, Buffer.from(`durable bytes for ${relative}\n`));
+  for (const [relative, bytes] of expected) {
+    const target = path.join(source, ...relative.split("/"));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, bytes);
+  }
+  const gate = new OperationalQuiescenceGate();
+  const checkpoint = new DataDirectoryCheckpointService({ sourceDirectory: source, gate });
+  const service = new BackupService({
+    sourceDirectory: source, backupDirectory: path.join(root, "backups"),
+    quiescence: checkpoint, canonicalization: checkpoint, reconciliation: checkpoint,
+    migration: createProductionRestoreMigrationRegistry(), now: () => new Date(NOW),
+  });
+
+  const created = await service.createBackup();
+  assert.equal(created.manifest.checkpoint.stores.length, 300);
+  assert.equal(created.manifest.totals.fileCount, expected.size);
+  assert.deepEqual((await service.verifyBackup(created.manifest.backupId)).manifest, created.manifest);
+  const restored = await service.restore({
+    backupId: created.manifest.backupId, destinationDirectory: path.join(root, "restored"),
+  });
+
+  assert.equal(restored.ready, true);
+  for (const [relative, bytes] of expected) {
+    assert.deepEqual(await readFile(path.join(restored.path, ...relative.split("/"))), bytes);
+  }
+  assert.equal(gate.readStatus().mode, "open");
+});
+
+test("real checkpoints reject unknown hidden paths and executor links before backup writes", async (t) => {
+  const current = await fixture(t);
+  await writeFile(path.join(current.source, "checkpoint-state.json"), "{}\n");
+  const gate = new OperationalQuiescenceGate();
+  const checkpoint = new DataDirectoryCheckpointService({ sourceDirectory: current.source, gate });
+  const service = new BackupService({
+    sourceDirectory: current.source, backupDirectory: current.backups, quiescence: checkpoint,
+  });
+  const rejectedBeforeWrites = async (causeCode) => {
+    await assert.rejects(() => service.createBackup(), (error) =>
+      error.code === "BACKUP_QUIESCENCE_FAILED" && error.cause?.code === causeCode);
+    await assert.rejects(lstat(current.backups), { code: "ENOENT" });
+    assert.equal(gate.readStatus().mode, "open");
+  };
+  const unknown = path.join(current.source, ".unknown.json");
+  await writeFile(unknown, "{}\n");
+  await rejectedBeforeWrites("CHECKPOINT_PATH_INVALID");
+  await rm(unknown);
+
+  const execution = path.join(current.source, "code-executor", "workspaces", "oct-software", "attempt-1");
+  await mkdir(execution, { recursive: true });
+  const outside = path.join(current.root, "outside");
+  await mkdir(outside);
+  const sentinel = path.join(outside, "sentinel.txt");
+  await writeFile(sentinel, "outside bytes\n");
+  const alias = path.join(execution, ".github");
+  await symlink(outside, alias, process.platform === "win32" ? "junction" : "dir");
+  await rejectedBeforeWrites("CHECKPOINT_PATH_INVALID");
+  await rm(alias);
+  await link(sentinel, path.join(execution, ".gitignore"));
+  await rejectedBeforeWrites("CHECKPOINT_FILE_INVALID");
+  assert.equal(await readFile(sentinel, "utf8"), "outside bytes\n");
+});
+
+test("corrupt executor manifest paths cannot create a restore candidate", async (t) => {
+  const current = await fixture(t);
+  const created = await current.service.createBackup();
+  const manifestPath = path.join(created.path, "manifest.json");
+  for (const unsafePath of [
+    ".unknown.json",
+    "code-executor/workspaces/oct-software/attempt-1/../.gitignore",
+    "code-executor/workspaces/oct-software/attempt-1/.cache/file:stream",
+    "code-executor/workspaces/oct-software/attempt-1/.cache/NUL.txt",
+    `code-executor/windows-tests/${"a".repeat(64)}/data/control/.unknown`,
+    `code-executor/workspaces/.test-library/${"a".repeat(64)}/unknown.mjs`,
+  ]) {
+    const corrupted = structuredClone(created.manifest);
+    corrupted.files[0].path = unsafePath;
+    await writeFile(manifestPath, JSON.stringify(corrupted));
+    const destination = path.join(current.root, "unsafe-restore");
+    await assert.rejects(current.service.restore({
+      backupId: created.manifest.backupId, destinationDirectory: destination,
+    }), { code: "BACKUP_CORRUPTED" });
+    await assert.rejects(lstat(destination), { code: "ENOENT" });
+    assert.equal((await readdir(current.root)).some((name) => name.startsWith(".restore-")), false);
+  }
 });
 
 test("backup catalog is newest-first, bounded, and never exposes local paths", async (t) => {
@@ -556,7 +678,7 @@ test("a trusted owner failure preserves active bytes and removes the candidate",
     migration: createProductionRestoreMigrationRegistry(),
   });
   const future = Buffer.from(
-    `${JSON.stringify({ schemaVersion: 3, revision: 0, sessions: {} })}\n`,
+    `${JSON.stringify({ schemaVersion: 4, revision: 0, sessions: {} })}\n`,
   );
   const ownerPath = path.join(current.source, "code-executor-state.json");
   await writeFile(ownerPath, future);

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { isBrainRequestInfrastructureFailure } from "../domain/brain-failure-recovery.js";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
+import { automaticReviewEligibility } from "../domain/automatic-review-policy.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
 import { createPrReviewConfirmationPlan } from "../domain/pr-review-confirmation.js";
 import { EmployeeController } from "./employee-controller.js";
@@ -201,6 +203,90 @@ function isAnalysisBlocked(job) {
   );
 }
 
+function brainIdentity(brain) {
+  if (typeof brain?.provider !== "string" || !brain.provider ||
+      typeof brain.model !== "string" || !brain.model) return null;
+  return { provider: brain.provider, model: brain.model };
+}
+
+function sameBrain(left, right) {
+  return Boolean(left && right && left.provider === right.provider && left.model === right.model);
+}
+
+function hasValidAnalysisAttemptBudget(job) {
+  const budget = job.analysisAttemptBudget;
+  return budget === undefined || Boolean(brainIdentity(budget) &&
+    Number.isSafeInteger(budget.attemptOffset) && budget.attemptOffset >= 0 &&
+    Number.isSafeInteger(job.attempts) && budget.attemptOffset <= job.attempts);
+}
+
+function analysisAttemptBudget(job, brain) {
+  if (!hasValidAnalysisAttemptBudget(job)) return null;
+  const budget = job.analysisAttemptBudget;
+  if (job.status === "retry_wait" && canRebindAnalysisModel(job, brain)) {
+    return { ...brain, attemptOffset: job.attempts };
+  }
+  return sameBrain(budget, brain) ? { ...brain, attemptOffset: budget.attemptOffset }
+    : { ...brain, attemptOffset: 0 };
+}
+
+function isLegacyOllamaTransportFailure(job) {
+  return job.failureCode === undefined && job.failurePhase === undefined &&
+    job.brain?.provider === "ollama" &&
+    job.error === "Ollama employee transport request failed";
+}
+
+function hasRecoverableAnalysisIdentity(job, brain) {
+  return Boolean(brain && ["blocked", "retry_wait"].includes(job.status) &&
+    !job.confirmationId && !job.confirmationFailure && !job.confirmationIntent && !job.handoffWorkItemId &&
+    !job.completedAt && !job.decision && !job.leaseUntil &&
+    Number.isSafeInteger(job.attempts) && job.attempts >= 1 && job.attempts < Number.MAX_SAFE_INTEGER &&
+    hasValidAnalysisAttemptBudget(job));
+}
+
+function knownAnalysisTransportFailure(job) {
+  const failure = job.analysisFailure;
+  return job.brain?.provider === "ollama" && job.error === "Ollama employee transport request failed" &&
+    (failure === undefined ? isLegacyOllamaTransportFailure(job) : failure.phase === "analysis" && failure.code === "PR_EMPLOYEE_JOB_FAILED") &&
+    (!job.brain.fallbackFrom || job.brain.fallbackFrom.reason === "PR_EMPLOYEE_PRIMARY_TIMEOUT" ||
+      isBrainRequestInfrastructureFailure(job.brain.fallbackFrom.reason));
+}
+
+function recordedInfrastructureFailure(job) {
+  const failure = job.analysisFailure;
+  return failure?.phase === "analysis" && failure.infrastructureFailure === true && failure.modelFailure === false &&
+    (failure.code === "PR_EMPLOYEE_PRIMARY_TIMEOUT" || isBrainRequestInfrastructureFailure(failure.code) || knownAnalysisTransportFailure(job));
+}
+
+function canRebindAnalysisModel(job, brain) {
+  if (!hasRecoverableAnalysisIdentity(job, brain)) return false;
+  const failure = job.analysisFailure;
+  if (failure === undefined ? !isLegacyOllamaTransportFailure(job)
+    : failure?.phase !== "analysis" || (failure.modelFailure !== true && !recordedInfrastructureFailure(job))) return false;
+  const previousBrain = brainIdentity(job.analysisAttemptBudget ?? job.brain?.fallbackFrom ?? job.brain);
+  return Boolean(previousBrain && !sameBrain(previousBrain, brain));
+}
+
+function recoverInfrastructureAnalysis(job, brain, runAt) {
+  if (!isAnalysisBlocked(job) || !hasRecoverableAnalysisIdentity(job, brain)) return null;
+  if (!knownAnalysisTransportFailure(job) && !recordedInfrastructureFailure(job)) return null;
+  const previousBrain = brainIdentity(job.analysisAttemptBudget ?? job.brain?.fallbackFrom ?? job.brain);
+  if (!sameBrain(previousBrain, brain)) return null;
+  // Only the last persisted failure is proven infrastructure-related. Refund
+  // that one attempt; retain all earlier charges and the complete job history.
+  const offset = (job.analysisAttemptBudget?.attemptOffset ?? 0) + 1;
+  if (offset > job.attempts) return null;
+  return { ...job, status: "queued", error: "", startedAt: null, leaseUntil: null, nextAttemptAt: null,
+    analysisAttemptBudget: { ...brain, attemptOffset: offset }, infrastructureRetryRequestedAt: runAt, updatedAt: runAt };
+}
+
+function recoverForChangedAnalysisModel(job, brain, runAt) {
+  if (!isAnalysisBlocked(job) || !canRebindAnalysisModel(job, brain)) return null;
+  return { ...job, status: "queued", error: "", startedAt: null, leaseUntil: null, nextAttemptAt: null,
+    analysisAttemptBudget: { ...brain, attemptOffset: job.attempts },
+    modelRetryRequestedAt: runAt, updatedAt: runAt };
+}
+
 function jobFingerprint(item, policyVersion) {
   return [
     item.id,
@@ -287,7 +373,12 @@ function latestJobError(jobs) {
       (left, right) =>
         Date.parse(right.updatedAt || 0) - Date.parse(left.updatedAt || 0),
     )[0];
-  return job ? `#${job.number}: ${job.error}` : "";
+  if (!job) return "";
+  const primary = job.brain?.fallbackFrom;
+  if (!primary) return `#${job.number}: ${job.error}`;
+  const detail = primary.nativeFailure;
+  const stage = detail ? ` (${detail.method ?? detail.kind}, ${detail.code ?? "未知"})` : "";
+  return `#${job.number}：主模型 ${primary.provider}/${primary.model} 失败（${primary.reason}${stage}）；备用模型 ${job.brain.provider}/${job.brain.model} 失败（${job.error}）`;
 }
 
 function trimJobs(jobs, limit) {
@@ -345,6 +436,42 @@ function projectWork(state) {
 
 export class ProactivePrEmployeeService {
   #admitAction;
+
+  #isCandidate(item) {
+    // The GitHub source already routes authored review feedback to developer.
+    // A legacy owner-request handoff would supersede that automatic repair root.
+    if (
+      this.config.triageOnly === true &&
+      this.config.automaticOwnPrRepair === true &&
+      item?.relation === "authored" &&
+      ["address_review", "resolve_conflict"].includes(item.nextAction)
+    ) {
+      return false;
+    }
+    const policy = this.config.automaticReviewPolicy;
+    return isCandidate(item) && (policy == null || item.relation !== "review_requested" ||
+      (policy.enabled && automaticReviewEligibility(item, policy.account, this.clock()) === null));
+  }
+
+  async #stillNeedsReviewTriage(item, signal) {
+    const policy = this.config.automaticReviewPolicy;
+    if (this.config.triageOnly !== true || policy?.enabled !== true || item.relation !== "review_requested") return true;
+    const unavailable = () => Object.assign(new Error("无法读取 PR 当前审核与分配状态"), { code: "PR_LIVE_REVIEW_FACTS_UNAVAILABLE" });
+    if (typeof this.github.readIncomingReviewRequest !== "function") throw unavailable();
+    const facts = await this.github.readIncomingReviewRequest({ repository: item.repo, number: item.number, account: policy.account },
+      signal === null ? undefined : { signal });
+    signal?.throwIfAborted();
+    if (facts?.kind !== "pull_request" || facts.incomingReviewFactsAvailable !== true ||
+        typeof facts.repo !== "string" || facts.repo.toLowerCase() !== item.repo.toLowerCase() ||
+        typeof facts.currentUser !== "string" || facts.currentUser.toLowerCase() !== policy.account.toLowerCase() ||
+        !["open", "closed", "merged"].includes(facts.state?.toLowerCase()) || typeof facts.isDraft !== "boolean" ||
+        typeof facts.author !== "string" || !facts.author || !Array.isArray(facts.assignees) ||
+        !facts.assignees.every(login => typeof login === "string" && login.length > 0) ||
+        !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(facts.headRefOid || "")) throw unavailable();
+    const reason = automaticReviewEligibility(facts, policy.account, this.clock());
+    if (reason === "INVALID_TARGET" || (reason === "SELF_AUTHORED" && facts.author.toLowerCase() !== policy.account.toLowerCase())) throw unavailable();
+    return facts.headRefOid === item.headRefOid && reason === null;
+  }
 
   constructor({
     store,
@@ -790,7 +917,7 @@ export class ProactivePrEmployeeService {
     const snapshot = await this.store.read("snapshot", null);
     if (snapshot?.sourceStatus?.githubPullRequests?.ok !== true) return state;
     const currentBySubject = new Map(
-      snapshot.items.filter(isCandidate).map((item) => [item.id, item]),
+      snapshot.items.filter((item) => this.#isCandidate(item)).map((item) => [item.id, item]),
     );
     const ids = state.jobs
       .filter((job) => ACTIVE_JOB_STATES.has(job.status))
@@ -1004,7 +1131,7 @@ export class ProactivePrEmployeeService {
       !current ||
       current.headRefOid !== job.headRefOid ||
       !sameJobGitTarget(job, current) ||
-      !isCandidate(current)
+      !this.#isCandidate(current)
     ) {
       state.jobs[index] = {
         ...job,
@@ -1065,7 +1192,10 @@ export class ProactivePrEmployeeService {
     const current = snapshot?.items?.find(
       (item) => item.id === job.subjectId,
     );
-    if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion)) {
+    if (
+      !this.#isCandidate(current) ||
+      !jobMatchesCurrentCandidate(job, current, this.config.policyVersion)
+    ) {
       const completedAt = this.clock().toISOString();
       state.jobs[index] = {
         ...job,
@@ -1084,6 +1214,9 @@ export class ProactivePrEmployeeService {
         ...job,
         status: "queued",
         attempts: 0,
+        ...(job.analysisAttemptBudget ? {
+          analysisAttemptBudget: { ...job.analysisAttemptBudget, attemptOffset: 0 },
+        } : {}),
         error: "",
         startedAt: null,
         leaseUntil: null,
@@ -1200,7 +1333,7 @@ export class ProactivePrEmployeeService {
       return state;
     }
 
-    const candidates = snapshot.items.filter(isCandidate);
+    const candidates = snapshot.items.filter((item) => this.#isCandidate(item));
     const currentBySubject = new Map(candidates.map((item) => [item.id, item]));
     let jobsChanged = false;
     const unresolvedSubjects = new Set(
@@ -1253,6 +1386,20 @@ export class ProactivePrEmployeeService {
 
     if (jobsChanged) {
       state = await this.controller.writeState(state);
+      signal?.throwIfAborted();
+    }
+
+    const requestedBrain = brainIdentity(this.reviewer);
+    const recoveredJobs = state.jobs.map((job) => {
+      const current = currentBySubject.get(job.subjectId);
+      if (!jobMatchesCurrentCandidate(job, current, this.config.policyVersion) ||
+          job.repo !== current.repo || job.number !== current.number ||
+          job.fingerprint !== jobFingerprint(current, this.config.policyVersion)) return job;
+      return recoverForChangedAnalysisModel(job, requestedBrain, runAt) ?? recoverInfrastructureAnalysis(job, requestedBrain, runAt) ?? job;
+    });
+    if (recoveredJobs.some((job, index) => job !== state.jobs[index])) {
+      state = await runAdmittedOperation(this.#admitAction,
+        () => this.controller.writeState({ ...state, jobs: recoveredJobs }));
       signal?.throwIfAborted();
     }
 
@@ -1362,6 +1509,8 @@ export class ProactivePrEmployeeService {
     let index = state.jobs.findIndex((job) => job.id === id);
     if (index < 0) return state;
     const startedAt = this.clock().toISOString();
+    const requestedBrain = brainIdentity(this.reviewer);
+    const budget = requestedBrain ? analysisAttemptBudget(state.jobs[index], requestedBrain) : null;
     const claimed = {
       ...state.jobs[index],
       status: "running",
@@ -1370,10 +1519,12 @@ export class ProactivePrEmployeeService {
       updatedAt: startedAt,
       leaseUntil: new Date(Date.parse(startedAt) + 120_000).toISOString(),
       error: "",
+      analysisFailure: null,
       brain: {
         provider: this.reviewer?.provider || "",
         model: this.reviewer?.model || "",
       },
+      ...(budget ? { analysisAttemptBudget: budget } : {}),
     };
     const claimedState = {
       ...state,
@@ -1387,6 +1538,8 @@ export class ProactivePrEmployeeService {
     );
     signal?.throwIfAborted();
 
+    let attemptBrain = claimed.brain;
+    let failurePhase = "context";
     try {
       if (!this.reviewer) throw new Error("岗位大脑未配置");
       const snapshot = await this.store.read("snapshot");
@@ -1399,7 +1552,7 @@ export class ProactivePrEmployeeService {
           candidate.nextAction === claimed.nextAction &&
           candidate.relation === claimed.relation,
       );
-      if (!item || !isCandidate(item)) {
+      if (!item || !this.#isCandidate(item)) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
       const policy = effectiveWorkPolicy(item, this.config.triageOnly);
@@ -1414,17 +1567,23 @@ export class ProactivePrEmployeeService {
       ) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
-      const analysis = await runAdmittedOperation(
+      const { analysis, brain: actualBrain } = await runAdmittedOperation(
         this.#admitAction,
-        () => this.reviewer.analyze(
-          {
+        async () => {
+          const input = {
             ...context,
             workMode: policy.mode,
             requestedAction: item.nextAction,
-          },
-          signal === null ? undefined : { signal },
-        ),
+          };
+          const options = signal === null ? undefined : { signal };
+          failurePhase = "analysis";
+          return typeof this.reviewer.analyzeWithReceipt === "function"
+            ? this.reviewer.analyzeWithReceipt(input, options)
+            : { analysis: await this.reviewer.analyze(input, options), brain: claimed.brain };
+        },
       );
+      attemptBrain = actualBrain;
+      failurePhase = "post_analysis";
       signal?.throwIfAborted();
       const latest = await this.store.read("snapshot");
       signal?.throwIfAborted();
@@ -1437,13 +1596,19 @@ export class ProactivePrEmployeeService {
         !sameJobGitTarget(claimed, current) ||
         current.nextAction !== claimed.nextAction ||
         current.relation !== claimed.relation ||
-        !isCandidate(current)
+        !this.#isCandidate(current)
       ) {
         return this.#finishAsSuperseded(state, claimed.id);
       }
 
       index = state.jobs.findIndex((job) => job.id === claimed.id);
       const completedAt = this.clock().toISOString();
+      failurePhase = "handoff";
+      // Analysis may outlive a publication or QA handoff while the dashboard
+      // snapshot still has the same Head. Re-read live scope before creating work.
+      if (policy.targetRoleId === "pr-engineer" && !await this.#stillNeedsReviewTriage(current, signal)) {
+        return this.#finishAsSuperseded(state, claimed.id);
+      }
       const handoff = policy.targetRoleId
         ? await this.triageHandoff.submit({
             requestKey: claimed.id,
@@ -1452,6 +1617,7 @@ export class ProactivePrEmployeeService {
             number: item.number,
             nextAction: item.nextAction,
             expectedHeadRefOid: claimed.headRefOid,
+            ...(policy.targetRoleId === "pr-engineer" && current.gitTarget ? { gitTarget: current.gitTarget } : {}),
           })
         : null;
       if (
@@ -1477,7 +1643,7 @@ export class ProactivePrEmployeeService {
         ...(policy.targetRoleId ? { targetRoleId: policy.targetRoleId } : {}),
         ...(handoff ? { handoffWorkItemId: handoff.workItemId } : {}),
         status: policy.requiresApproval ? "ready_for_human" : "ready",
-        brain: { ...claimed.brain },
+        brain: { ...actualBrain },
         updatedAt: completedAt,
         completedAt,
         leaseUntil: null,
@@ -1495,6 +1661,7 @@ export class ProactivePrEmployeeService {
       } else {
         state.jobs[index] = completed;
       }
+      failurePhase = "persistence";
       state.lastError = "";
       state = this.#queueMemory(state, state.jobs[index], "analysis_ready");
       signal?.throwIfAborted();
@@ -1525,15 +1692,27 @@ export class ProactivePrEmployeeService {
       }
       const failedAt = this.clock().toISOString();
       const attempts = state.jobs[index].attempts || 1;
-      const blocked = attempts >= this.config.maxAttempts;
-      const retryIndex = Math.min(
-        attempts - 1,
-        this.config.retryMinutes.length - 1,
-      );
+      const failureReceipt = failurePhase === "analysis" && typeof this.reviewer?.getFailureReceipt === "function"
+        ? this.reviewer.getFailureReceipt(error) : null;
+      const failureBrain = failureReceipt?.brain ?? attemptBrain;
+      const legacyTransportFailure = failureBrain?.provider === "ollama" &&
+        error?.code === undefined && error?.message === "Ollama employee transport request failed";
+      const infrastructureFailure = failurePhase === "analysis" && (failureReceipt?.infrastructureFailure === true ||
+        (failureReceipt === null && legacyTransportFailure));
+      const nextBudget = infrastructureFailure && budget ? { ...budget, attemptOffset: budget.attemptOffset + 1 } : budget;
+      const modelAttempts = attempts - (nextBudget?.attemptOffset ?? 0);
+      const blocked = !infrastructureFailure && modelAttempts >= this.config.maxAttempts;
+      const retryIndex = infrastructureFailure && ["STRUCTURED_PROVIDER_BUSY", "STRUCTURED_PROVIDER_QUEUE_TIMEOUT"].includes(error?.code)
+        ? 0 : Math.min((infrastructureFailure ? attempts : modelAttempts) - 1, this.config.retryMinutes.length - 1);
       const retryMinutes = this.config.retryMinutes[retryIndex] || 1;
       state.jobs[index] = {
         ...state.jobs[index],
         status: blocked ? "blocked" : "retry_wait",
+        brain: { ...failureBrain },
+        analysisFailure: { phase: failurePhase, code: stableFailureCode(error),
+          modelFailure: failurePhase === "analysis" && (failureReceipt?.modelFailure ?? false),
+          ...(infrastructureFailure ? { infrastructureFailure: true } : {}) },
+        ...(nextBudget ? { analysisAttemptBudget: nextBudget } : {}),
         error: error.message || String(error),
         updatedAt: failedAt,
         leaseUntil: null,

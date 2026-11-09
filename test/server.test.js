@@ -3,9 +3,525 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { TaskRunRegistry } from '../src/services/task-run-registry.js';
+import { WorkContinuationScheduler } from '../src/services/work-continuation-scheduler.js';
+
+async function targetedContinuationChain({ holdOrdinary = false } = {}) {
+  const values = new Map(), decisions = [], finished = deferred(), ordinaryStarted = deferred(), ordinaryRelease = deferred();
+  let enabled = !holdOrdinary;
+  const store = { async read(k, fallback) { return structuredClone(values.get(k) ?? fallback); },
+    async write(k, v) { values.set(k, structuredClone(v)); } };
+  const now = '2026-10-23T16:00:00.000Z';
+  const items = ['first', 'continuation'].map((id, index) => ({
+    itemId: `work-${id}`, kind: 'assignment', assignmentId: `assignment-${id}`, sourceSequence: index + 1,
+    inputDigest: 'a'.repeat(64), assignment: { assignmentId: `assignment-${id}`, target: { type: 'role', id: 'developer' } },
+    event: { eventId: `event-${id}`, eventType: 'pull_request.updated', subject: { id }, payload: {} },
+    graph: { parentItemId: null, dependsOnItemIds: [], acceptanceContracts: [], deliveries: [] },
+    currentTarget: { type: 'role', id: 'developer' }, activeIntentId: null, decisionContext: null,
+    status: 'queued', revision: 1, ownerId: null, leaseId: null, leaseUntil: null,
+    attempt: 0, availableAt: null, statusReason: null, createdAt: now, updatedAt: now,
+  }));
+  const ledger = { async intake() { return { received: 0 }; },
+    async listItems() { return { items: structuredClone(items), nextCursor: null }; },
+    async readItemForReconciliation({ itemId }) { return structuredClone(items.find(x => x.itemId === itemId) ?? null); },
+    async readItemProgress(ids) { return structuredClone(items.filter(x => ids.includes(x.itemId))); },
+    async claim(input) {
+      const item = items.find(x => x.itemId === input.itemId);
+      assert.equal(input.expectedRevision, item.revision);
+      Object.assign(item, { status: 'working', revision: item.revision + 1, ownerId: input.workerId,
+        leaseId: `lease-${item.itemId}`, leaseUntil: '2026-10-23T16:10:00.000Z', attempt: item.attempt + 1 });
+      return structuredClone(item);
+    },
+    async stageIntent({ itemId }) { const item = items.find(x => x.itemId === itemId);
+      Object.assign(item, { status: 'dispatch_pending', revision: item.revision + 1, ownerId: null, leaseId: null, leaseUntil: null }); },
+    async scheduleRetry() { assert.fail('valid continuation must not retry its decision'); }, async transition() {},
+  };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } };
+  const scheduler = new WorkContinuationScheduler({ store,
+    ledger: { ...ledger, async listClaimCandidates() { return { items: [structuredClone(items[1])],
+      facts: [{ itemId: items[1].itemId, graphBlocked: false }], nextCursor: null }; } },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled, paused: false }; } },
+  });
+  const definition = { id: 'developer', name: 'Developer', mission: 'Implement work', enabled: true, scheduleMinutes: 5 };
+  const permissions = { allowedIntents: ['complete'] };
+  const brain = { provider: 'local-test', model: 'target-chain', remoteData: { requirements: false, code: false, memory: false } };
+  let coordination, cycleResult;
+  const engine = { view() { return { definition, permissions, brain: { ...brain, remote: false } }; },
+      async decide({ item }) { decisions.push(item.itemId);
+        if (holdOrdinary && item.itemId === 'work-first') { ordinaryStarted.resolve(); await ordinaryRelease.promise; }
+        else enabled = false;
+        return { schemaVersion: 1, confidence: 100, summary: 'Done', intent: { schemaVersion: 1,
+          type: 'complete', summary: 'Done', reason: 'Test complete', outcome: 'no-action', evidence: [] } }; } };
+  const employee = new ConfiguredRoleEmployee({ definition, permissions, brain, taskBrain: brain, store,
+    decisionEngine: engine, taskDecisionEngine: engine,
+    onRun: async ({ roleId, signal, continuationTarget }) => {
+      try { cycleResult = await coordination.runCycle({ roleId, signal,
+        ...(continuationTarget ? { continuationTarget } : {}) }); return cycleResult;
+      } finally { if (items[1].status === 'dispatch_pending' || !holdOrdinary) finished.resolve(); }
+    },
+  });
+  const legacy = { id: 'pr-reviewer', scheduleMinutes: 0, async view() { return {}; },
+    async roleView() { return { id: 'pr-reviewer', enabled: true, paused: false }; }, async run() {}, async control() {} };
+  const registry = new EmployeeRegistry([legacy, employee]);
+  const loop = new ProactiveWorkLoop({ ledger, clock: () => now,
+    roleDirectory: new RoleWorkerDirectory({ workers: [employee.asRoleWorker()], legacyEmployeeRegistry: registry, legacyOwnedRoleIds: [] }) });
+  const noOp = { async runCycle() {} };
+  coordination = new WorkCoordinationService({ ledger, workLoop: loop, workLimit: 1,
+    proposalResultReconciler: noOp, attentionResultReconciler: noOp, conditionWaker: noOp,
+    dispatcher: { async dispatchPending() {} } });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, employeeRegistry: registry,
+    workContinuationScheduler: scheduler, refreshService: { async refresh() {} } },
+    { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await background.initialRefresh;
+    if (holdOrdinary) {
+      const ordinary = background.runEmployee('developer', { trigger: 'manual' });
+      await ordinaryStarted.promise;
+      enabled = true;
+      await timers.find(t => t.delay === 10_000).callback();
+      for (let index = 0; index < 10; index += 1) await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(decisions, ['work-first'], 'the target must wait rather than start a parallel role decision');
+      assert.equal(scheduler.readStatus().running, 1, 'the target wake remains owned while queued');
+      ordinaryRelease.resolve(); await ordinary;
+    }
+    await finished.promise;
+    assert.deepEqual(cycleResult.stages.work.result.outcomes.map(x => ({ status: x.status, code: x.code })),
+      [{ status: 'staged', code: undefined }]);
+    assert.deepEqual(decisions, holdOrdinary ? ['work-first', 'work-continuation'] : ['work-continuation']);
+    assert.equal(items[0].revision, holdOrdinary ? 3 : 1, 'a target wake must not spend its budget on the first ordinary candidate');
+    assert.equal(items[1].status, 'dispatch_pending');
+  } finally { ordinaryRelease.resolve(); enabled = false; await background.stop(); }
+}
+
+test('automatic role timer ticks use durable scheduling while manual runs and nonautomatic schedules remain available', async t => {
+  for (const automatic of [true, false]) await t.test(String(automatic), async () => {
+    const timers = [], decisions = [], revisions = [];
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticReview: automatic } },
+      refreshService: { async refresh() {} },
+      employeeRegistry: { schedules: () => [{ id: 'developer', intervalMinutes: 5 }],
+        async runSelected(ids) { decisions.push(...ids); }, async runAll() {} },
+      workContinuationScheduler: { async runCycle(options) { revisions.push(options.runtimeRevision); return { started: 0 }; } },
+    }, { runtimeRevision: 'a'.repeat(64),
+      setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; },
+      clearIntervalFn() {}, reportError(error) { throw error; } });
+    try {
+      await background.initialRefresh;
+      for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+      decisions.length = 0;
+      const wakes = revisions.length;
+      await timers.find(timer => timer.delay === 5 * 60_000).callback();
+      for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve));
+      assert.equal(decisions.includes('developer'), !automatic);
+      if (automatic) { assert.ok(revisions.length > wakes); assert.equal(revisions.at(-1), 'a'.repeat(64)); }
+      await background.runEmployee('developer', { trigger: 'manual' });
+      assert.equal(decisions.includes('developer'), true);
+    } finally { await background.stop(); }
+  });
+});
+
+test('a durable continuation executes its exact lower-ranked item through the configured role chain', { timeout: 5_000 },
+  () => targetedContinuationChain());
+test('a targeted wake waits for an existing ordinary role cycle and executes afterwards without coalescing it away', { timeout: 5_000 },
+  () => targetedContinuationChain({ holdOrdinary: true }));
+
+test('the automatic configured role chain returns its exact preclaim deferral to the continuation', async () => {
+  let dispatch;
+  const values = new Map(), target = { itemId: 'work-stale', fingerprint: 'a'.repeat(64) };
+  const employee = new ConfiguredRoleEmployee({
+    definition: { id: 'orchestrator', name: 'Orchestrator', mission: 'Coordinate work', enabled: true, scheduleMinutes: 0 },
+    permissions: { allowedIntents: ['complete'] },
+    brain: { provider: 'local-test', model: 'test', remoteData: { requirements: false, code: false, memory: false } },
+    decisionEngine: { view() { return {}; }, async decide() { assert.fail('stale facts must precede a model decision'); } },
+    store: { async read(key, fallback) { return structuredClone(values.get(key) ?? fallback); },
+      async write(key, value) { values.set(key, structuredClone(value)); } },
+    onRun: async ({ continuationTarget }) => {
+      assert.deepEqual(continuationTarget, target);
+      return { stages: { work: { ok: true, result: { scanned: 1, workAttempts: 0,
+        outcomes: [{ itemId: target.itemId, status: 'decision_deferred', code: 'PR_FACTS_STALE', privateDetails: 'private material' }] } } } };
+    },
+  });
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() {} },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, options) {
+      return ids.includes('orchestrator') ? [await employee.run(options)] : [];
+    } },
+    workContinuationScheduler: { async runCycle(options) { dispatch = options.dispatch; return { started: 0 }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError(error) { throw error; } });
+  try {
+    await background.initialRefresh;
+    for (let i = 0; i < 10 && !dispatch; i++) await new Promise(resolve => setImmediate(resolve));
+    const result = await dispatch({ roleId: 'orchestrator', continuationTarget: target, signal: new AbortController().signal });
+    assert.deepEqual(result, { skipped: null, continuationOutcome: { ...target, status: 'decision_deferred', code: 'PR_FACTS_STALE' } });
+    assert.equal(JSON.stringify(await employee.view()).includes('work-stale'), false);
+    assert.equal(JSON.stringify(result).includes('private material'), false);
+  } finally { await background.stop(); }
+});
+
+test('automatic continuation timeout reaches the role and keeps shutdown waiting for late work', { timeout: 5_000 }, async () => {
+  const started = deferred(), cancelled = deferred(), release = deferred();
+  const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
+  let now = Date.now(), state, calls = 0;
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
+    ledger: {
+      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() {} },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, { signal }) {
+      if (ids[0] !== 'developer') return;
+      calls += 1; signal.addEventListener('abort', () => cancelled.resolve(signal.reason), { once: true });
+      started.resolve(); await release.promise; signal.throwIfAborted();
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await started.promise; await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve)); now += 1_001;
+    await timers.find(timer => timer.delay === 10_000).callback();
+    assert.equal((await cancelled.promise).code, 'WORK_CONTINUATION_TIMEOUT');
+    await timers.find(timer => timer.delay === 10_000).callback(); assert.equal(calls, 1);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await background.initialRefresh;
+    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test('continuation watchdog still stops owned work after fact refresh fails', { timeout: 5_000 }, async () => {
+  const started = deferred(), cancelled = deferred(), release = deferred();
+  const item = { itemId: 'work-timeout', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true }, workCoordination: { leaseDurationMs: 1_000 } };
+  let now = Date.now(), state, calls = 0, failRefresh = false;
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(state ?? fallback); }, async write(_key, value) { state = structuredClone(value); } },
+    ledger: {
+      async listClaimCandidates() { return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); }, async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } }, clock: () => new Date(now),
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() { if (failRefresh) throw new Error('facts unavailable'); } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids, { signal }) {
+      if (ids[0] !== 'developer') return;
+      calls += 1; signal.addEventListener('abort', () => cancelled.resolve(signal.reason), { once: true });
+      started.resolve(); await release.promise; signal.throwIfAborted();
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await started.promise; await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve));
+    failRefresh = true;
+    await timers.find(timer => timer.delay === 7 * 60_000).callback();
+    now += 1_001;
+    await timers.find(timer => timer.delay === 10_000).callback();
+    assert.equal((await cancelled.promise).code, 'WORK_CONTINUATION_TIMEOUT');
+    await timers.find(timer => timer.delay === 10_000).callback(); assert.equal(calls, 1);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await background.initialRefresh;
+    assert.equal(state.records[0].receipts[0].outcome, 'timed_out');
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test('deferred DingTalk enrichment releases facts and remains owned by shutdown', { timeout: 5_000 }, async () => {
+  const started = deferred();
+  let summarySignal, deferredRefresh;
+  const background = startApplicationBackgroundWork({ config: { refreshMinutes: 7 },
+    refreshService: {
+      async refresh(options) { deferredRefresh = options.deferDingTalkSummary; },
+      async summarizePendingDingTalk({ signal }) {
+        summarySignal = signal; started.resolve();
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+      },
+    },
+    employeeRegistry: { schedules: () => [], async runAll() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    await started.promise;
+    assert.equal(deferredRefresh, true);
+    assert.equal(summarySignal.aborted, false);
+    await background.stop();
+    assert.equal(summarySignal.aborted, true);
+  } finally { await background.stop(); }
+});
+
+test('shutdown removes unstarted queued manual work while still draining admitted work', { timeout: 5_000 }, async () => {
+  const codeStarted = deferred(), releaseCode = deferred();
+  let roleCalls = 0;
+  const background = startApplicationBackgroundWork({ config: { refreshMinutes: 7 },
+    refreshService: { async refresh() {} },
+    workCoordination: { async runCycle() { codeStarted.resolve(); await releaseCode.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) { if (ids.includes('requirements-analyst')) roleCalls += 1; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.catch(error => error);
+  try {
+    await codeStarted.promise;
+    const queued = background.runEmployee('requirements-analyst').catch(error => error);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(background.drainStatus().queuedOperationCount, 1);
+    assert.equal(roleCalls, 0);
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    assert.equal((await queued).code, 'LIFECYCLE_SHUTDOWN_ABORTED');
+    assert.equal(background.drainStatus().queuedOperationCount, 0);
+    assert.equal(stopped, false);
+    assert.equal(roleCalls, 0);
+    releaseCode.resolve(); await stopping; await initial;
+    assert.equal(roleCalls, 0, 'cancelled queued work must never execute later');
+  } finally { releaseCode.resolve(); await background.stop(); await initial; }
+});
+
+test('automatic code execution leaves result reconciliation and fact refresh free while retaining shutdown ownership', { timeout: 5_000 }, async () => {
+  const facts = deferred(), release = deferred(), timers = [];
+  let refreshes = 0, reconciliations = 0, calls = 0, executions = 0, workerSignal;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { await facts.promise; refreshes += 1; } },
+    employeeRegistry: { schedules: () => [], async runSelected() {} },
+    workCoordination: { async intake() {}, async runCycle() { reconciliations += 1; } },
+    codeJobExecution: { async runCycle({ signal }, runOperation) {
+      calls += 1;
+      if (executions === 0) {
+        executions += 1;
+        runOperation(async () => { workerSignal = signal; await release.promise; signal.throwIfAborted(); }).catch(() => {});
+      }
+      return { scheduled: executions };
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(calls, 0, 'execution needs admitted facts');
+    facts.resolve(); await background.initialRefresh; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(executions, 1);
+    const tick = timers.find(timer => timer.delay === 10_000);
+    const beforePolls = calls;
+    await tick.callback(); await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.ok(calls > beforePolls, 'short admission polls must continue while a model runs');
+    assert.equal(executions, 1, 'continued polling must not duplicate the owned execution');
+    await timers.find(timer => timer.delay === 7 * 60_000).callback();
+    assert.equal(refreshes, 2); assert.equal(reconciliations, 2, 'fresh results can reconcile before the model returns');
+    assert.ok(background.drainStatus().activeParticipants.some(participant => participant.id === DRAIN_PARTICIPANTS.codeJobExecution.id));
+    const beforeStop = calls;
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(workerSignal.aborted, true); assert.equal(stopped, false);
+    release.resolve(); await stopping; await tick.callback(); assert.equal(calls, beforeStop);
+  } finally { facts.resolve(); release.resolve(); await background.initialRefresh; await background.stop(); }
+});
+
+for (const slowStage of ['legacy-review', 'housekeeping', 'memory-projection']) test(`automatic fact refresh remains free while ${slowStage} owns late work`, { timeout: 5_000 }, async () => {
+  const started = deferred(), release = deferred(), timers = [];
+  let refreshes = 0, reviews = 0, requirements = 0, initialSettled = false;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { refreshes += 1; } },
+    workCoordination: { async intake() {}, async runCycle() {
+      if (slowStage === 'housekeeping') { started.resolve(); await release.promise; }
+    } },
+    memoryProjector: { async runCycle() {
+      if (slowStage === 'memory-projection') { started.resolve(); await release.promise; }
+    } },
+    employeeRegistry: { schedules: () => [{ id: 'requirements-analyst', intervalMinutes: 1 }, { id: 'pr-reviewer', intervalMinutes: 2 }],
+      async runSelected(ids) {
+        if (ids.includes('requirements-analyst')) requirements += 1;
+        if (ids.includes('pr-reviewer')) {
+          reviews += 1;
+          if (slowStage === 'legacy-review') { started.resolve(); await release.promise; }
+        }
+      } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.then(() => { initialSettled = true; }, error => {
+    if (error.code !== 'LIFECYCLE_SHUTDOWN_ABORTED') throw error;
+  });
+  try {
+    await started.promise; await new Promise(resolve => setImmediate(resolve));
+    assert.equal(initialSettled, true, 'fresh facts must finish independently of model and projection work');
+    await timers.find(timer => timer.delay === 60_000).callback(); assert.equal(requirements, 1);
+    const duplicateReview = timers.find(timer => timer.delay === 120_000).callback();
+    if (slowStage !== 'legacy-review') await duplicateReview;
+    await timers.find(timer => timer.delay === 7 * 60_000).callback(); assert.equal(refreshes, 2);
+    if (slowStage === 'legacy-review') assert.equal(reviews, 1, 'refresh and scheduled legacy patrol must coalesce');
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    release.resolve(); await stopping; await initial; await duplicateReview;
+  } finally { release.resolve(); await background.stop(); await initial; }
+});
+
+test('a continuation cancelled while waiting for fresh facts settles before the refresh and never runs later', async () => {
+  const refreshing = deferred(), releaseRefresh = deferred(), controller = new AbortController();
+  let refreshes = 0, dispatch, requirements = 0;
+  const timeout = Object.assign(new Error('continuation expired'), { code: 'WORK_CONTINUATION_TIMEOUT' });
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { if (++refreshes > 1) { refreshing.resolve(); await releaseRefresh.promise; } } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) { if (ids.includes('requirements-analyst')) requirements += 1; } },
+    workContinuationScheduler: { async runCycle(options) { dispatch = options.dispatch; return { started: 0 }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    await new Promise(resolve => setImmediate(resolve));
+    const refresh = background.refresh({ notify: true }); await refreshing.promise;
+    let settled = false;
+    const waiting = dispatch({ roleId: 'requirements-analyst', signal: controller.signal }).finally(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, false);
+    controller.abort(timeout);
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, true);
+    assert.deepEqual(await waiting, { skipped: 'continuation_timeout' });
+    assert.equal(requirements, 0);
+    releaseRefresh.resolve(); await refresh;
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(requirements, 0);
+  } finally { releaseRefresh.resolve(); await background.stop(); }
+});
+
+test('an automatic general fact waiter does not occupy operational admission and stops before the active refresh', async () => {
+  const gate = new OperationalQuiescenceGate(), refreshing = deferred(), release = deferred();
+  let work = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    refreshService: { async refresh() { refreshing.resolve(); await release.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected() { work += 1; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  const initial = background.initialRefresh.catch(error => error);
+  try {
+    await refreshing.promise;
+    assert.equal(gate.readStatus().activeOperations, 1, 'the admitted fact read owns one lease');
+    let settled = false;
+    const waiting = background.signalAgency({ trigger: 'waiting-for-facts' }).finally(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(gate.readStatus().activeOperations, 1, 'unstarted general work must not own another lease');
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(settled, true); assert.equal(stopped, false);
+    await waiting; assert.equal(work, 0);
+    release.resolve(); await stopping; await initial;
+    assert.equal(gate.readStatus().activeOperations, 0);
+  } finally { release.resolve(); await background.stop(); await initial; }
+});
+
+test('automatic local proposal retries run during long code work and remain in lifecycle drain', { timeout: 5_000 }, async () => {
+  const refreshed = deferred(), codeStarted = deferred(), releaseCode = deferred();
+  const retried = deferred(), releaseRetry = deferred(); const timers = []; let polls = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { async refresh() { await refreshed.promise; } },
+    employeeRegistry: { schedules: () => [], async runSelected() {} },
+    workCoordination: { async intake() {}, async runCycle() { codeStarted.resolve(); await releaseCode.promise; } },
+    localCodeProposalRecovery: { async runCycle() { polls += 1; if (polls > 1) { retried.resolve(); await releaseRetry.promise; } } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  const initial = background.initialRefresh.catch(error => {
+    if (error.code !== 'LIFECYCLE_SHUTDOWN_ABORTED') throw error;
+  });
+  try {
+    const tick = timers.find(t => t.delay === 10_000);
+    await tick.callback(); assert.equal(polls, 0, 'fresh facts are required');
+    refreshed.resolve(); await codeStarted.promise;
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(polls, 1);
+    await tick.callback(); await retried.promise;
+    await tick.callback(); assert.equal(polls, 2, 'duplicate ticks coalesce');
+    assert.ok(background.drainStatus().activeParticipants.some(p => p.id === DRAIN_PARTICIPANTS.localCodeProposalRecovery.id));
+    let stopped = false; const stopping = background.stop().then(() => { stopped = true; });
+    releaseCode.resolve(); await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    releaseRetry.resolve(); await stopping; await initial;
+    await tick.callback(); assert.equal(polls, 2);
+  } finally { refreshed.resolve(); releaseCode.resolve(); releaseRetry.resolve(); await background.stop(); }
+});
+
+for (const port of ['localCodeProposalRecovery', 'codeJobExecution']) test(`a first ${port} tick cannot enter closed maintenance admission`, async () => {
+  const gate = new OperationalQuiescenceGate(); const timers = []; let polls = 0; let token;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    refreshService: { async refresh() {} }, employeeRegistry: { schedules: () => [], async runSelected() {} },
+    [port]: { async runCycle() { polls += 1; } },
+  }, { reportError() {}, setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await background.initialRefresh; await new Promise(resolve => setImmediate(resolve));
+    const before = polls; const tick = timers.find(t => t.delay === 10_000);
+    token = await gate.enter();
+    await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(polls, before);
+    gate.leave(token); token = null;
+    await tick.callback(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(polls, before + 1);
+  } finally { if (token) gate.leave(token); await background.stop(); }
+});
+
+for (const port of ['localCodeProposalRecovery', 'codeJobExecution']) test(`manual mode does not poll the automatic ${port} port`, async () => {
+  const timers = []; let polls = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: false } },
+    refreshService: { async refresh() {} }, employeeRegistry: { schedules: () => [], async runSelected() {} },
+    [port]: { async runCycle() { polls += 1; } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try { await background.initialRefresh; await timers.find(t => t.delay === 10_000).callback(); assert.equal(polls, 0); }
+  finally { await background.stop(); }
+});
+
+test('durable continuations start automatically after fresh intake and hand off without a role timer', { timeout: 5_000 }, async () => {
+  const refresh = deferred();
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  const testerStarted = deferred();
+  const releaseTester = deferred();
+  const item = { itemId: 'work-continuation', revision: 1, status: 'queued', currentTarget: { type: 'role', id: 'developer' } };
+  let persisted;
+  let factRead = false;
+  const roles = [];
+  const config = { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } };
+  const scheduler = new WorkContinuationScheduler({
+    store: { async read(_key, fallback) { return structuredClone(persisted ?? fallback); }, async write(_key, state) { persisted = structuredClone(state); } },
+    ledger: {
+      async listClaimCandidates() { assert.equal(factRead, true); return { items: [structuredClone(item)], facts: [{ itemId: item.itemId, graphBlocked: false }], nextCursor: null }; },
+      async listItems() { return { items: [], nextCursor: null }; },
+      async readItemForReconciliation() { return structuredClone(item); },
+      async readItemProgress() { return [structuredClone(item)]; },
+    },
+    configurationReader: { async readActive() { return { configuration: config }; } },
+    roleStateReader: { async read() { return { enabled: true, paused: false }; } },
+  });
+  const timers = [];
+  const background = startApplicationBackgroundWork({ config, workContinuationScheduler: scheduler,
+    refreshService: { async refresh() { await refresh.promise; factRead = true; } },
+    employeeRegistry: { schedules: () => [], async runSelected(ids) {
+      const role = ids[0]; if (!['developer', 'tester'].includes(role)) return;
+      roles.push(role);
+      if (role === 'developer') { developerStarted.resolve(); await releaseDeveloper.promise; item.currentTarget.id = 'tester'; item.revision += 1; }
+      if (role === 'tester') { testerStarted.resolve(); await releaseTester.promise; item.revision += 1; }
+    } },
+  }, { setIntervalFn(callback, delay) { const timer = { callback, delay, unref() {} }; timers.push(timer); return timer; }, clearIntervalFn() {} });
+  try {
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(persisted, undefined);
+    refresh.resolve(); await developerStarted.promise;
+    assert.equal(persisted.records[0].status, 'running');
+    const tick = timers.find(timer => timer.delay === 10_000);
+    await tick.callback(); assert.deepEqual(roles, ['developer']);
+    releaseDeveloper.resolve(); await testerStarted.promise;
+    assert.deepEqual(roles, ['developer', 'tester']);
+    assert.ok(background.drainStatus().activeParticipants.some(({ id }) => id === DRAIN_PARTICIPANTS.workContinuation.id));
+    let stopped = false;
+    const stopping = background.stop().then(() => { stopped = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(stopped, false);
+    releaseTester.resolve(); await stopping; await background.initialRefresh;
+    assert.notEqual(persisted.records[0].status, 'running', 'the durable acknowledgement must be included in shutdown drain');
+  } finally { refresh.resolve(); releaseDeveloper.resolve(); releaseTester.resolve(); await background.stop(); }
+});
 import { createApplication } from "../src/composition-root.js";
 import {
   createDashboardServer,
@@ -18,7 +534,12 @@ import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
+import { createWorkProposalRunnerGroup } from "../src/services/work-proposal-runner-group.js";
 import { ReviewHandoffReconciler } from "../src/services/review-handoff-reconciler.js";
+import { createGitHubActionExecutor } from "../src/adapters/github-action-adapter.js";
+import { githubCredentialSourceError } from "../src/lib/github-credential-source.js";
+import { ManagedProcessError } from "../src/lib/managed-process.js";
+import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { createSafeDisabledConfiguration } from "../src/lib/config.js";
 import { ConfigurationStore } from "../src/services/configuration-store.js";
 import {
@@ -991,10 +1512,12 @@ async function withServer(
     memoryImports,
     codeJobReader,
     codeJobControl,
+    taskRuns,
     changePackageReader,
     changePackageApplicationRequester,
     changePackageApplicationStatusReader,
     codeJobEvidenceReader,
+    jenkinsConnection,
     runtimeSourceIdentity,
     onRecordConfirmationOutcome,
   } = {},
@@ -1236,6 +1759,8 @@ async function withServer(
   if (memoryImports) application.memoryImports = memoryImports;
   if (codeJobReader) application.codeJobReader = codeJobReader;
   if (codeJobControl) application.codeJobControl = codeJobControl;
+  if (jenkinsConnection) application.jenkinsConnection = jenkinsConnection;
+  if (taskRuns) application.taskRuns = taskRuns;
   if (changePackageReader) application.changePackageReader = changePackageReader;
   if (changePackageApplicationRequester) {
     application.changePackageApplicationRequester =
@@ -1262,6 +1787,43 @@ async function withServer(
     await server.shutdown();
   }
 }
+
+test('Jenkins connection HTTP API enforces local action headers and returns no supplied secret', async () => {
+  const connected = [];
+  const input = { repository: 'acme/repo', buildUrl: 'http://ci.example/job/Test/1/', username: 'fixture-user', password: 'fixture-secret' };
+  await withServer(async ({ server }) => {
+    const status = await request(server, { path: '/api/ci/jenkins/connection' });
+    assert.deepEqual(JSON.parse(status.body), { configured: false });
+    for (const headers of [{ 'content-type': 'application/json' }, { ...trustedConfigurationHeaders(), origin: 'http://other.invalid' }]) {
+      const rejected = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers, body: JSON.stringify(input) });
+      assert.equal(rejected.status, 403);
+    }
+    assert.equal(connected.length, 0);
+    const accepted = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers: trustedConfigurationHeaders(), body: JSON.stringify(input) });
+    assert.equal(accepted.status, 200); assert.deepEqual(connected, [input]); assert.ok(!accepted.body.includes(input.password));
+    assert.equal(accepted.headers['cache-control'], 'no-store');
+    const expanded = await request(server, { method: 'POST', path: '/api/ci/jenkins/connection', headers: trustedConfigurationHeaders(), body: JSON.stringify({ ...input, allowAllJobs: true }) });
+    assert.equal(expanded.status, 400); assert.equal(connected.length, 1);
+  }, { jenkinsConnection: { async status() { return { configured: false }; }, async connect(value) { connected.push(value); return { configured: true, username: value.username, state: 'available' }; } } });
+});
+
+test('task-run HTTP controls enforce origin and CAS through the real registry',async()=>{
+  let saved=null;const entered=deferred(),gate=deferred();let calls=0;
+  const registry=new TaskRunRegistry({store:{read:async(_k,f)=>saved??f,write:async(_k,v)=>{saved=structuredClone(v);}},settleControl:async()=>{}});
+  const execution=registry.run({kind:'work-item',taskId:'work-1',roleId:'reviewer',title:'Check',subject:'repo#1',revision:1},async()=>{calls++;entered.resolve();if(calls===1)await gate.promise;return calls;});
+  await entered.promise;
+  try{await withServer(async({server})=>{
+    const listed=await request(server,{path:'/api/task-runs'});assert.equal(listed.status,200);
+    const view=JSON.parse(listed.body).items[0];
+    const body=JSON.stringify({runId:view.runId,expectedRevision:view.revision,command:'instruct',instruction:'check locks'});
+    const rejected=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:{'content-type':'application/json',origin:'http://wrong.invalid'},body});
+    assert.equal(rejected.status,403);
+    const accepted=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:trustedConfigurationHeaders(),body});assert.equal(accepted.status,200);
+    const stale=await request(server,{method:'POST',path:'/api/task-runs/work-item/work-1/control',headers:trustedConfigurationHeaders(),body});assert.equal(stale.status,409);
+    assert.equal(JSON.parse(stale.body).code,'TASK_RUN_CONFLICT');
+  },{taskRuns:registry});}finally{gate.resolve();await execution;}
+  assert.equal(calls,2);
+});
 
 test("live and health freeze the startup runtime source identity", async () => {
   const runtimeSourceIdentity = {
@@ -1408,6 +1970,17 @@ test("brain provider status API exposes only the sanitized readiness projection"
   assert.deepEqual(fixture.application.config, originalConfig);
   assert.equal(response.body.includes(privateMarker), false);
 
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1,
+    state: "available",
+    cliAvailable: true,
+    fileLoginAvailable: true,
+    credentialMode: "codex-native-login",
+  });
+  const native = await request(server, { path: "/api/brain-providers/status" });
+  assert.equal(native.status, 200);
+  assert.equal(JSON.parse(native.body).credentialMode, "codex-native-login");
+
   const query = await request(server, {
     path: "/api/brain-providers/status?source=private",
   });
@@ -1466,6 +2039,14 @@ test("brain provider status API exposes only the sanitized readiness projection"
   });
   assert.equal(invalid.status, 500);
   assert.equal(invalid.body.includes(privateMarker), false);
+
+  fixture.application.brainProviderStatus.readStatus = async () => ({
+    schemaVersion: 1, state: "available", cliAvailable: true,
+    fileLoginAvailable: true, credentialMode: privateMarker,
+  });
+  const invalidMode = await request(server, { path: "/api/brain-providers/status" });
+  assert.equal(invalidMode.status, 500);
+  assert.equal(invalidMode.body.includes(privateMarker), false);
 
   fixture.application.brainProviderStatus = null;
   const missing = await request(server, {
@@ -1631,17 +2212,21 @@ test("backup drains an admitted HTTP mutation while liveness and status remain i
 
 test("failed backup reopens admission and does not poison later HTTP work", async (t) => {
   let refreshCalls = 0;
+  const reports = [];
   const fixture = operationalApplication({
     async refresh() {
       refreshCalls += 1;
       return { dashboard: {} };
     },
     async createBackup() {
-      throw new Error("private backup failure");
+      throw Object.assign(new Error("private backup failure"), {
+        code: "BACKUP_private_credential", stage: "private backup failure",
+        counts: { fileCount: "private backup failure", private: 123 },
+      });
     },
   });
   const server = createDashboardServer(fixture.application, {
-    reportError() {},
+    reportError(value) { reports.push(value); },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.shutdown());
@@ -1654,6 +2239,9 @@ test("failed backup reopens admission and does not poison later HTTP work", asyn
   });
   assert.equal(failed.status, 500);
   assert.equal(failed.body.includes("private backup failure"), false);
+  assert.deepEqual(reports.map((value) => JSON.parse(value)), [{
+    code: "BACKUP_CREATE_FAILED", stage: "create_backup",
+  }]);
   assert.equal(fixture.gate.readStatus().mode, "open");
 
   const laterMutation = await request(server, {
@@ -1666,6 +2254,88 @@ test("failed backup reopens admission and does not poison later HTTP work", asyn
   });
   assert.equal(laterMutation.status, 200);
   assert.equal(refreshCalls, 1);
+});
+
+test("backup failure diagnostics survive observer disconnect and contain only safe fields", async (t) => {
+  for (const disconnect of [false, true]) {
+    await t.test(disconnect ? "disconnected observer" : "connected observer", async (child) => {
+      const started = deferred();
+      const release = deferred();
+      const reported = deferred();
+      const observerClosed = deferred();
+      const reports = [];
+      const privateMarker = "credential-and-payload-must-never-be-logged";
+      const cause = Object.assign(new Error(privateMarker), {
+        code: "CHECKPOINT_CAPACITY_EXCEEDED", stage: "metadata_preflight",
+        counts: { fileCount: 100_001, directoryCount: 3, totalBytes: 42, privateMarker },
+      });
+      const failure = Object.assign(new Error(privateMarker, { cause }), {
+        code: "BACKUP_QUIESCENCE_FAILED", statusCode: 503,
+      });
+      const fixture = operationalApplication({ async createBackup() {
+        started.resolve();
+        await release.promise;
+        throw failure;
+      } });
+      const server = createDashboardServer(fixture.application, {
+        reportError(value) { reports.push(value); reported.resolve(); },
+      });
+      server.once("request", (_request, response) => response.once("close", observerClosed.resolve));
+      await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+      child.after(async () => { release.resolve(); await server.shutdown(); });
+      let outgoing;
+      const response = new Promise((resolve, reject) => {
+        outgoing = http.request({ host: "127.0.0.1", port: server.address().port,
+          method: "POST", path: "/api/system/backups",
+          headers: { host: "127.0.0.1:4173", "content-length": 2, ...trustedConfigurationHeaders() },
+        }, (incoming) => { incoming.resume(); incoming.once("end", () => resolve(incoming.statusCode)); });
+        outgoing.on("error", disconnect ? () => resolve(null) : reject);
+        outgoing.end("{}");
+      });
+      await started.promise;
+      if (disconnect) {
+        outgoing.destroy();
+        await observerClosed.promise;
+        assert.equal(fixture.gate.readStatus().mode, "closed");
+      }
+      release.resolve();
+      let timeout;
+      try {
+        await Promise.race([reported.promise, new Promise((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error("backup failure diagnostic was lost")), 1000);
+        })]);
+      } finally { clearTimeout(timeout); }
+      assert.equal(await response, disconnect ? null : 503);
+      assert.equal(fixture.gate.readStatus().mode, "open");
+      assert.equal(reports.length, 1);
+      assert.equal(typeof reports[0], "string");
+      assert.equal(reports[0].includes(privateMarker), false);
+      assert.deepEqual(JSON.parse(reports[0]), {
+        code: "BACKUP_QUIESCENCE_FAILED", stage: "metadata_preflight",
+        causeCode: "CHECKPOINT_CAPACITY_EXCEEDED",
+        counts: { fileCount: 100_001, directoryCount: 3, totalBytes: 42 },
+      });
+      const next = await request(server, { method: "POST", path: "/api/refresh", headers: trustedConfigurationHeaders() });
+      assert.equal(next.status, 200);
+    });
+  }
+});
+
+test("a throwing backup diagnostic sink does not replace failure or prevent later work", async (t) => {
+  const fixture = operationalApplication({ async createBackup() {
+    throw Object.assign(new Error("private backup cause"), { code: "BACKUP_IO_FAILED", statusCode: 503 });
+  } });
+  const server = createDashboardServer(fixture.application, {
+    reportError() { throw new Error("private logging failure"); },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.shutdown());
+  const failed = await request(server, { method: "POST", path: "/api/system/backups",
+    headers: trustedConfigurationHeaders(), body: "{}" });
+  assert.equal(failed.status, 503);
+  assert.equal(failed.body.includes("private"), false);
+  assert.equal(fixture.gate.readStatus().mode, "open");
+  assert.equal((await request(server, { method: "POST", path: "/api/refresh", headers: trustedConfigurationHeaders() })).status, 200);
 });
 
 test("the same-origin process endpoint acknowledges before graceful shutdown", async () => {
@@ -1823,6 +2493,64 @@ test("shutdown signals the registered Review handoff participant", async () => {
   await background.stop();
   assert.equal(handoffSignal.aborted, true);
   assert.ok(participants.includes(DRAIN_PARTICIPANTS.reviewHandoffRecovery.id));
+});
+
+test("shutdown drains a cancelled GitHub handoff while retaining cleanup failures", async (t) => {
+  for (const cleanupFails of [false, true]) {
+    await t.test(cleanupFails ? "cleanup failure remains authoritative" : "cooperative cancellation succeeds", async () => {
+      const started = deferred();
+      const application = startupApplication();
+      const githubAssignee = createGitHubActionExecutor({
+        ghCommand: process.platform === "win32" ? "C:\\Program Files\\GitHub CLI\\gh.exe" : "/usr/bin/gh",
+        runner: {
+          async run({ signal }) {
+            started.resolve();
+            await new Promise((resolve) => {
+              signal.addEventListener("abort", resolve, { once: true });
+              if (signal.aborted) resolve();
+            });
+            throw new ManagedProcessError("PROCESS_ABORTED", "cancelled");
+          },
+        },
+        credentialSource: Object.freeze({
+          async acquire() {
+            return Object.freeze({
+              async use(callback) { return callback("fictional_test_token"); },
+              release() {
+                if (cleanupFails) throw githubCredentialSourceError("GITHUB_CREDENTIAL_CLEANUP_FAILED");
+              },
+            });
+          },
+        }),
+      });
+      application.reviewHandoffReconciler = new ReviewHandoffReconciler({
+        confirmations: {
+          async readReviewHandoffs() {
+            return [{
+              id: "review-42", actorAccountId: "local-owner",
+              request: { requestId: "request-42", pullRequest: { repository: "acme/repo", number: 42 } },
+              automaticReview: { reviewEvent: "COMMENT", headRefOid: "a".repeat(40) },
+            }];
+          },
+          async recordReviewHandoff() {},
+        },
+        ownerWorkRequests: { async submit() {
+          return { phase: "intaken", workItemId: "work-42", assignment: { target: { id: "tester" } } };
+        } },
+        githubAssignee,
+      });
+      const background = startApplicationBackgroundWork(application, {
+        setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {},
+      });
+      await started.promise;
+      if (cleanupFails) {
+        await assert.rejects(background.stop(), { code: "GITHUB_CREDENTIAL_CLEANUP_FAILED" });
+      } else {
+        await background.stop();
+      }
+      await githubAssignee.close();
+    });
+  }
 });
 
 test("a timed-out handoff keeps its unfinished operation in the shutdown drain", async () => {
@@ -2035,7 +2763,7 @@ test("production drain participants reject every public trigger before execution
   const reportedErrors = [];
   const executed = [];
   const participantIds = Object.values(DRAIN_PARTICIPANTS).filter(
-    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery,
+    (participant) => participant !== DRAIN_PARTICIPANTS.reviewHandoffRecovery && participant !== DRAIN_PARTICIPANTS.workContinuation && participant !== DRAIN_PARTICIPANTS.localCodeProposalRecovery && participant !== DRAIN_PARTICIPANTS.codeJobExecution,
   ).map(
     (participant) => participant.id,
   );
@@ -2181,6 +2909,7 @@ test("configuration safe mode cannot bypass closed operational admission", async
     backgroundWork.runConfirmationOperation(async () => "must-not-run"),
     { code: "SYSTEM_QUIESCING" },
   );
+  await assert.rejects(backgroundWork.runAttentionOperation(async () => "must-not-run"), { code: "SYSTEM_QUIESCING" });
   const mutation = await request(server, {
     method: "POST",
     path: "/api/configuration/drafts",
@@ -3629,6 +4358,548 @@ test("scheduled and manual employees wait for refresh without an external queue"
   }
 });
 
+test("exact internal question status is read-only and rejects query parameters", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  let reads = 0;
+  await withServer(async ({ server }) => {
+    const result = await request(server, { path: `/api/attention/internal/${requestId}` });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), { item: { requestId, status: "archived" } });
+    assert.equal((await request(server, { path: `/api/attention/internal/${requestId}?answer=yes` })).status, 400);
+    assert.equal(reads, 1);
+  }, { attentionBrowser: { async readStatus(input) {
+    reads++;
+    assert.deepEqual(input, { requestId });
+    return { requestId, status: "archived" };
+  } } });
+});
+
+test("maintenance requests are a read-only separate endpoint", async () => {
+  let reads = 0;
+  const faults = { items: [{ requestId: `attention-${"a".repeat(64)}`, maintenanceCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" }], total: 1 };
+  await withServer(async ({ server }) => {
+    const result = await request(server, { path: "/api/attention/maintenance" });
+    assert.equal(result.status, 200);
+    assert.deepEqual(JSON.parse(result.body), faults);
+    assert.equal((await request(server, { path: "/api/attention/maintenance?unknown=1" })).status, 400);
+    assert.equal(reads, 1);
+  }, { attentionBrowser: { async listMaintenance() { reads += 1; return faults; } } });
+});
+
+test("Review runs while a developer is busy and drains on shutdown", async () => {
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  let reviewRunning = false;
+  const releaseReview = deferred();
+  const timers = [];
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "developer", intervalMinutes: 10 }, { id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected(ids) {
+        if (ids[0] === "developer") {
+          developerStarted.resolve();
+          await releaseDeveloper.promise;
+        }
+        if (ids[0] === "pr-engineer") {
+          reviewRunning = true;
+          await releaseReview.promise;
+        }
+      },
+    },
+    refreshService: { async refresh() {} },
+  };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    await background.initialRefresh;
+    const developer = timers[1].callback();
+    await developerStarted.promise;
+    const review = timers[2].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reviewRunning, true,
+      "a busy developer must not hold the Review scheduler");
+    let stopped = false;
+    const stopping = background.stop().then(() => { stopped = true; });
+    releaseDeveloper.resolve();
+    await developer;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, false, "shutdown must still drain the independent Review");
+    releaseReview.resolve();
+    await Promise.all([review, stopping]);
+  } finally {
+    releaseDeveloper.resolve(); releaseReview.resolve();
+    await background.stop();
+  }
+});
+
+test("Review waits for fresh facts, coalesces ticks and cancels a startup wait on stop", async () => {
+  const releaseRefresh = deferred();
+  const releaseReview = deferred();
+  const timers = [];
+  let runs = 0;
+  const application = {
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected(ids) {
+        if (ids[0] !== "pr-engineer") return;
+        runs += 1;
+        await releaseReview.promise;
+      },
+    },
+    refreshService: { async refresh() { await releaseRefresh.promise; } },
+  };
+  const background = startApplicationBackgroundWork(application, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    const first = timers[1].callback();
+    const second = timers[1].callback();
+    const manual = background.runEmployee("pr-engineer");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runs, 0);
+    releaseRefresh.resolve();
+    await background.initialRefresh;
+    assert.equal(runs, 1);
+    releaseReview.resolve();
+    await Promise.all([first, second, manual]);
+  } finally {
+    releaseRefresh.resolve(); releaseReview.resolve();
+    await background.stop();
+  }
+
+  const pendingRefresh = deferred();
+  const pending = startApplicationBackgroundWork({ ...application, refreshService: {
+    async refresh() { await pendingRefresh.promise; },
+  } }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  const review = pending.runEmployee("pr-engineer");
+  const stopping = pending.stop();
+  pendingRefresh.resolve();
+  await Promise.all([review, stopping, pending.initialRefresh]);
+  assert.equal(runs, 1, "stopping before startup facts must not run Review");
+});
+
+test("Review without fresh facts does not hold maintenance admission", { timeout: 2_000 }, async () => {
+  const timers = [];
+  const gate = new OperationalQuiescenceGate({ drainTimeoutMs: 100 });
+  let runs = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [{ id: "pr-engineer", intervalMinutes: 10 }],
+      async runSelected() { runs += 1; },
+    },
+    refreshService: { async refresh() { throw new Error("upstream unavailable"); } },
+  }, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {}, reportError() {},
+  });
+  try {
+    await assert.rejects(background.initialRefresh, /upstream unavailable/);
+    const review = timers[1].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().activeOperations, 0);
+    const token = await gate.enter();
+    gate.leave(token);
+    await review;
+    assert.equal(runs, 0);
+  } finally { await background.stop(); }
+});
+
+test("maintenance drains active Review and blocks manual Review while closed", async () => {
+  const gate = new OperationalQuiescenceGate();
+  const started = deferred();
+  const release = deferred();
+  const errors = [];
+  let reviews = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) {
+        if (ids[0] !== "pr-engineer") return;
+        reviews += 1; started.resolve(); await release.promise;
+      },
+    },
+    refreshService: { async refresh() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError(error) { errors.push(error); } });
+  try {
+    await background.initialRefresh;
+    const review = background.runEmployee("pr-engineer");
+    await started.promise;
+    assert.equal(gate.readStatus().activeOperations, 1);
+    const closing = gate.enter();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().mode, "closing");
+    release.resolve();
+    await review;
+    const token = await closing;
+    await assert.rejects(background.runEmployee("pr-engineer"), { code: "SYSTEM_QUIESCING" });
+    assert.equal(reviews, 1);
+    gate.leave(token);
+    assert.equal(errors.length, 1);
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test("Review waits for a newer refresh queued behind a developer", async () => {
+  const timers = [];
+  const developerStarted = deferred();
+  const releaseDeveloper = deferred();
+  const releaseRefresh = deferred();
+  let refreshes = 0;
+  let reviews = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    employeeRegistry: {
+      schedules: () => [{ id: "developer", intervalMinutes: 10 }, { id: "pr-engineer", intervalMinutes: 11 }],
+      async runSelected(ids) {
+        if (ids[0] === "developer") { developerStarted.resolve(); await releaseDeveloper.promise; }
+        if (ids[0] === "pr-engineer") reviews += 1;
+      },
+    },
+    refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
+  }, {
+    setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+    clearIntervalFn() {},
+  });
+  try {
+    await background.initialRefresh;
+    const developer = timers[1].callback();
+    await developerStarted.promise;
+    const refresh = timers[0].callback();
+    const review = timers[2].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(reviews, 0, "a known newer refresh must invalidate the admitted snapshot");
+    releaseDeveloper.resolve();
+    await developer;
+    releaseRefresh.resolve();
+    await Promise.all([refresh, review]);
+    assert.equal(reviews, 1);
+  } finally {
+    releaseDeveloper.resolve(); releaseRefresh.resolve(); await background.stop();
+  }
+});
+
+for (const blocker of ["memory projection", "legacy patrol"]) {
+  for (const roleId of ["developer", "orchestrator", "tester"]) {
+    test(`automatic ${roleId} bypasses stalled ${blocker}, coalesces manual ticks and drains`, async () => {
+      const blocked = deferred();
+      const releaseBlocked = deferred();
+      const releaseRole = deferred();
+      const timers = [];
+      let roleRuns = 0;
+      let handoffs = 0;
+      const background = startApplicationBackgroundWork({
+        config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+        employeeRegistry: {
+          schedules: () => [{ id: roleId, intervalMinutes: 10 }],
+          async runSelected(ids) {
+            if (ids[0] === "pr-reviewer" && blocker === "legacy patrol") {
+              blocked.resolve(); await releaseBlocked.promise;
+            }
+            if (ids[0] !== roleId) return;
+            roleRuns += 1;
+            await releaseRole.promise;
+          },
+        },
+        refreshService: { async refresh() {} },
+        ...(blocker === "memory projection" ? {
+          memoryProjector: { async runCycle() { blocked.resolve(); await releaseBlocked.promise; } },
+        } : {}),
+        reviewHandoffReconciler: { async runCycle() { handoffs += 1; } },
+      }, {
+        setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+        clearIntervalFn() {},
+      });
+      try {
+        await blocked.promise;
+        const handoffsBeforeRole = handoffs;
+        const scheduled = timers[1].callback();
+        const manual = background.runEmployee(roleId);
+        manual.catch(() => {});
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(roleRuns, 1, "fresh role handoffs must not wait for optional memory or legacy work");
+        assert.equal(handoffs, handoffsBeforeRole, "other roles must not run Review-only handoff recovery");
+        assert.ok(background.drainStatus().activeParticipants.some(
+          ({ id }) => id === DRAIN_PARTICIPANTS.employeeExecution.id,
+        ));
+        const refreshed = background.initialRefresh;
+        const manualStopped = assert.rejects(manual, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+        let stopped = false;
+        const stopping = background.stop().then(() => { stopped = true; });
+        releaseBlocked.resolve();
+        await refreshed;
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(stopped, false, "shutdown must drain the independent role");
+        assert.equal(background.drainStatus().backgroundOperationActive, true);
+        releaseRole.resolve();
+        await Promise.all([scheduled, manualStopped, stopping]);
+        assert.equal(roleRuns, 1, "manual and scheduled requests must share one role cycle");
+      } finally {
+        releaseBlocked.resolve(); releaseRole.resolve(); await background.stop();
+      }
+    });
+ }
+}
+
+for (const roleId of ["developer", "orchestrator", "tester"]) {
+  test(`automatic ${roleId} uses scoped coordination while general code jobs are busy`, async () => {
+    const codeJobsStarted = deferred();
+    const releaseCodeJobs = deferred();
+    const workScopes = [];
+    const noOpCycle = { async runCycle() {} };
+    const coordination = new WorkCoordinationService({
+      ledger: { async intake() {} },
+      proposalResultReconciler: noOpCycle,
+      attentionResultReconciler: noOpCycle,
+      conditionWaker: noOpCycle,
+      codeJobRunner: { async runCycle() { codeJobsStarted.resolve(); await releaseCodeJobs.promise; } },
+      workLoop: { async runCycle(options) { workScopes.push(options); } },
+      dispatcher: { async dispatchPending() {} },
+    });
+    const registry = new EmployeeRegistry(["pr-reviewer", roleId].map((id) => ({
+      id,
+      async view() {},
+      async roleView() {},
+      async control() {},
+      run(options) {
+        return id === roleId ? coordination.runCycle({
+          trigger: `employee:${roleId}`, includeWork: true, roleId: id, signal: options.signal,
+        }) : Promise.resolve();
+      },
+    })));
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: roleId === "developer", automaticReview: roleId !== "developer" } },
+      employeeRegistry: registry,
+      workCoordination: coordination,
+      refreshService: { async refresh() {} },
+    }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+    try {
+      await codeJobsStarted.promise;
+      const roleRun = background.runEmployee(roleId);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(workScopes.length, 1, "scoped role decisions must not wait for general code jobs");
+      assert.equal(workScopes[0].roleId, roleId);
+      assert.equal(workScopes[0].trigger, `employee:${roleId}`);
+      assert.equal(workScopes[0].signal instanceof AbortSignal, true);
+      assert.equal(workScopes[0].signal.aborted, false);
+      await roleRun;
+      releaseCodeJobs.resolve();
+      await background.initialRefresh;
+    } finally { releaseCodeJobs.resolve(); await background.stop(); }
+  });
+}
+
+for (const roleId of ["developer", "orchestrator", "pr-engineer", "tester"]) {
+  test(`automatic ${roleId} waits for refreshing facts without waiting for another role`, async () => {
+    const timers = [];
+    const generalStarted = deferred();
+    const releaseGeneral = deferred();
+    const releaseRefresh = deferred();
+    let refreshes = 0;
+    let roleRuns = 0;
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true, automaticReview: true } },
+      employeeRegistry: {
+        schedules: () => [{ id: "requirements-analyst", intervalMinutes: 10 }, { id: roleId, intervalMinutes: 11 }],
+        async runSelected(ids) {
+          if (ids[0] === "requirements-analyst") { generalStarted.resolve(); await releaseGeneral.promise; }
+          if (ids[0] === roleId) roleRuns += 1;
+        },
+      },
+      refreshService: { async refresh() { if (++refreshes > 1) await releaseRefresh.promise; } },
+    }, {
+      setIntervalFn(callback) { const timer = { callback, unref() {} }; timers.push(timer); return timer; },
+      clearIntervalFn() {},
+    });
+    try {
+      await background.initialRefresh;
+      let generalSettled = false;
+      const general = timers[1].callback().finally(() => { generalSettled = true; });
+      await generalStarted.promise;
+      const refresh = timers[0].callback();
+      const role = timers[2].callback();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(refreshes, 2, "refresh must begin while general work is still running");
+      assert.equal(roleRuns, 0, "an actively refreshing snapshot must finish admission before new role work");
+      releaseRefresh.resolve();
+      await Promise.all([refresh, role]);
+      assert.equal(roleRuns, 1);
+      assert.equal(generalSettled, false, "newly admitted facts must release other roles before the long role ends");
+      await background.runEmployee(roleId);
+      assert.equal(roleRuns, 2);
+      releaseGeneral.resolve(); await general;
+    } finally {
+      releaseGeneral.resolve(); releaseRefresh.resolve(); await background.stop();
+    }
+  });
+}
+
+test("automatic role waiters resume and later refreshes do not wait for general work", async () => {
+  const refreshing = deferred(), releaseRefresh = deferred();
+  const general = deferred(), releaseGeneral = deferred();
+  let refreshes = 0, roleRuns = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticReview: true } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) {
+        if (ids[0] === "requirements-analyst") { general.resolve(); await releaseGeneral.promise; }
+        if (ids[0] === "orchestrator") roleRuns += 1;
+      },
+    },
+    refreshService: { async refresh() {
+      if (++refreshes === 1) { refreshing.resolve(); await releaseRefresh.promise; }
+    } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  try {
+    await refreshing.promise;
+    const role = background.runEmployee("orchestrator");
+    const generalRun = background.runEmployee("requirements-analyst");
+    const nextRefresh = background.refresh({ notify: true });
+    releaseRefresh.resolve();
+    await general.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refreshes, 2, "the next refresh must not queue behind general role work");
+    assert.equal(roleRuns, 1, "existing role waiters must use the now fully admitted facts");
+    releaseGeneral.resolve();
+    await Promise.all([role, generalRun, nextRefresh, background.initialRefresh]);
+  } finally { releaseRefresh.resolve(); releaseGeneral.resolve(); await background.stop(); }
+});
+
+test("memory authority deferrals remain visible while automatic employee work continues", async () => {
+  const logs = [], errors = [];
+  let employees = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7 },
+    employeeRegistry: { schedules: () => [], async runSelected() { employees++; } },
+    refreshService: { async refresh() {} },
+    memoryProjector: { async runCycle() { return { authorityBound: {
+      status: "deferred", code: "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE", attempts: 2,
+    } }; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {},
+    log: value => logs.push(value), reportError: value => errors.push(value) });
+  try {
+    await background.initialRefresh;
+    await background.runEmployee("tester", { trigger: "scheduled" });
+    assert.ok(employees > 0);
+    assert.equal(errors.length, 0);
+    assert.ok(logs.some(value => /memory_before_employee.*WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE/u.test(value)));
+    assert.ok(logs.some(value => /memory_after_employee.*WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE/u.test(value)));
+  } finally { await background.stop(); }
+});
+
+test("automatic own-PR developer cancels a startup fact wait on stop", async () => {
+  const releaseRefresh = deferred();
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+    },
+    refreshService: { async refresh() { await releaseRefresh.promise; } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  try {
+    const developer = background.runEmployee("developer");
+    const refreshing = assert.rejects(background.initialRefresh, { code: "LIFECYCLE_SHUTDOWN_ABORTED" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(developers, 0);
+    const stopping = background.stop();
+    releaseRefresh.resolve();
+    await Promise.all([developer, stopping, refreshing]);
+    assert.equal(developers, 0);
+  } finally { releaseRefresh.resolve(); await background.stop(); }
+});
+
+test("automatic own-PR developer respects maintenance admission and drain", async () => {
+  const gate = new OperationalQuiescenceGate();
+  const started = deferred();
+  const release = deferred();
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) {
+        if (ids[0] !== "developer") return;
+        developers += 1; started.resolve(); await release.promise;
+      },
+    },
+    refreshService: { async refresh() {} },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh;
+    const developer = background.runEmployee("developer");
+    await started.promise;
+    const closing = gate.enter();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gate.readStatus().mode, "closing");
+    release.resolve();
+    await developer;
+    const token = await closing;
+    await assert.rejects(background.runEmployee("developer"), { code: "SYSTEM_QUIESCING" });
+    assert.equal(developers, 1);
+    gate.leave(token);
+  } finally { release.resolve(); await background.stop(); }
+});
+
+test("automatic own-PR developer without fresh facts does not hold maintenance admission", async () => {
+  const gate = new OperationalQuiescenceGate({ drainTimeoutMs: 100 });
+  let developers = 0;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    operations: { admission: { run: gate.run.bind(gate) } },
+    employeeRegistry: {
+      schedules: () => [],
+      async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+    },
+    refreshService: { async refresh() { throw new Error("upstream unavailable"); } },
+  }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {}, reportError() {} });
+  try {
+    await assert.rejects(background.initialRefresh, /upstream unavailable/);
+    await background.runEmployee("developer");
+    assert.equal(gate.readStatus().activeOperations, 0);
+    const token = await gate.enter();
+    gate.leave(token);
+    assert.equal(developers, 0);
+  } finally { await background.stop(); }
+});
+
+for (const githubActions of [undefined, { enabled: true },
+  { enabled: true, automaticOwnPrRepair: false }, { enabled: false, automaticOwnPrRepair: true }]) {
+  test(`developer keeps serialized scheduling without enabled automatic own-PR repair: ${JSON.stringify(githubActions)}`, async () => {
+    const memoryStarted = deferred();
+    const releaseMemory = deferred();
+    let developers = 0;
+    const background = startApplicationBackgroundWork({
+      config: { refreshMinutes: 7, githubActions },
+      employeeRegistry: {
+        schedules: () => [],
+        async runSelected(ids) { if (ids[0] === "developer") developers += 1; },
+      },
+      refreshService: { async refresh() {} },
+      memoryProjector: { async runCycle() { memoryStarted.resolve(); await releaseMemory.promise; } },
+    }, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+    try {
+      await memoryStarted.promise;
+      const developer = background.runEmployee("developer");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(developers, 0);
+      releaseMemory.resolve();
+      await Promise.all([background.initialRefresh, developer]);
+      assert.equal(developers, 1);
+    } finally { releaseMemory.resolve(); await background.stop(); }
+  });
+}
+
 test("overlapping scheduled role and refresh ticks are coalesced", async () => {
   const roleStarted = deferred();
   const releaseRole = deferred();
@@ -4252,8 +5523,9 @@ test("manual refresh fences facts but reopens confirmations before slow agency",
   await exerciseConfirmationRefreshGate("manual");
 });
 
-test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () => {
+test("an unhealthy GitHub refresh permits local answers while external confirmation writes stay closed", async () => {
   const queueCalls = [];
+  let internalAnswers = 0;
   const application = startupApplication({
     port: 4173,
     queueCalls,
@@ -4272,6 +5544,8 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
       };
     },
   });
+  application.attentionBrowser = Object.fromEntries(["answer", "reject", "later"].map(method =>
+    [method, async () => { internalAnswers++; return { status: "answered" }; }]));
   const backgroundWork = startApplicationBackgroundWork(application, {
     setIntervalFn() {
       return { unref() {} };
@@ -4287,6 +5561,7 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
 
   try {
     const next = await request(server, { path: "/api/confirmations/next" });
+    const history = await request(server, { path: "/api/confirmations/history" });
     const approve = await request(server, {
       method: "POST",
       path: `/api/confirmations/${pendingConfirmationItem().id}/approve`,
@@ -4306,13 +5581,62 @@ test("an unhealthy GitHub PR refresh keeps confirmation APIs closed", async () =
       },
     });
 
-    assert.equal(next.status, 503);
+    assert.equal(next.status, 200);
+    assert.equal(history.status, 200);
     assert.equal(approve.status, 503);
     assert.equal(manualEmployee.status, 503);
-    assert.deepEqual(queueCalls, []);
+    const internalAnswer = await request(server, { method: "POST", path: `/api/attention/internal/attention-${"a".repeat(64)}/answer`,
+      headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 1, contentDigest: "b".repeat(64), answer: { type: "text", text: "继续" } }),
+    });
+    assert.equal(internalAnswer.status, 200);
+    assert.equal(internalAnswers, 1);
+    assert.deepEqual(queueCalls, ["next", "history"]);
   } finally {
     await server.shutdown();
   }
+});
+
+test("shutdown drains local reads and internal answers during refresh and safe mode", async (t) => {
+  for (const safeMode of [false, true]) for (const confirmationsEnabled of [true, false]) for (const method of ["runConfirmationRead", "runAttentionOperation"]) await t.test(`${safeMode}:${confirmationsEnabled}:${method}`, async () => {
+  const refreshRelease = deferred();
+  const readStarted = deferred();
+  const readRelease = deferred();
+  const app = startupApplication({
+    async refresh() { await refreshRelease.promise; return healthyRefreshResult(); },
+  });
+  if (!confirmationsEnabled) app.confirmationQueue = null;
+  if (safeMode) app.configuration = { status: { safeMode: true, migrationError: null } };
+  const backgroundWork = startApplicationBackgroundWork(app, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  const reading = backgroundWork[method](async () => {
+    readStarted.resolve();
+    await readRelease.promise;
+    return "local history";
+  });
+  await readStarted.promise;
+  let stopped = false;
+  const stopping = backgroundWork.stop().then(() => { stopped = true; });
+  try {
+    await assert.rejects(backgroundWork[method](async () => "must not run"), { code: "CONFIRMATION_FACTS_NOT_READY" });
+    assert.equal(stopped, false);
+  } finally {
+    refreshRelease.resolve();
+    readRelease.resolve();
+    await stopping;
+  }
+  assert.equal(await reading, "local history");
+  });
+});
+
+test("internal answers cannot start after shutdown when external confirmations are disabled", async () => {
+  const app = startupApplication({ async refresh() { return healthyRefreshResult(); } });
+  app.confirmationQueue = null;
+  const background = startApplicationBackgroundWork(app, { setIntervalFn() { return { unref() {} }; }, clearIntervalFn() {} });
+  await background.initialRefresh;
+  await background.stop();
+  let writes = 0;
+  await assert.rejects(background.runAttentionOperation(async () => { writes++; }), { code: "CONFIRMATION_FACTS_NOT_READY" });
+  assert.equal(writes, 0);
 });
 
 test("server rejects an untrusted Host before exposing local data", async () => {
@@ -5227,6 +6551,7 @@ test("work APIs expose only newest-first ledger projections", async () => {
         safeguards: {
           prEmployeePaused: true,
           externalActionsEnabled: false,
+          automaticReviewEnabled: false,
         },
       });
       assert.deepEqual(JSON.parse(items.body), {
@@ -5294,6 +6619,7 @@ test("daily work APIs expose the bounded daily projection without changing durab
       safeguards: {
         prEmployeePaused: true,
         externalActionsEnabled: false,
+        automaticReviewEnabled: false,
       },
     });
     assert.equal(items.status, 200);
@@ -6684,6 +8010,47 @@ test("internal attention mutations are source-bound and only signal background w
   );
 });
 
+test("internal attention answers use local admission while external confirmation facts are pending", async () => {
+  const requestId = `attention-${"a".repeat(64)}`;
+  let mutations = 0;
+  await withServer(
+    async ({ server }) => {
+      const response = await request(server, {
+        method: "POST",
+        path: `/api/attention/internal/${requestId}/answer`,
+        headers: {
+          origin: "http://127.0.0.1:4173",
+          "x-mydashboard-action": "1",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          expectedRevision: 1,
+          contentDigest: "b".repeat(64),
+          answer: { type: "text", text: "继续" },
+        }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(mutations, 1);
+    },
+    {
+      attentionBrowser: {
+        answer() { mutations += 1; return { requestId, status: "answered" }; },
+        reject() { mutations += 1; },
+        later() { mutations += 1; },
+      },
+      backgroundWork: {
+        runAttentionOperation(operation) { return operation(); },
+        runConfirmationOperation() {
+          throw Object.assign(new Error("facts pending"), {
+            code: "CONFIRMATION_FACTS_NOT_READY",
+            statusCode: 503,
+          });
+        },
+      },
+    },
+  );
+});
+
 test("internal attention rejects untrusted callers and body-supplied request ids", async () => {
   const requestId = `attention-${"a".repeat(64)}`;
   const body = JSON.stringify({
@@ -7282,6 +8649,243 @@ test("shutdown drains the admitted memory projection port then stops its cycle",
   await Promise.allSettled([backgroundWork.initialRefresh]);
 });
 
+async function configurationRestartShutdownRace({
+  proposalRunnerFactory = (runner) => runner,
+  expectedClaimExecutions = 1,
+  transformRejection = (error) => error,
+  additionalStage = async () => {},
+  settleCutover = (control) => control.commit({
+    version: 40,
+    configurationDigest: "b".repeat(64),
+  }),
+  close = async () => {},
+} = {}) {
+  const gate = new ActionAdmissionGate();
+  gate.bindEffective({ version: 39, configurationDigest: "a".repeat(64) });
+  const noOpCycle = { async runCycle() {} };
+  const proposalStarted = deferred();
+  const releaseProposal = deferred();
+  let racing = false;
+  let claimExecutions = 0;
+  let applicationCloses = 0;
+  let leaseCloses = 0;
+  let stopping;
+  let statusBeforeStop;
+  const reportedErrors = [];
+  const coordinator = new WorkCoordinationService({
+    ledger: { async intake() {} },
+    proposalRunner: proposalRunnerFactory({
+      async runCycle() {
+        if (racing) {
+          proposalStarted.resolve();
+          await releaseProposal.promise;
+        }
+        try {
+          return await gate.run(() => { claimExecutions += 1; });
+        } catch (error) {
+          throw transformRejection(error);
+        }
+      },
+    }),
+    proposalResultReconciler: {
+      async runCycle() { if (racing) await additionalStage(gate); },
+    },
+    attentionResultReconciler: noOpCycle,
+    conditionWaker: noOpCycle,
+    workLoop: noOpCycle,
+    dispatcher: { async dispatchPending() {} },
+  });
+  const application = startupApplication({
+    async close() { applicationCloses += 1; await close(); },
+  });
+  let server;
+  let backgroundWork;
+  application.workCoordination = {
+    intake: (options) => coordinator.intake(options),
+    async runCycle(options) {
+      try {
+        return await coordinator.runCycle(options);
+      } catch (error) {
+        if (racing) {
+          // Shutdown may resume between the failed coordination promise and
+          // the background task's rejection/finally handlers.
+          queueMicrotask(() => {
+            statusBeforeStop = backgroundWork.drainStatus();
+            stopping = server.shutdown().then(
+              () => ({ succeeded: true }),
+              (failure) => ({ succeeded: false, failure }),
+            );
+          });
+        }
+        throw error;
+      }
+    },
+  };
+  backgroundWork = startApplicationBackgroundWork(application, {
+    drainTimeoutMs: 500,
+    reportError(error) { reportedErrors.push(error); },
+    setIntervalFn() { return { unref() {} }; },
+    clearIntervalFn() {},
+  });
+  await backgroundWork.initialRefresh;
+  server = createDashboardServer(application, {
+    backgroundWork,
+    shutdownDrainTimeoutMs: 1_000,
+    writerLease: {
+      async acquire() {},
+      async close() { leaseCloses += 1; },
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    racing = true;
+    const cycling = backgroundWork.signalAgency().then(
+      () => assert.fail("the old configuration must reject the cycle"),
+      (error) => error,
+    );
+    await proposalStarted.promise;
+    await gate.cutover(settleCutover);
+    releaseProposal.resolve();
+    const cycleFailure = await cycling;
+    assert.ok(stopping, "shutdown must race the tracked rejection");
+    const shutdown = await stopping;
+    assert.equal(statusBeforeStop.activeTaskCount, 1);
+    assert.equal(claimExecutions, expectedClaimExecutions, "cutover must prevent another proposal claim");
+    assert.deepEqual(backgroundWork.drainStatus().activeParticipants, []);
+    assert.equal(backgroundWork.drainStatus().activeTaskCount, 0);
+    assert.deepEqual(reportedErrors, [cycleFailure]);
+    return { shutdown, cycleFailure, applicationCloses, leaseCloses };
+  } finally {
+    releaseProposal.resolve();
+    await Promise.allSettled([backgroundWork.stop(), server.shutdown()]);
+  }
+}
+
+test("shutdown drains a configuration cutover admission rejection racing task settlement", async () => {
+  const result = await configurationRestartShutdownRace();
+  assert.equal(result.cycleFailure.code, "WORK_COORDINATION_STAGE_FAILED");
+  assert.equal(result.cycleFailure.cause.code, "RUNTIME_RESTART_REQUIRED");
+  assert.deepEqual(result.shutdown, { succeeded: true });
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 1);
+});
+
+test("shutdown drains an aggregate containing only real configuration restart rejections", async () => {
+  const result = await configurationRestartShutdownRace({
+    additionalStage: (gate) => gate.run(() => assert.fail("must not be admitted")),
+  });
+  assert.ok(result.cycleFailure instanceof AggregateError);
+  assert.equal(result.cycleFailure.errors.length, 2);
+  assert.deepEqual(result.shutdown, { succeeded: true });
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 1);
+});
+
+test("shutdown drains real grouped proposal runners containing only configuration restart rejections", async (t) => {
+  for (const count of [2, 3]) {
+    await t.test(`${count} proposal runners`, async () => {
+      const result = await configurationRestartShutdownRace({
+        proposalRunnerFactory: (runner) => createWorkProposalRunnerGroup(
+          Array.from({ length: count }, () => runner),
+        ),
+        expectedClaimExecutions: count,
+        additionalStage: (gate) => gate.run(() => assert.fail("must not be admitted")),
+      });
+      assert.ok(result.cycleFailure instanceof AggregateError);
+      const groupFailure = result.cycleFailure.errors
+        .find((error) => error.stage === "proposal_execution").cause;
+      assert.ok(groupFailure instanceof AggregateError);
+      assert.equal(groupFailure.message, "one or more work proposal runners failed");
+      assert.equal(groupFailure.errors.length, count);
+      assert.deepEqual(result.shutdown, { succeeded: true });
+      assert.equal(result.applicationCloses, 1);
+      assert.equal(result.leaseCloses, 1);
+    });
+  }
+});
+
+test("shutdown retains real I/O and unknown write failures inside grouped proposal runners", async (t) => {
+  for (const [name, failure] of [
+    ["real I/O without an error code", new Error("durable append failed")],
+    ["unknown external write", Object.assign(new Error("external write was not confirmed"), {
+      code: "EXTERNAL_ACTION_UNKNOWN",
+    })],
+  ]) {
+    await t.test(name, async () => {
+      const result = await configurationRestartShutdownRace({
+        proposalRunnerFactory: (runner) => createWorkProposalRunnerGroup([
+          runner,
+          { async runCycle(options) {
+            try { return await runner.runCycle(options); }
+            catch { throw failure; }
+          } },
+        ]),
+        expectedClaimExecutions: 2,
+      });
+      const groupFailure = result.cycleFailure.cause;
+      assert.ok(groupFailure instanceof AggregateError);
+      assert.equal(groupFailure.errors.length, 2);
+      assert.ok(groupFailure.errors.includes(failure));
+      assert.equal(result.shutdown.succeeded, false);
+      assert.equal(result.shutdown.failure, result.cycleFailure);
+      assert.equal(result.applicationCloses, 0);
+      assert.equal(result.leaseCloses, 0);
+    });
+  }
+});
+
+test("shutdown retains non-admission failures alongside a configuration cutover", async (t) => {
+  for (const [name, options] of [
+    ["a plain error with the same code", {
+      transformRejection: () => Object.assign(new Error("ordinary failure"), {
+        code: "RUNTIME_RESTART_REQUIRED",
+      }),
+    }],
+    ["an aggregate with a real I/O failure", {
+      additionalStage: async () => { throw new Error("durable append failed"); },
+    }],
+    ["an aggregate with an unknown external write", {
+      additionalStage: async () => {
+        throw Object.assign(new Error("external write was not confirmed"), {
+          code: "EXTERNAL_ACTION_UNKNOWN",
+        });
+      },
+    }],
+    ["a foreign aggregate wrapper", {
+      transformRejection: (error) => new AggregateError([error], "foreign failure"),
+    }],
+    ["a typed rejection with another failure cause", {
+      transformRejection: (error) => Object.assign(error, {
+        cause: new Error("durable runtime failed"),
+      }),
+    }],
+    ["an unknown configuration state", {
+      settleCutover: (control) => control.markUnknown(),
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const result = await configurationRestartShutdownRace(options);
+      assert.equal(result.shutdown.succeeded, false);
+      assert.equal(result.shutdown.failure, result.cycleFailure);
+      assert.equal(result.applicationCloses, 0);
+      assert.equal(result.leaseCloses, 0);
+    });
+  }
+});
+
+test("a pure configuration restart rejection does not suppress runtime close failure", async () => {
+  const failure = Object.assign(new Error("native termination is unconfirmed"), {
+    code: "NATIVE_CODEX_REAP_UNCONFIRMED",
+  });
+  const result = await configurationRestartShutdownRace({
+    close: async () => { throw failure; },
+  });
+  assert.equal(result.shutdown.succeeded, false);
+  assert.equal(result.shutdown.failure, failure);
+  assert.equal(result.applicationCloses, 1);
+  assert.equal(result.leaseCloses, 0);
+});
+
 test("shutdown preserves a real memory projection failure after abort", async () => {
   const projectionStarted = deferred();
   const releaseProjectionPort = deferred();
@@ -7709,6 +9313,192 @@ test("a bounded shutdown timeout retains the application and writer lease fail-c
   assert.equal(leaseCloses, 0);
 });
 
+test("shutdown closes browser preconnections that have not sent an HTTP request", async () => {
+  const events = [];
+  const application = startupApplication({
+    async close() { events.push("application-close"); },
+  });
+  const server = createDashboardServer(application, {
+    backgroundWork: { async stop() { events.push("background-stop"); } },
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 250,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const accepted = new Promise((resolve) => server.once("connection", resolve));
+  const client = net.createConnection({ host: "127.0.0.1", port: server.address().port });
+  const connected = new Promise((resolve, reject) => {
+    client.once("connect", resolve);
+    client.once("error", reject);
+  });
+  await Promise.all([accepted, connected]);
+  try {
+    assert.equal(client.bytesWritten, 0);
+    await server.shutdown();
+    assert.deepEqual(events, ["background-stop", "application-close", "lease-close"]);
+  } finally {
+    client.destroy();
+    await server.shutdown().catch(() => {});
+  }
+});
+
+test("shutdown closes a reused browser connection whose next HTTP headers are incomplete", { timeout: 2000 }, async (t) => {
+  const events = [];
+  const application = startupApplication({ async close() { events.push('application-close'); } });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    backgroundWork: { async stop() { events.push('background-stop'); } },
+    writerLease: { async acquire() {}, async close() { events.push('lease-close'); } },
+    shutdownDrainTimeoutMs: 250,
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const accepted = deferred(), finished = deferred();
+  server.once('connection', socket => accepted.resolve(socket));
+  server.once('request', (_request, response) => response.once('finish', finished.resolve));
+  const client = net.createConnection({ host: '127.0.0.1', port: server.address().port });
+  let response = '';
+  client.on('data', chunk => { response += chunk.toString(); });
+  t.after(async () => { client.destroy(); await server.shutdown().catch(() => {}); });
+  try {
+    const socket = await accepted.promise;
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nConnection: keep-alive\r\n\r\n');
+    await finished.promise;
+    const nextHeaders = new Promise(resolve => socket.once('data', resolve));
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nX-Pending:');
+    await nextHeaders;
+    const closed = new Promise(resolve => client.once('close', resolve));
+    await server.shutdown();
+    await closed;
+    assert.match(response, /^HTTP\/1\.1 200 /);
+    assert.match(response, /\r\n0\r\n\r\n$/);
+    assert.deepEqual(events, ['background-stop', 'application-close', 'lease-close']);
+  } finally {
+    client.destroy();
+    await server.shutdown().catch(() => {});
+  }
+});
+
+test("shutdown preserves an accepted pipelined POST after an earlier response finishes", { timeout: 2000 }, async (t) => {
+  const started = deferred(), release = deferred(), firstFinished = deferred(), accepted = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push('application-close'); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, { shutdownDrainTimeoutMs: 1000,
+    writerLease: { async acquire() {}, async close() { events.push('lease-close'); } } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  server.once('connection', socket => accepted.resolve(socket));
+  server.on('request', (incoming, response) => {
+    if (incoming.method === 'GET') response.once('finish', firstFinished.resolve);
+  });
+  const client = net.createConnection({ host: '127.0.0.1', port: server.address().port });
+  const closed = new Promise(resolve => client.once('close', resolve));
+  let response = '', clientError = null, stopping;
+  client.on('data', chunk => { response += chunk.toString(); });
+  client.on('error', error => { clientError = error; });
+  t.after(async () => { release.resolve(healthyRefreshResult()); client.destroy(); await server.shutdown().catch(() => {}); });
+  try {
+    const socket = await accepted.promise;
+    client.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nConnection: keep-alive\r\n\r\n' +
+      'POST /api/refresh HTTP/1.1\r\nHost: 127.0.0.1:4173\r\nOrigin: http://127.0.0.1:4173\r\nX-MyDashboard-Action: 1\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
+    await Promise.all([started.promise, firstFinished.promise]);
+    stopping = server.shutdown();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+    release.resolve(healthyRefreshResult());
+    await stopping;
+    await closed;
+    assert.equal(clientError, null);
+    assert.equal((response.match(/HTTP\/1\.1 200 /g) ?? []).length, 2);
+    assert.equal((response.match(/\r\n0\r\n\r\n/g) ?? []).length, 2);
+    assert.deepEqual(events, ['application-close', 'lease-close']);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    client.destroy();
+    await stopping?.catch(() => {});
+    await server.shutdown().catch(() => {});
+  }
+});
+
+test("shutdown waits for an accepted POST instead of treating it as a browser preconnection", async () => {
+  const started = deferred();
+  const release = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push("application-close"); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 1_000,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let socket;
+  server.once("request", (incoming) => { socket = incoming.socket; });
+  const pending = request(server, {
+    method: "POST", path: "/api/refresh",
+    headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", connection: "close" },
+  });
+  await started.promise;
+  const stopping = server.shutdown();
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+    release.resolve(healthyRefreshResult());
+    assert.equal((await pending).status, 200);
+    await stopping;
+    assert.deepEqual(events, ["application-close", "lease-close"]);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    await pending.catch(() => {});
+    await stopping.catch(() => {});
+  }
+});
+
+test("an unfinished POST keeps shutdown and the writer lease fail-closed", async () => {
+  const started = deferred();
+  const release = deferred();
+  const events = [];
+  const application = startupApplication({
+    async refresh() { started.resolve(); return release.promise; },
+    async close() { events.push("application-close"); },
+  });
+  application.config.port = 4173;
+  const server = createDashboardServer(application, {
+    writerLease: {
+      async acquire() {},
+      async close() { events.push("lease-close"); },
+    },
+    shutdownDrainTimeoutMs: 100,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let socket;
+  server.once("request", (incoming) => { socket = incoming.socket; });
+  const pending = request(server, {
+    method: "POST", path: "/api/refresh",
+    headers: { origin: "http://127.0.0.1:4173", "x-mydashboard-action": "1", connection: "close" },
+  });
+  await started.promise;
+  try {
+    await assert.rejects(server.shutdown(), { code: "LIFECYCLE_DRAIN_TIMEOUT" });
+    assert.equal(socket.destroyed, false);
+    assert.deepEqual(events, []);
+  } finally {
+    release.resolve(healthyRefreshResult());
+    await pending;
+  }
+});
+
 test("the writer lease excludes restore before recovery has opened a listener", async () => {
   const name = `mydashboard-test-writer-${createHash("sha256")
     .update(`${process.pid}-${Date.now()}-${Math.random()}`)
@@ -7821,7 +9611,7 @@ test("awaited shutdown releases a delayed runtime before an immediate restart", 
   assert.equal(runtimeHeld, false);
 });
 
-test("startup listens immediately but confirmations stay closed until initial reconcile finishes", async () => {
+test("startup allows local confirmation reads while writes wait for initial reconciliation", async () => {
   const port = await availablePort();
   const refreshStarted = deferred();
   const releaseRefresh = deferred();
@@ -7873,8 +9663,16 @@ test("startup listens immediately but confirmations stay closed until initial re
     const confirmationDuringRefresh = await requestPort(port, {
       path: "/api/confirmations/next",
     });
-    assert.equal(confirmationDuringRefresh.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(confirmationDuringRefresh.status, 200);
+    const historyDuringRefresh = await requestPort(port, { path: "/api/confirmations/history" });
+    assert.equal(historyDuringRefresh.status, 200);
+    const approvalDuringRefresh = await requestPort(port, {
+      method: "POST", path: "/api/confirmations/confirmation-pr-work-1/approve",
+      headers: { origin: `http://127.0.0.1:${port}`, "x-mydashboard-action": "1", "content-type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(approvalDuringRefresh.status, 503);
+    assert.deepEqual(queueCalls, ["next", "history"]);
 
     releaseRefresh.resolve();
     await reconcileStarted.promise;
@@ -7882,8 +9680,8 @@ test("startup listens immediately but confirmations stay closed until initial re
     const confirmationDuringReconcile = await requestPort(port, {
       path: "/api/confirmations/next",
     });
-    assert.equal(confirmationDuringReconcile.status, 503);
-    assert.deepEqual(queueCalls, []);
+    assert.equal(confirmationDuringReconcile.status, 200);
+    assert.deepEqual(queueCalls, ["next", "history", "next"]);
 
     releaseReconcile.resolve();
     server = await starting;
@@ -7892,7 +9690,7 @@ test("startup listens immediately but confirmations stay closed until initial re
     });
     assert.equal(confirmation.status, 200);
     assert.equal(JSON.parse(confirmation.body).pendingCount, 1);
-    assert.deepEqual(queueCalls, ["next"]);
+    assert.deepEqual(queueCalls, ["next", "history", "next", "next"]);
     assert.equal(runAllCalls, 1);
   } finally {
     releaseRefresh.resolve();
@@ -8493,6 +10291,32 @@ test("health does not mask unexpected memory failures", async () => {
     },
     { memorySearch },
   );
+});
+
+test("health stays responsive during a pending memory authority check and shares its probe", async () => {
+  let resolveHealth;
+  let calls = 0;
+  const pending = new Promise(resolve => { resolveHealth = resolve; });
+  const memorySearch = { async search() { throw new Error("Query must retain its own authority check"); },
+    async getHealth() { calls += 1; return pending; } };
+  await withServer(async ({ server }) => {
+    const started = Date.now();
+    const checks = Promise.all([request(server, { path: "/api/health" }), request(server, { path: "/api/health" })]);
+    const failSafe = setTimeout(() => resolveHealth({ ready: true }), 2_000);
+    try {
+      const responses = await checks;
+      assert.ok(Date.now() - started < 1_500, "Health must not wait for the authority queue");
+      assert.equal(calls, 1);
+      for (const health of responses) {
+        assert.equal(health.status, 200);
+        assert.deepEqual(JSON.parse(health.body).memory, { ready: false, authorityCurrent: false, checking: true });
+      }
+      resolveHealth({ ready: true, authorityCurrent: true });
+      await new Promise(resolve => setImmediate(resolve));
+      await request(server, { path: "/api/health" });
+      assert.equal(calls, 2, "A completed probe must not become a cached authority claim");
+    } finally { clearTimeout(failSafe); resolveHealth({ ready: true }); }
+  }, { memorySearch });
 });
 
 test("unified memory query forwards only bounded filters and pagination", async () => {

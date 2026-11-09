@@ -2,22 +2,37 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
+import { automaticReviewWorkAdmission } from "../src/domain/automatic-review-policy.js";
 import {
-  activatePendingPullRequestWorkSource,
-  appendPullRequestWorkSource,
+  activatePendingPullRequestWorkSource as activatePendingPullRequestWorkSourceWithCounter,
+  appendPullRequestWorkSource as appendPullRequestWorkSourceWithCounter,
   createPullRequestWorkSource,
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   normalizePullRequestWorkSource,
-  pullRequestHeadAdmission,
+  pullRequestHeadAdmission as singlePullRequestHeadAdmission,
+  pullRequestHeadAdmissions,
   pullRequestTrustedPredecessorHead,
   verifyPullRequestExecutionBinding,
   validatePullRequestSourceTransition,
 } from "../src/services/work-ledger-pr-source.js";
 
+// These source-only fixtures have no claims; production passes the owning
+// item's exact counter at its validated activation boundary.
+const appendPullRequestWorkSource = (source, envelope, options = {}) =>
+  appendPullRequestWorkSourceWithCounter(source, envelope, { attemptAtActivation: 0, ...options });
+const activatePendingPullRequestWorkSource = (source, options = {}) =>
+  activatePendingPullRequestWorkSourceWithCounter(source, { attemptAtActivation: 0, ...options });
+
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const HEAD_C = "c".repeat(40);
+
+function pullRequestHeadAdmission(state, item) {
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(candidate => singlePullRequestHeadAdmission(state, candidate)));
+  return singlePullRequestHeadAdmission(state, item);
+}
 
 function pullRequestEnvelope(
   sequence,
@@ -69,11 +84,29 @@ function initialSource() {
   ).source;
 }
 
+test("replacement Assign intake survives source normalization and later CI snapshots", () => {
+  const facts = { relation: "review_requested", reviewRequestEventId: "event-2", reviewReceivedAt: "2026-08-03T01:00:00Z" };
+  const initial = pullRequestEnvelope(1, HEAD_A);
+  let source = createPullRequestWorkSource(initial).source;
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(2, HEAD_A,
+    { occurredAt: "2026-08-03T01:10:00.000Z", gitFacts: facts })).source;
+  source = normalizePullRequestWorkSource(source);
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(3, HEAD_A,
+    { occurredAt: "2026-08-05T01:10:00.000Z", gitFacts: { ...facts, ciStatus: "FAILURE" } })).source;
+  const root = { ...sourceItem(normalizePullRequestWorkSource(source)), event: initial.event, createdAt: initial.event.occurredAt };
+  assert.equal(automaticReviewWorkAdmission(root).admittedAt, "2026-08-03T01:10:00.000Z");
+  const forged = structuredClone(source);
+  forged.revisions.at(-1).incomingReview.eventId = "different-assign";
+  assert.throws(() => normalizePullRequestWorkSource(forged));
+});
+
 function sourceItem(source) {
   return {
     itemId: "work-item-pr-42",
+    kind: "source_root",
     source,
     sourceQuarantine: null,
+    attempt: 0,
   };
 }
 
@@ -83,6 +116,33 @@ function executionBinding(item) {
     event: currentWorkItemEvent(item),
   });
 }
+
+test("incoming Review receipts on a rejected snapshot cannot trigger legacy migration or rewrite accepted history", () => {
+  let source = initialSource();
+  source = appendPullRequestWorkSource(source, pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A })).source;
+  const previous = structuredClone(source);
+  const rejected = appendPullRequestWorkSource(source, pullRequestEnvelope(3, HEAD_C, { gitFacts: {
+    relation: "review_requested", reviewRequestEventId: "AE_2", reviewReceivedAt: "2026-08-02T01:00:00.000Z",
+  } }));
+  assert.equal(rejected.disposition, "ignored_unproven_head");
+  const normalized = normalizePullRequestWorkSource(rejected.source);
+  assert.equal(normalized.headRevision, previous.headRevision);
+  assert.deepEqual(normalized.revisions.slice(0, previous.revisions.length), previous.revisions);
+  assert.doesNotThrow(() => validatePullRequestSourceTransition([sourceItem(previous)], [sourceItem(normalized)]));
+});
+
+test("batch Head admission matches individual authority and refreshes after mutation", () => {
+  const first = sourceItem(initialSource());
+  const state = { items: [first] };
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(item => pullRequestHeadAdmission(state, item)));
+  first.source = appendPullRequestWorkSource(first.source,
+    pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A }),
+    { activate: false }).source;
+  assert.deepEqual(pullRequestHeadAdmissions(state, state.items),
+    state.items.map(item => pullRequestHeadAdmission(state, item)));
+  assert.equal(pullRequestHeadAdmissions(state, state.items)[0].pending, true);
+});
 
 test("deferred A to B keeps A active and records B as pending", () => {
   const sourceA = initialSource();
@@ -195,6 +255,7 @@ test("source transitions accept pointer progress and reject history rewrites", (
     validatePullRequestSourceTransition(
       [sourceItem(pendingB)],
       [sourceItem(activeB)],
+      [], headActivationTimeline(sourceA, activeB),
     )
   );
 
@@ -210,6 +271,73 @@ test("source transitions accept pointer progress and reject history rewrites", (
     (error) => error.code === "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID",
   );
 });
+
+function batchedHeadActivationSources({ legacy = false } = {}) {
+  const previous = initialSource();
+  if (legacy) delete previous.decisionBudget;
+  let next = appendPullRequestWorkSource(previous,
+    pullRequestEnvelope(2, HEAD_B, { previousHeadRefOid: HEAD_A }),
+    { attemptAtActivation: 14 }).source;
+  for (const sequence of [3, 4, 5, 6]) {
+    next = appendPullRequestWorkSource(next,
+      pullRequestEnvelope(sequence, HEAD_B),
+      { attemptAtActivation: 14, authorityEpochChanged: sequence === 5 }).source;
+  }
+  return { previous, next };
+}
+
+function headActivationTimeline(previous, next, attempt = 0) {
+  return next.revisions.slice(previous.activeRevision, next.activeRevision)
+    .filter(revision => revision.disposition === "accepted")
+    .map((revision, index) => ({
+      itemId: "work-item-pr-42", sequence: revision.revision, type: "pr_source_revised",
+      details: { workKey: next.workKey, activeRevision: revision.revision,
+        headRefOid: revision.headRefOid, headRevision: revision.headRevision,
+        ...(index === 0 ? { previousActiveRevision: previous.activeRevision,
+          previousHeadRefOid: previous.current.headRefOid, decisionAttemptOffset: attempt } : {}),
+      },
+    }));
+}
+
+for (const legacy of [false, true]) {
+  test(`source transition preserves the Head activation budget through batched metadata updates (${legacy ? "legacy" : "current"})`, () => {
+    // Sanitized shape of the outage: active 102 -> 107, Head activated at
+    // 103, authority-only advance at 106, and lifetime claim count 14.
+    const { previous, next } = batchedHeadActivationSources({ legacy });
+    assert.equal(next.activeRevision, 6);
+    assert.equal(next.decisionBudget.activationRevision, 2);
+    assert.equal(next.decisionBudget.attemptOffset, 14);
+    assert.equal(next.headRevision, 3);
+    assert.doesNotThrow(() => validatePullRequestSourceTransition(
+      [{ ...sourceItem(previous), attempt: 14 }],
+      [{ ...sourceItem(next), attempt: 14 }],
+      [], headActivationTimeline(previous, next, 14),
+    ));
+  });
+}
+
+for (const corruption of ["activation behind", "activation ahead", "wrong offset", "hidden Head change", "history rewrite"]) {
+  test(`batched metadata updates still reject ${corruption}`, () => {
+    const { previous, next } = batchedHeadActivationSources();
+    if (corruption === "activation behind") next.decisionBudget.activationRevision = 1;
+    if (corruption === "activation ahead") next.decisionBudget.activationRevision = 7;
+    if (corruption === "wrong offset") next.decisionBudget.attemptOffset = 13;
+    if (corruption === "history rewrite") next.revisions[0].inputDigest = "f".repeat(64);
+    if (corruption === "hidden Head change") {
+      const returned = appendPullRequestWorkSource(
+        appendPullRequestWorkSource(next, pullRequestEnvelope(7, HEAD_C,
+          { previousHeadRefOid: HEAD_B }), { attemptAtActivation: 14 }).source,
+        pullRequestEnvelope(8, HEAD_B, { previousHeadRefOid: HEAD_C }),
+        { attemptAtActivation: 14 }).source;
+      Object.assign(next, returned, { decisionBudget: next.decisionBudget });
+    }
+    assert.throws(() => validatePullRequestSourceTransition(
+      [{ ...sourceItem(previous), attempt: 14 }],
+      [{ ...sourceItem(next), attempt: 14 }],
+      [], headActivationTimeline(previous, next, 14),
+    ), (error) => ["WORK_LEDGER_PR_SOURCE_INVALID", "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID"].includes(error.code));
+  });
+}
 
 test("execution authority keeps same-Head facts valid but rejects pending or changed Heads", () => {
   const itemA = sourceItem(initialSource());

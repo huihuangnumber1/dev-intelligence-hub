@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import path from "node:path";
+import { StateStore } from "../src/lib/state-store.js";
 import test from "node:test";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
@@ -647,4 +649,123 @@ test("evidence candidates exclude action-incompatible code deliverables", async 
     ["valid-verify", "valid-modify"],
   );
   assert.equal(page.nextBeforeSequence, null);
+});
+
+
+function versionedProposalFixture() {
+  const files = new Map();
+  const directory = "work-proposal-versioned-fixture";
+  const target = path.join(directory, WORK_PROPOSAL_STATE_KEY + ".json");
+  let reads = 0;
+  const fileSystem = {
+    async mkdir() {},
+    async readFile(file) {
+      reads += 1;
+      if (!files.has(file)) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      return files.get(file);
+    },
+    async writeFile(file, content) { files.set(file, content); },
+    async rename(from, to) { files.set(to, files.get(from)); files.delete(from); },
+    async rm(file) { files.delete(file); },
+  };
+  const store = new StateStore(directory, { fileSystem });
+  const versionedReads = [];
+  const readVersioned = store.readVersioned.bind(store);
+  store.readVersioned = async (name, fallback, options) => {
+    const result = await readVersioned(name, fallback, options);
+    versionedReads.push({ ifVersion: options?.ifVersion, changed: result.changed });
+    return result;
+  };
+  return { store, files, target, versionedReads, readCount: () => reads };
+}
+
+async function readyVersionedProposals() {
+  const fixture = versionedProposalFixture();
+  const context = await readyStore({ store: fixture.store });
+  await context.proposals.create(proposal());
+  return { ...context, ...fixture };
+}
+
+test("unchanged versioned claims keep fresh reads and detached output", async () => {
+  const { proposals, versionedReads, readCount } = await readyVersionedProposals();
+  const request = { runnerId: "runner-1", leaseDurationMs: 60_000 };
+  const first = await claimAs(proposals, request);
+  const before = readCount();
+  first.proposal.payload.objective = "caller mutation";
+  const repeated = await claimAs(proposals, request);
+  assert.equal(readCount() - before, 1);
+  assert.equal(versionedReads.at(-1)?.changed, false);
+  assert.equal(repeated.proposal.payload.objective, proposal().payload.objective);
+  assert.equal(Object.isFrozen(repeated.proposal), false);
+  proposals.state.proposals[0].proposal.payload.objective = "public mutation";
+  await assert.rejects(claimAs(proposals, request), { code: "WORK_PROPOSAL_STATE_FORKED" });
+  assert.equal(proposals.ready, false);
+});
+
+test("fresh versioned reads still reject changed durable corruption and forks", async (t) => {
+  const cases = [
+    ["digest", (state) => { state.proposals[0].recordDigest = "0".repeat(64); }, "WORK_PROPOSAL_STATE_CORRUPTED"],
+    ["fork", (state) => { state.proposals.reverse(); }, "WORK_PROPOSAL_STATE_FORKED"],
+    ["rollback", (state) => Object.assign(state, { revision: 0, nextResultSequence: 1, proposals: [], results: [] }), "WORK_PROPOSAL_STATE_ROLLBACK"],
+    ["deletion", null, "WORK_PROPOSAL_STATE_ROLLBACK"],
+  ];
+  for (const [name, mutate, code] of cases) await t.test(name, async () => {
+    const { proposals, files, target } = await readyVersionedProposals();
+    await proposals.create(proposal({ proposalId: "work-intent-proposal-2" }));
+    if (mutate === null) files.delete(target);
+    else { const state = JSON.parse(files.get(target)); mutate(state); files.set(target, JSON.stringify(state)); }
+    await assert.rejects(claimAs(proposals, { runnerId: "runner-1", leaseDurationMs: 60_000 }), { code });
+    assert.equal(proposals.ready, false);
+  });
+});
+
+test("lost versioned write ACK forces fresh recovery and remains idempotent", async () => {
+  const { proposals, store, versionedReads } = await readyVersionedProposals();
+  const write = store.write.bind(store);
+  store.write = async (...args) => {
+    const version = await write(...args);
+    store.write = write;
+    throw new Error("lost versioned ACK");
+  };
+  const next = proposal({ proposalId: "work-intent-proposal-2" });
+  await assert.rejects(proposals.create(next), { message: "lost versioned ACK" });
+  assert.equal(proposals.ready, true);
+  assert.equal(versionedReads.at(-1)?.changed, true);
+  assert.equal(versionedReads.at(-1)?.ifVersion, undefined);
+  const revision = proposals.state.revision;
+  assert.equal((await proposals.create(next)).revision, revision);
+  assert.equal(proposals.state.revision, revision);
+});
+
+test("missing write version invalidates pairing until a fresh validation", async () => {
+  const { proposals, store, versionedReads } = await readyVersionedProposals();
+  const write = store.write.bind(store);
+  store.write = async (...args) => { await write(...args); };
+  await proposals.create(proposal({ proposalId: "work-intent-proposal-2" }));
+  const request = { runnerId: "runner-1", leaseDurationMs: 60_000 };
+  await claimAs(proposals, request);
+  assert.equal(versionedReads.at(-1)?.changed, true);
+  await claimAs(proposals, request);
+  assert.equal(versionedReads.at(-1)?.changed, true);
+  await claimAs(proposals, request);
+  assert.equal(versionedReads.at(-1)?.changed, false);
+});
+
+test("replacement mutable limits cannot retain cached validation", async () => {
+  const { proposals } = await readyVersionedProposals();
+  await proposals.create(proposal({ proposalId: "work-intent-proposal-2" }));
+  const request = { runnerId: "runner-1", leaseDurationMs: 60_000 };
+  await claimAs(proposals, request);
+  proposals.limits = { ...proposals.limits };
+  await claimAs(proposals, request);
+  proposals.limits.maximumProposals = 1;
+  await assert.rejects(claimAs(proposals, request), { code: "WORK_PROPOSAL_STATE_CORRUPTED" });
+  assert.equal(proposals.ready, false);
+});
+
+test("invalid version responses fail closed", async () => {
+  const { proposals, store } = await readyVersionedProposals();
+  store.readVersioned = async () => ({ changed: false, version: Object.freeze({}) });
+  await assert.rejects(claimAs(proposals, { runnerId: "runner-1", leaseDurationMs: 60_000 }), { code: "WORK_PROPOSAL_STATE_CORRUPTED" });
+  assert.equal(proposals.ready, false);
 });

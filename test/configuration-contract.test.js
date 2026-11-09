@@ -25,9 +25,86 @@ function document() {
   return structuredClone(committedDocument);
 }
 
+test("global DingTalk digest brain requires only explicit DingTalk remote authority", () => {
+  const before = document();
+  const configured = document();
+  configured.brainProviders["digest-luna"] = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  configured.brain.primaryBrain = {
+    provider: "digest-luna", model: "gpt-6-luna", reasoningEffort: "medium",
+    remoteData: { requirements: false, code: false, memory: false, dingtalk: true },
+  };
+  configured.brain.allowRemoteDingTalkSummary = true;
+  const normalized = normalizeConfigurationDocument(configured);
+  assert.deepEqual(normalized.brain.primaryBrain, configured.brain.primaryBrain);
+  assert.equal(normalized.brain.allowRemoteDingTalkSummary, true);
+  const form = configurationDocumentFromForm(createConfigurationFormState(normalized));
+  assert.equal(form.ok, true);
+  assert.deepEqual(form.configuration.brain.primaryBrain, configured.brain.primaryBrain);
+  const impact = configurationDocumentImpact(before, configured);
+  assert.ok(impact.authority_expansion.includes("brain.allowRemoteDingTalkSummary"));
+  assert.ok(impact.authority_expansion.includes("brain.primaryBrain"));
+  assert.ok(impact.restart_required.includes("brain.primaryBrain"));
+  for (const mutate of [
+    (value) => { value.brain.allowRemoteDingTalkSummary = false; },
+    (value) => { value.brain.primaryBrain.remoteData.code = true; },
+    (value) => { value.brain.primaryBrain.remoteData.dingtalk = false; },
+  ]) {
+    const invalid = structuredClone(configured); mutate(invalid);
+    assert.throws(() => normalizeConfigurationDocument(invalid));
+  }
+});
+
+test("PR promoter primary brain is optional, explicit, versioned and preserved by form round trips", () => {
+  const old = document();
+  const oldDigest = configurationDocumentDigest(old);
+  const configured = structuredClone(old);
+  configured.brainProviders["promoter-codex"] = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  configured.employees.prReviewer.allowRemoteCodeContext = true;
+  configured.employees.prReviewer.primaryBrain = { provider: "promoter-codex", model: "gpt-5.6-luna", reasoningEffort: "medium",
+    remoteData: { requirements: true, code: true, memory: false } };
+  const normalized = normalizeConfigurationDocument(configured);
+  assert.deepEqual(normalized.employees.prReviewer.primaryBrain, configured.employees.prReviewer.primaryBrain);
+  const form = configurationDocumentFromForm(createConfigurationFormState(normalized));
+  assert.equal(form.ok, true);
+  assert.deepEqual(form.configuration.employees.prReviewer.primaryBrain, configured.employees.prReviewer.primaryBrain);
+  const impact = configurationDocumentImpact(old, configured);
+  assert.ok(impact.restart_required.includes("employees.prReviewer.primaryBrain"));
+  assert.ok(impact.authority_expansion.includes("employees.prReviewer.primaryBrain"));
+  assert.equal(configurationDocumentDigest(old), oldDigest);
+  assert.equal(Object.hasOwn(normalizeConfigurationDocument(old).employees.prReviewer, "primaryBrain"), false);
+  for (const mutate of [
+    (value) => { value.employees.prReviewer.primaryBrain.provider = "missing"; },
+    (value) => { value.employees.prReviewer.allowRemoteCodeContext = false; },
+    (value) => { value.employees.prReviewer.primaryBrain.remoteData.code = false; },
+    (value) => { value.employees.prReviewer.primaryBrain.remoteData.requirements = false; },
+  ]) {
+    const invalid = structuredClone(configured); mutate(invalid);
+    assert.throws(() => normalizeConfigurationDocument(invalid));
+  }
+});
+
+test("mail summary is opt in without rewriting historical configuration digests", () => {
+  const old = document();
+  const before = configurationDocumentDigest(old);
+  assert.equal(Object.hasOwn(normalizeConfigurationDocument(old).dingtalk, "mailEnabled"), false);
+  const enabled = structuredClone(old);
+  enabled.dingtalk.mailEnabled = true;
+  assert.equal(normalizeConfigurationDocument(enabled).dingtalk.mailEnabled, true);
+  assert.notEqual(configurationDocumentDigest(enabled), before);
+  assert.ok(configurationDocumentImpact(old, enabled).restart_required.includes("dingtalk.mailEnabled"));
+  assert.ok(configurationDocumentImpact(old, enabled).authority_expansion.includes("dingtalk.mailEnabled"));
+  delete enabled.dingtalk.mailEnabled;
+  assert.equal(configurationDocumentDigest(enabled), before);
+  enabled.dingtalk.mailEnabled = "true";
+  assert.throws(() => normalizeConfigurationDocument(enabled));
+});
+
 function legacyGithubCredentialDocument() {
   const value = document();
   delete value.githubActions.credentialMode;
+  delete value.githubActions.automaticReview;
+  delete value.githubActions.assignAfterAutomaticReview;
+  delete value.githubActions.automaticOwnPrRepair;
   return value;
 }
 
@@ -545,6 +622,18 @@ test("Git Head snapshot workspaces require a bounded Git configuration", () => {
   assertInvalid(relativeCommand);
 });
 
+test("Windows Git Head snapshots accept the UCRT64 native implementation", () => {
+  if (process.platform !== "win32") return;
+  const configuration = document();
+  configuration.codeExecutor = {
+    enabled: false,
+    gitCommand: "C:/Program Files/Git/ucrt64/bin/git.exe",
+    workspaces: [{ id: "dashboard", sourceRoot: "dashboard", gitHeadSnapshot: true }],
+  };
+  assert.equal(normalizeConfigurationDocument(configuration).codeExecutor.gitCommand,
+    configuration.codeExecutor.gitCommand);
+});
+
 test("Windows Git Head snapshots reject wrapper executables before activation", () => {
   if (process.platform !== "win32") return;
   const wrapper = document();
@@ -733,6 +822,107 @@ test("versioned code executor profiles accept reusable Node script assets", () =
   assert.deepEqual(
     normalized.codeExecutor.profiles["reusable-smoke"].asset,
     value.codeExecutor.profiles["reusable-smoke"].asset,
+  );
+});
+
+test("Windows fixed profiles bind native executable and asset versions without Docker configuration", () => {
+  const value = document();
+  value.codeExecutor = { enabled: true, workspaces: [{ id: "dashboard", sourceRoot: "." }],
+    profiles: { native: { kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "a".repeat(64), timeoutMs: 30_000,
+      asset: { schemaVersion: 1, title: "Native tests", description: "Fixed product assertions", version: 1, source: "fixed" } } },
+    requiredProfilesByWorkspace: { dashboard: ["native"] } };
+  assert.deepEqual(normalizeConfigurationDocument(value).codeExecutor.profiles, value.codeExecutor.profiles);
+  const unpinned = structuredClone(value);
+  delete unpinned.codeExecutor.profiles.native.nodeSha256;
+  assertInvalid(unpinned);
+});
+
+test("own PR repair is an optional strict boolean and preserves legacy documents", () => {
+  const legacy = document();
+  delete legacy.githubActions.automaticOwnPrRepair;
+  const normalized = normalizeConfigurationDocument(legacy);
+  assert.equal(Object.hasOwn(normalized.githubActions, "automaticOwnPrRepair"), false);
+  assert.equal(configurationDocumentDigest(normalized), configurationDocumentDigest(legacy));
+
+  for (const enabled of [true, false]) {
+    const configured = structuredClone(legacy);
+    configured.githubActions.automaticOwnPrRepair = enabled;
+    assert.equal(normalizeConfigurationDocument(configured).githubActions.automaticOwnPrRepair, enabled);
+  }
+  for (const value of ["true", 1, null, {}, []]) {
+    const invalid = structuredClone(legacy);
+    invalid.githubActions.automaticOwnPrRepair = value;
+    assertInvalid(invalid);
+  }
+});
+
+test("own PR repair enabling expands authority and disabling or removal tightens it", () => {
+  const path = "githubActions.automaticOwnPrRepair";
+  const withSetting = (value) => {
+    const configuration = document();
+    if (value === undefined) delete configuration.githubActions.automaticOwnPrRepair;
+    else configuration.githubActions.automaticOwnPrRepair = value;
+    return configuration;
+  };
+  for (const [before, after, tightening, expansion] of [
+    [undefined, true, false, true],
+    [false, true, false, true],
+    [true, false, true, false],
+    [true, undefined, true, false],
+    [undefined, false, false, false],
+    [false, undefined, false, false],
+  ]) {
+    const impact = configurationDocumentImpact(withSetting(before), withSetting(after));
+    assert.deepEqual(impact.security_tightening, tightening ? [path] : []);
+    assert.deepEqual(impact.authority_expansion, expansion ? [path] : []);
+    assert.deepEqual(impact.restart_required, [path]);
+  }
+});
+
+test("executor profile IDs and bindings match the sandbox ID boundary", () => {
+  const valid = () => {
+    const value = document();
+    value.codeExecutor = {
+      enabled: true,
+      docker: {
+        executable: "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe",
+        host: "npipe:////./pipe/dockerDesktopLinuxEngine",
+      },
+      workspaces: [{ id: "dashboard", sourceRoot: "." }],
+      profiles: {
+        "node-test": {
+          kind: "node-test",
+          image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+          timeoutMs: 30_000,
+        },
+      },
+      requiredProfilesByWorkspace: { dashboard: ["node-test"] },
+    };
+    return value;
+  };
+
+  for (const profileId of ["node_test", "node.test", "a".repeat(65)]) {
+    const value = valid();
+    value.codeExecutor.profiles = {
+      [profileId]: value.codeExecutor.profiles["node-test"],
+    };
+    value.codeExecutor.requiredProfilesByWorkspace.dashboard = [profileId];
+    assertInvalid(value);
+
+    const invalidBinding = valid();
+    invalidBinding.codeExecutor.requiredProfilesByWorkspace.dashboard = [profileId];
+    assertInvalid(invalidBinding);
+  }
+
+  const boundary = valid();
+  const longestId = "a".repeat(64);
+  boundary.codeExecutor.profiles = {
+    [longestId]: boundary.codeExecutor.profiles["node-test"],
+  };
+  boundary.codeExecutor.requiredProfilesByWorkspace.dashboard = [longestId];
+  assert.deepEqual(
+    normalizeConfigurationDocument(boundary).codeExecutor.requiredProfilesByWorkspace,
+    { dashboard: [longestId] },
   );
 });
 
@@ -1143,6 +1333,28 @@ test("supervised CLI providers are closed remote-only brain identities", () => {
   }
 });
 
+test("native Codex capacity is bounded, persistent, consistent and classified for restart", () => {
+  const before = document();
+  before.brainProviders.native = { kind: "codex-cli", credentialMode: "codex-native-login", remote: true };
+  const after = structuredClone(before);
+  after.brainProviders.native.maxConcurrentTurns = 2;
+  assert.equal(normalizeConfigurationDocument(after).brainProviders.native.maxConcurrentTurns, 2);
+  const field = "brainProviders.native.maxConcurrentTurns";
+  assert.ok(configurationDocumentImpact(before, after).restart_required.includes(field));
+  assert.ok(configurationDocumentImpact(before, after).authority_expansion.includes(field));
+  assert.ok(configurationDocumentImpact(after, before).security_tightening.includes(field));
+  for (const value of [0, 5, 1.5, "2"]) {
+    const invalid = structuredClone(after); invalid.brainProviders.native.maxConcurrentTurns = value; assertInvalid(invalid);
+  }
+  for (const credentialMode of ["api-key", "codex-login"]) {
+    const invalid = structuredClone(after); invalid.brainProviders.native.credentialMode = credentialMode; assertInvalid(invalid);
+  }
+  const inconsistent = structuredClone(after);
+  inconsistent.brainProviders.second = structuredClone(before.brainProviders.native);
+  assertInvalid(inconsistent);
+  const remote = document(); remote.brainProviders.ollama.maxConcurrentTurns = 2; assertInvalid(remote);
+});
+
 test("CLI provider credential modes remain optional legacy configuration and classify authority", () => {
   const legacy = document();
   legacy.brainProviders.cli = { kind: "codex-cli", remote: true };
@@ -1151,7 +1363,7 @@ test("CLI provider credential modes remain optional legacy configuration and cla
     false,
   );
 
-  for (const credentialMode of ["api-key", "codex-login"]) {
+  for (const credentialMode of ["api-key", "codex-login", "codex-native-login"]) {
     const configured = structuredClone(legacy);
     configured.brainProviders.cli.credentialMode = credentialMode;
     assert.equal(
@@ -1169,9 +1381,20 @@ test("CLI provider credential modes remain optional legacy configuration and cla
     "brainProviders.cli.credentialMode",
   ]);
 
-  const claude = structuredClone(legacy);
-  claude.brainProviders.cli = { kind: "claude-cli", remote: true, credentialMode: "codex-login" };
-  assertInvalid(claude);
+  for (const credentialMode of ["codex-login", "codex-native-login"]) {
+    const claude = structuredClone(legacy);
+    claude.brainProviders.cli = { kind: "claude-cli", remote: true, credentialMode };
+    assertInvalid(claude);
+  }
+
+  const nativeLogin = structuredClone(login);
+  nativeLogin.brainProviders.cli.credentialMode = "codex-native-login";
+  assert.deepEqual(configurationDocumentImpact(login, nativeLogin).restart_required, [
+    "brainProviders.cli.credentialMode",
+  ]);
+  assert.deepEqual(configurationDocumentImpact(login, nativeLogin).authority_expansion, [
+    "brainProviders.cli.credentialMode",
+  ]);
 
   for (const provider of ["ollama", "openai-compatible"]) {
     const nonCli = document();

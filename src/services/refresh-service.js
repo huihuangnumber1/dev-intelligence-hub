@@ -1,10 +1,15 @@
 import { buildDashboard } from "../domain/dashboard-model.js";
+import { mergeMailNotifications } from "../domain/dingtalk-mail.js";
 import {
   ACTION_STATES,
   assessPullRequestResponsibility,
+  isPersonalPullRequest,
 } from "../domain/pr-responsibility.js";
 import { prioritize } from "../domain/prioritizer.js";
 import { diffSnapshots } from "../domain/snapshot-diff.js";
+import { runStructuredProviderRequest } from "../lib/structured-provider-request.js";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeNativeFailure } from "./task-run-execution-receipts.js";
 import {
   resolveEffectivePullRequestUpdatedWindow,
 } from "../domain/pull-request-updated-window.js";
@@ -21,6 +26,34 @@ import {
 } from "../domain/dingtalk-report.js";
 
 const DINGTALK_REPORT_STATE_KEY = "dingtalk-report-state";
+const AUXILIARY_TIMEOUT_MS = 5_000;
+const DINGTALK_TIMEOUT_MS = 30_000;
+
+function auxiliaryTimeoutError() {
+  return Object.assign(new Error("辅助数据读取超时，本轮保留已有数据"), {
+    code: "REFRESH_AUXILIARY_TIMEOUT",
+  });
+}
+
+function auxiliaryRead(operation, deadline, signal) {
+  signal?.throwIfAborted();
+  const remainingMs = Math.ceil(deadline - performance.now());
+  if (remainingMs <= 0) return Promise.reject(auxiliaryTimeoutError());
+  const controller = new AbortController();
+  return runStructuredProviderRequest({
+    controller, timeoutMs: remainingMs, signal,
+    operation: () => operation(controller.signal),
+    cancellationError: () => signal.reason,
+    timeoutError: auxiliaryTimeoutError,
+  });
+}
+const DINGTALK_KINDS_BY_SOURCE = Object.freeze({
+  "daily messages": ["announcement", "message"],
+  unread: ["conversation"],
+  mentions: ["mention"],
+  todos: ["todo"],
+  mail: ["mail"],
+});
 
 const CONFIRMABLE_ACTION_STATES = new Set([
   ACTION_STATES.ACTION_NOW,
@@ -32,6 +65,11 @@ function dashboardOptions(config) {
   return {
     issueActiveWindowDays: config.githubRead?.issueActiveWindowDays ?? 14,
   };
+}
+
+function personalSnapshot(snapshot) {
+  return snapshot == null ? snapshot : { ...snapshot,
+    items: snapshot.items.filter(item => item.kind !== 'pull_request' || isPersonalPullRequest(item)) };
 }
 
 function serviceError(statusCode, message) {
@@ -119,6 +157,9 @@ function brainAssessmentFingerprint(item, brainConfig) {
     state: item.state || "",
     isDraft: Boolean(item.isDraft),
     reviewFactsAvailable: item.reviewFactsAvailable === true,
+    reviewFeedbackAvailable: item.reviewFeedbackAvailable,
+    reviewFeedbackDigest: item.reviewFeedbackDigest,
+    reviewFeedbackCount: item.reviewFeedbackCount,
     headRefOid: item.headRefOid || "",
     myReviewState: item.myReviewState || "",
     myReviewCommitOid: item.myReviewCommitOid || "",
@@ -142,7 +183,11 @@ export class RefreshService {
     config,
     brain = null,
     operationQueue = null,
+    repairProgressReader = null,
     clock = () => new Date(),
+    auxiliaryTimeoutMs = AUXILIARY_TIMEOUT_MS,
+    dingtalkTimeoutMs = DINGTALK_TIMEOUT_MS,
+    dingtalkSummaryTimeoutMs = 180_000,
   }) {
     this.github = github;
     this.brain = brain;
@@ -154,8 +199,23 @@ export class RefreshService {
       throw new TypeError("RefreshService clock must be a function");
     }
     this.clock = clock;
+    if (!Number.isSafeInteger(auxiliaryTimeoutMs) || auxiliaryTimeoutMs < 1 || auxiliaryTimeoutMs > 30_000) {
+      throw new TypeError("RefreshService auxiliaryTimeoutMs must be between 1 and 30000");
+    }
+    this.auxiliaryTimeoutMs = auxiliaryTimeoutMs;
+    if (!Number.isSafeInteger(dingtalkTimeoutMs) || dingtalkTimeoutMs < 1 || dingtalkTimeoutMs > 30_000) {
+      throw new TypeError("RefreshService dingtalkTimeoutMs must be between 1 and 30000");
+    }
+    this.dingtalkTimeoutMs = dingtalkTimeoutMs;
+    if (!Number.isSafeInteger(dingtalkSummaryTimeoutMs) || dingtalkSummaryTimeoutMs < 1 || dingtalkSummaryTimeoutMs > 600_000) {
+      throw new TypeError("RefreshService dingtalkSummaryTimeoutMs must be between 1 and 600000");
+    }
+    this.dingtalkSummaryTimeoutMs = dingtalkSummaryTimeoutMs;
+    this.pendingDingTalkSummary = null;
+    this.summaryOperations = Promise.resolve();
     this.running = null;
     this.operationQueue = operationQueue;
+    this.repairProgressReader = repairProgressReader;
     this.operations = Promise.resolve();
   }
 
@@ -173,6 +233,41 @@ export class RefreshService {
     return this.#enqueue(() =>
       this.#confirmPullRequestResponsibility(id, actionState, headRefOid),
     );
+  }
+
+  summarizePendingDingTalk({ signal } = {}) {
+    const operation = this.summaryOperations.then(async () => {
+      signal?.throwIfAborted();
+      const request = this.pendingDingTalkSummary;
+      if (!request) return { skipped: "no_pending_summary" };
+      const meta = { enabled: true, errors: [] };
+      const items = await this.#summarizeDingTalk(request.items, meta, signal,
+        performance.now() + this.dingtalkSummaryTimeoutMs);
+      return this.#enqueue(async () => {
+        signal?.throwIfAborted();
+        const current = await this.store.read("snapshot");
+        if (this.pendingDingTalkSummary !== request || current?.refreshedAt !== request.refreshedAt ||
+            current.brain?.dingtalkSummaryFingerprint !== request.fingerprint) return { skipped: "snapshot_changed" };
+        const brain = { ...current.brain, ...meta,
+          errors: [...current.brain.errors, ...meta.errors],
+          dingtalkSummaryState: meta.dingtalkSummaryError ? "failed" : "complete" };
+        // Summary metadata must not replace PR assessment/provider metadata.
+        brain.enabled = current.brain.enabled;
+        const next = { ...current, brain,
+          items: [...current.items.filter(item => !Object.values(DINGTALK_KINDS_BY_SOURCE).flat().includes(item.kind)), ...items],
+          sources: { ...current.sources, dingtalk: items.length } };
+        const previous = await this.store.read("previous-snapshot");
+        const dashboard = buildDashboard(next, previous, dashboardOptions(this.config));
+        dashboard.dingtalkReport = projectDingTalkReportState(normalizeDingTalkReportState(await this.store.read(DINGTALK_REPORT_STATE_KEY)));
+        signal?.throwIfAborted();
+        await this.store.write("snapshot", next);
+        await this.store.write("dashboard", dashboard);
+        this.pendingDingTalkSummary = null;
+        return { summarized: brain.dingtalkSummarized, state: brain.dingtalkSummaryState };
+      });
+    });
+    this.summaryOperations = operation.catch(() => {});
+    return operation;
   }
 
   #enqueue(operation) {
@@ -257,12 +352,12 @@ export class RefreshService {
     return dashboard;
   }
 
-  async #assessUncertainPullRequests(items, signal) {
+  async #assessUncertainPullRequests(items, signal, deadline) {
     const brainConfig = this.config.brain || {};
     const meta = {
       enabled: Boolean(brainConfig.enabled),
-      provider: brainConfig.provider || "",
-      model: brainConfig.model || "",
+      provider: brainConfig.primaryBrain?.provider || brainConfig.provider || "",
+      model: brainConfig.primaryBrain?.model || brainConfig.model || "",
       assessed: 0,
       errors: [],
     };
@@ -283,16 +378,22 @@ export class RefreshService {
     for (const item of candidates) {
       signal?.throwIfAborted();
       try {
-        item.brainAssessment = await this.brain.assessPullRequest(item, { signal });
+        // Adapters receive a detached input: a late response cannot mutate a published snapshot.
+        item.brainAssessment = await auxiliaryRead(
+          stageSignal => this.brain.assessPullRequest(structuredClone(item), { signal: stageSignal }),
+          deadline, signal,
+        );
         meta.assessed += 1;
       } catch (error) {
+        signal?.throwIfAborted();
         meta.errors.push(`${item.repo || item.id} #${item.number || "?"}: ${error.message}`);
+        if (error.code === "REFRESH_AUXILIARY_TIMEOUT") break;
       }
     }
     return { items, meta };
   }
 
-  async #summarizeDingTalk(items, brainMeta, signal) {
+  async #summarizeDingTalk(items, brainMeta, signal, deadline) {
     const prepared = prepareDingTalkDigest(items);
     brainMeta.dingtalkGroups = prepared.groups.length;
     brainMeta.dingtalkSummarized = 0;
@@ -309,19 +410,38 @@ export class RefreshService {
 
     try {
       signal?.throwIfAborted();
-      const summaries = await this.brain.summarizeDingTalk(
-        dingTalkDigestFacts(prepared.groups),
-        { signal },
-      );
+      const facts = dingTalkDigestFacts(prepared.groups);
+      const receipt = await auxiliaryRead(async stageSignal =>
+        typeof this.brain.summarizeDingTalkWithReceipt === "function"
+          ? this.brain.summarizeDingTalkWithReceipt(facts, { signal: stageSignal })
+          : { summaries: await this.brain.summarizeDingTalk(facts, { signal: stageSignal }), fallbackUsed: false },
+      deadline, signal);
+      const summaries = receipt.summaries;
+      if (receipt.fallbackUsed) {
+        brainMeta.fallbackUsed = true;
+        brainMeta.fallbackProvider = this.config.brain?.provider || "ollama";
+        brainMeta.fallbackModel = this.config.brain?.model || "";
+      }
       brainMeta.dingtalkSummarized = summaries.length;
       return applyDingTalkSummaries(prepared, summaries);
     } catch (error) {
-      brainMeta.errors.push(`钉钉摘要: ${error.message}`);
+      signal?.throwIfAborted();
+      brainMeta.dingtalkSummaryError = {
+        message: error.message,
+        ...(typeof error.code === "string" ? { code: error.code } : {}),
+        ...(typeof error.primaryFailureCode === "string" ? { primaryFailureCode: error.primaryFailureCode } : {}),
+        ...(typeof error.fallbackFailureCode === "string" ? { fallbackFailureCode: error.fallbackFailureCode } : {}),
+      };
+      try {
+        const diagnostic = Object.getOwnPropertyDescriptor(error, "primaryNativeFailure")?.value;
+        if (diagnostic) brainMeta.dingtalkSummaryError.primaryNativeFailure = normalizeNativeFailure(diagnostic);
+      } catch { /* Invalid diagnostics do not replace the original provider failure. */ }
+      brainMeta.errors.push("钉钉 AI 摘要暂时不可用，已显示消息摘录；系统将自动重试。");
       return applyDingTalkSummaries(prepared);
     }
   }
 
-  async #performRefresh({ notify = false, signal } = {}) {
+  async #performRefresh({ notify = false, signal, deferDingTalkSummary = false } = {}) {
     signal?.throwIfAborted();
     const startedAt = clockMilliseconds(this.clock);
     const observationLowerBound = new Date(startedAt).toISOString();
@@ -339,6 +459,21 @@ export class RefreshService {
     const previousItems = previous?.items || [];
     const errors = [];
     const since = previous?.refreshedAt;
+
+    // Collect independent sources while GitHub is loading. A slow mailbox gets
+    // its own bounded read, without spending the optional AI enrichment budget.
+    const dingtalkCollection = this.config.dingtalk.enabled
+      ? auxiliaryRead(stageSignal => this.dingtalk.collect(since, {
+          signal: stageSignal, mailEnabled: this.config.dingtalk.mailEnabled === true,
+          sourceTimeoutMs: Math.max(1, this.dingtalkTimeoutMs - Math.min(1000, Math.floor(this.dingtalkTimeoutMs / 5))),
+        }), performance.now() + this.dingtalkTimeoutMs, signal).catch((error) => ({
+          items: previousItems.filter((item) =>
+            ["announcement", "message", "mention", "todo", "conversation",
+              ...(this.config.dingtalk.mailEnabled ? ["mail"] : [])].includes(item.kind)),
+          errors: [`钉钉: ${error.message}`],
+          retained: true,
+        }))
+      : Promise.resolve({ items: [], errors: [] });
 
     const githubCalls = this.config.githubRead?.enabled === false
       ? [[], [], []].map((value) => ({ status: "fulfilled", value }))
@@ -371,10 +506,15 @@ export class RefreshService {
         .filter((item) => item.kind === "pull_request")
         .map((item) => [item.id, item]),
     );
-    const classifiedPullRequests = githubValues[0].map((item) => {
+    let pullRequests = githubValues[0].filter(isPersonalPullRequest).map(({ reviewRepairProgress: _previous, ...item }) => item);
+    if (githubCalls[0].status === "fulfilled" && this.config.githubRead?.enabled !== false && this.repairProgressReader !== null) {
+      pullRequests = await this.repairProgressReader.enrich(pullRequests, { signal });
+    }
+    const classifiedPullRequests = pullRequests.map((item) => {
       const classified = {
         ...item,
         ...assessPullRequestResponsibility(item, {
+          now: observationLowerBound,
           historicalAfterDays:
             this.config.prResponsibility?.historicalAfterDays ?? 30,
         }),
@@ -415,37 +555,64 @@ export class RefreshService {
         responsibilityConfirmedAt: override.confirmedAt || "",
       };
     });
+    // PR assessments share one budget rather than one timeout per PR.
+    const auxiliaryDeadline = performance.now() + this.auxiliaryTimeoutMs;
     const brainAssessment = this.#assessUncertainPullRequests(
       classifiedPullRequests,
       signal,
+      auxiliaryDeadline,
     );
-    const dingtalkCollection = this.config.dingtalk.enabled
-      ? this.dingtalk.collect(since, { signal }).catch((error) => ({
-          items: previousItems.filter((item) =>
-            [
-              "announcement",
-              "message",
-              "mention",
-              "todo",
-              "conversation",
-            ].includes(item.kind),
-          ),
-          errors: [`钉钉: ${error.message}`],
-        }))
-      : Promise.resolve({ items: [], errors: [] });
     const [assessedPullRequests, dingtalkResult] = await Promise.all([
       brainAssessment,
       dingtalkCollection,
     ]);
     signal?.throwIfAborted();
     errors.push(...dingtalkResult.errors);
-    const summarizedDingTalkItems = dingtalkResult.errors.length
-      ? dingtalkResult.items
-      : await this.#summarizeDingTalk(
-          dingtalkResult.items,
-          assessedPullRequests.meta,
-          signal,
-        );
+    dingtalkResult.items = mergeMailNotifications(dingtalkResult.items,
+      [...assessedPullRequests.items, ...githubValues[1]]);
+    const staleDingTalkKinds = new Set(
+      (dingtalkResult.failedSources || [])
+        .flatMap((source) => DINGTALK_KINDS_BY_SOURCE[source] || []),
+    );
+    const prepared = prepareDingTalkDigest(dingtalkResult.items);
+    const fingerprint = canonicalJsonDigest([dingTalkDigestFacts(prepared.groups), this.config.brain ?? null]);
+    let summaryRequest = null;
+    let freshDingTalkItems;
+    const reusable = !dingtalkResult.retained && previous?.brain?.dingtalkSummaryState === "complete" && previous.brain.dingtalkSummarized > 0 &&
+      previous.brain.dingtalkSummaryFingerprint === fingerprint;
+    if (reusable) {
+      const ids = new Set(prepared.groups.map(group => `dingtalk:digest:${group.groupId}`));
+      freshDingTalkItems = [...prepared.passthrough, ...previous.items.filter(item => ids.has(item.id))];
+      Object.assign(assessedPullRequests.meta, { dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: "complete",
+        dingtalkGroups: prepared.groups.length, dingtalkSummarized: previous.brain.dingtalkSummarized });
+      for (const key of ["fallbackUsed", "fallbackProvider", "fallbackModel"]) {
+        if (Object.hasOwn(previous.brain, key)) assessedPullRequests.meta[key] = previous.brain[key];
+      }
+    } else if (deferDingTalkSummary && !dingtalkResult.retained && prepared.groups.length > 0 &&
+        assessedPullRequests.meta.enabled && typeof this.brain?.summarizeDingTalk === "function") {
+      freshDingTalkItems = applyDingTalkSummaries(prepared);
+      Object.assign(assessedPullRequests.meta, { dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: "pending",
+        dingtalkGroups: prepared.groups.length, dingtalkSummarized: 0 });
+      summaryRequest = { refreshedAt: observationLowerBound, fingerprint, items: structuredClone(dingtalkResult.items) };
+    } else {
+      freshDingTalkItems = dingtalkResult.retained ? dingtalkResult.items :
+        await this.#summarizeDingTalk(dingtalkResult.items, assessedPullRequests.meta, signal, performance.now() + this.dingtalkSummaryTimeoutMs);
+      if (!dingtalkResult.retained) Object.assign(assessedPullRequests.meta, {
+        dingtalkSummaryFingerprint: fingerprint, dingtalkSummaryState: assessedPullRequests.meta.dingtalkSummaryError ? "failed" : "complete" });
+    }
+    const summarizedDingTalkItems = deduplicate([
+      ...freshDingTalkItems,
+      ...previousItems.filter((item) => staleDingTalkKinds.has(item.kind)),
+    ]);
+    if (summaryRequest) summaryRequest.items = deduplicate([
+      ...summaryRequest.items, ...previousItems.filter(item => staleDingTalkKinds.has(item.kind)),
+    ]);
+    // A fact refresh can finish before the model. Keep that same request when
+    // both its authorization/configuration and complete input are unchanged.
+    if (summaryRequest && this.pendingDingTalkSummary?.fingerprint === fingerprint &&
+        canonicalJsonDigest(this.pendingDingTalkSummary.items) === canonicalJsonDigest(summaryRequest.items)) {
+      summaryRequest = this.pendingDingTalkSummary;
+    }
     signal?.throwIfAborted();
 
     const snapshot = {
@@ -491,7 +658,7 @@ export class RefreshService {
       0,
       clockMilliseconds(this.clock) - startedAt,
     );
-    const diff = diffSnapshots(previous, snapshot);
+    const diff = diffSnapshots(personalSnapshot(previous), snapshot);
     const dashboard = buildDashboard(
       snapshot,
       previous,
@@ -556,18 +723,32 @@ export class RefreshService {
     let notification = { sent: false, reason: "disabled" };
     let notificationDiff = null;
     if (notify && this.config.dingtalk.enabled && !errors.length) {
-      notificationDiff = diffSnapshots(notificationBaseline, snapshot);
-      notification = await this.notifier.send(
-        notificationDiff,
-        prioritize(
-          snapshot.items,
-          snapshot.refreshedAt,
-          dashboardOptions(this.config),
-        ),
-        { signal },
-      );
+      notificationDiff = diffSnapshots(personalSnapshot(notificationBaseline), snapshot);
+      try {
+        notification = await this.notifier.send(
+          notificationDiff,
+          prioritize(
+            snapshot.items,
+            snapshot.refreshedAt,
+            dashboardOptions(this.config),
+          ),
+          { signal },
+        );
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        notification = {
+          sent: false,
+          reason: "send-failed",
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
       signal?.throwIfAborted();
-      await this.store.write("notification-snapshot", snapshot);
+      if (
+        notification.sent === true ||
+        ["baseline", "no-important-change"].includes(notification.reason)
+      ) {
+        await this.store.write("notification-snapshot", snapshot);
+      }
     }
     if (scheduledReportError) errors.push(scheduledReportError);
 
@@ -582,6 +763,8 @@ export class RefreshService {
       notificationDiff,
       notification,
     });
+    if (summaryRequest) summaryRequest.refreshedAt = observationLowerBound;
+    this.pendingDingTalkSummary = summaryRequest;
     return { dashboard, diff, notification };
   }
 }

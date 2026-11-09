@@ -1,11 +1,20 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { normalizeStructuredBrainRequest } from "../src/lib/structured-brain-request.js";
 import { EmployeeRegistry } from "../src/services/employee-registry.js";
 import { RoleWorkerDirectory } from "../src/services/role-worker-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 import { ConfiguredRoleEmployee } from "../src/services/configured-role-employee.js";
 import { RoleDecisionEngine } from "../src/services/role-decision-engine.js";
+import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
+import { WorkCoordinationService } from "../src/services/work-coordination-service.js";
+import { WorkLedgerService } from "../src/services/work-ledger-service.js";
+import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { coordinatorGoalControl } from "../src/domain/work-goal-ownership.js";
+import { MODEL_WORK_DECISION_JSON_SCHEMA } from "../src/domain/structured-brain-contract.js";
 
 class MemoryStore {
   constructor() {
@@ -220,6 +229,114 @@ function deferred() {
   return { promise, resolve };
 }
 
+function fixedDecisionEngine(roleId, decision) {
+  return new RoleDecisionEngine({ definition: definition(roleId),
+    permissions: permissions("complete", "handoff", "ask_user", "propose_github_review", "propose_code_action"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true }), generate: async () => JSON.stringify(decision) },
+  });
+}
+
+test("developer PR development cannot complete without review, including an already committed alleged fix", async () => {
+  for (const event of [
+    { eventType: "pull_request.owner_requested", payload: { workType: "development", headRefOid: "a".repeat(40) } },
+    { eventType: "pull_request.updated", payload: { relation: "authored", nextAction: "address_review", headRefOid: "a".repeat(40) } },
+    { eventType: "pull_request.updated", payload: { relation: "authored", nextAction: "fix_ci", headRefOid: "a".repeat(40) } },
+  ]) {
+    const engine = fixedDecisionEngine("developer", completeDecision());
+    await assert.rejects(engine.decide({ item: { event }, context: {
+      requirements: {}, code: { sourceEvent: event, existingRepair: { commitOid: "b".repeat(40) } },
+    } }), { code: "ROLE_DECISION_PR_REVIEW_REQUIRED" });
+  }
+});
+
+test("an existing-fix developer handoff remains internal through the PR engineer decision", async () => {
+  const event = { eventType: "pull_request.owner_requested", source: { provider: "local-owner" },
+    payload: { workType: "development", headRefOid: "a".repeat(40) } };
+  const input = { item: { event }, context: { requirements: {}, code: { sourceEvent: event,
+    internalReview: { kind: "developer_handoff", headRefOid: event.payload.headRefOid,
+      brief: "Existing commit is claimed to fix the review", evidence: ["developer-report-only"] } } } };
+  const external = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review",
+    summary: "Publish", reason: "Review complete", verdict: "approve", body: "ok", evidence: [] } });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", external).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_ONLY" });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", completeDecision()).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_EVIDENCE_REQUIRED" });
+  const internal = completeDecision(); internal.intent.evidence = [`head:${event.payload.headRefOid}`, "code-inspection", "actual-regression-report"];
+  assert.equal((await fixedDecisionEngine("pr-engineer", internal).decide(input)).intent.type, "complete");
+});
+
+test("PR development retains real requirements questions and ordinary non-PR completion", async () => {
+  const event = { eventType: "pull_request.owner_requested", payload: { workType: "development" } };
+  assert.equal((await fixedDecisionEngine("developer", askUserDecision()).decide({ item: { event },
+    context: { requirements: {}, code: { sourceEvent: event } } })).intent.type, "ask_user");
+  assert.equal((await fixedDecisionEngine("developer", completeDecision()).decide({ item: {},
+    context: { requirements: {} } })).intent.type, "complete");
+  const testing = { eventType: "pull_request.owner_requested", payload: { workType: "testing" } };
+  assert.equal((await fixedDecisionEngine("developer", completeDecision()).decide({ item: { event: testing },
+    context: { requirements: {}, code: { sourceEvent: testing } } })).intent.type, "complete");
+});
+
+test("internal own PR review rejects external publication and requires Head and repair evidence on completion", async () => {
+  const internalReview = { kind: "own_pr_repair", headRefOid: "a".repeat(40), feedbackDigest: "f".repeat(64),
+    publicationConfirmationId: "confirmation-push", controlledCommitEvidenceId: "controlled-repair" };
+  const event = { eventType: "pull_request.internal_review_requested", source: { provider: "internal-review-repair" },
+    payload: { internalReview, headRefOid: internalReview.headRefOid } };
+  const input = { item: { event }, context: { requirements: {}, code: { sourceEvent: event } } };
+  await assert.rejects(fixedDecisionEngine("pr-engineer", completeDecision()).decide(input),
+    { code: "ROLE_DECISION_INTERNAL_REVIEW_EVIDENCE_REQUIRED" });
+  const bound = completeDecision();
+  bound.intent.evidence = [`head:${internalReview.headRefOid}`, "controlled-commit:controlled-repair", "publication:confirmation-push"];
+  await assert.rejects(fixedDecisionEngine("pr-engineer", bound).decide(input), { code: "ROLE_DECISION_INTERNAL_REVIEW_FEEDBACK_REQUIRED" });
+  event.subject = { repository: "acme/repo", number: 42 };
+  input.context.code.originalRepairFeedback = { snapshotId: `repair-feedback-snapshot-${"d".repeat(64)}`, feedbackDigest: internalReview.feedbackDigest,
+    originalHeadRefOid: "b".repeat(40), reviewHeadRefOid: internalReview.headRefOid };
+  input.context.code.pullRequest = { reviewMaterial: { gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "me",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "c".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: internalReview.headRefOid } } };
+  assert.equal((await fixedDecisionEngine("pr-engineer", bound).decide(input)).intent.type, "complete");
+  const external = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Publish",
+    reason: "Review complete", verdict: "approve", body: "ok", evidence: [] } });
+  await assert.rejects(fixedDecisionEngine("pr-engineer", external).decide(input),
+    { code: "ROLE_DECISION_INTERNAL_REVIEW_ONLY" });
+});
+
+test("owner goal controls validate fake provider output within the correction budget and isolate concurrent schemas", async () => {
+  const original = JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA);
+  const calls = [];
+  const seen = new Map();
+  const contextFor = (root, child) => ({ requirements: { coordination: { goalControl: coordinatorGoalControl({
+    rootTaskId: root, parentTaskId: null, event: { source: { provider: "local-owner" }, eventType: "owner_request.created" },
+    childTaskIds: [child],
+  }) } } });
+  const engine = new RoleDecisionEngine({ definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({}), async generate(request) {
+      calls.push(request);
+      const context = JSON.parse(request.messages[1].content);
+      const control = context.requirements.coordination.goalControl;
+      const count = (seen.get(control.rootTaskId) ?? 0) + 1;
+      seen.set(control.rootTaskId, count);
+      assert.ok(request.messages[0].content.includes(JSON.stringify(request.schema)), "the described schema must be this request's schema");
+      await Promise.resolve();
+      const result = orchestrationDecision();
+      result.intent.action.type = "cancel";
+      result.intent.action.sourceTaskId = control.rootTaskId === "root-a" && count === 1 ? control.rootTaskId : control.cancellableTaskIds[0];
+      return JSON.stringify(result);
+    } },
+  });
+  const [a, b] = await Promise.all([
+    engine.decide({ item: {}, context: contextFor("root-a", "child-a") }),
+    engine.decide({ item: {}, context: contextFor("root-b", "child-b") }),
+  ]);
+  assert.equal(a.intent.action.sourceTaskId, "child-a");
+  assert.equal(b.intent.action.sourceTaskId, "child-b");
+  assert.equal(calls.length, 3, "one invalid root control uses the existing correction attempt");
+  assert.equal(JSON.stringify(MODEL_WORK_DECISION_JSON_SCHEMA), original);
+  for (const request of calls) {
+    const control = JSON.parse(request.messages[1].content).requirements.coordination.goalControl;
+    const cancel = request.schema.properties.intent.oneOf.find(v => v.properties.type.const === "orchestrate")
+      .properties.action.oneOf.find(v => v.properties.type.const === "cancel");
+    assert.deepEqual(cancel.properties.sourceTaskId.enum, control.cancellableTaskIds);
+    assert.equal(Object.isFrozen(cancel.properties.sourceTaskId.enum), true);
+  }
+});
+
 test("RoleDecisionEngine classifies context, routes the configured brain, and normalizes output", async () => {
   const calls = [];
   const router = {
@@ -270,6 +387,10 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
   assert.match(calls[0].messages[0].content, /untrusted|不可信/i);
   assert.match(
     calls[0].messages[0].content,
+    /PR development.*owner_requested.*latest.*Head.*existing.*fix.*handoff.*pr-review.*without.*owner.*confirmation/i,
+  );
+  assert.match(
+    calls[0].messages[0].content,
     /modify produces change-package.*verify produces test-report/i,
   );
   assert.match(
@@ -305,6 +426,93 @@ test("RoleDecisionEngine classifies context, routes the configured brain, and no
     calls[0].sessionKey,
     "github:pull_request:example/software#24256",
   );
+});
+
+test("Review Skill prompts pass provider input validation and preserve Markdown", async () => {
+  const body = "## 结论\n\n**通过**：完整检查当前代码，未发现阻塞缺陷。\n\n## QA 待验\n\n- 在界面确认年龄来源及边界值显示。";
+  const decision = completeDecision({
+    intent: {
+      schemaVersion: 1,
+      type: "propose_github_review",
+      verdict: "approve",
+      summary: "年龄来源代码评审通过，交 QA 验证",
+      reason: "未发现阻塞缺陷，界面回归由 QA 完成",
+      body,
+      evidence: ["完整检查当前变更和年龄来源调用链，界面实测未执行"],
+    },
+  });
+  let request;
+  const router = {
+    async generate(value) {
+      normalizeStructuredBrainRequest({
+        model: value.brain.model,
+        messages: value.messages,
+        schema: value.schema,
+      }, { maxRequestBytes: 2 * 1024 * 1024 });
+      request = value;
+      return JSON.stringify(decision);
+    },
+    describe() {
+      return { ...brain(), remote: false };
+    },
+  };
+  const engine = new RoleDecisionEngine({
+    definition: definition("pr-engineer"),
+    permissions: permissions("propose_github_review"),
+    brain: brain(),
+    brainRouter: router,
+  });
+  const result = await engine.decide({
+    item: {},
+    context: { requirements: { title: "年龄来源" } },
+  });
+  assert.equal(result.intent.body, body);
+  const prompt = request.messages[0].content;
+  const skill = await readFile(
+    new URL("../src/skills/quick-pr-review/SKILL.md", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    prompt.includes(skill), true,
+    "provider receives the complete packaged skill",
+  );
+
+  const otherRole = new RoleDecisionEngine({
+    definition: definition("developer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      ...router,
+      async generate(value) {
+        request = value;
+        return JSON.stringify(completeDecision());
+      },
+    },
+  });
+  await otherRole.decide({ item: {}, context: { requirements: {} } });
+  assert.equal(request.messages[0].content.includes(skill), false);
+});
+
+test("tester receives the packaged testing workflow without changing its allowed intents", async () => {
+  const requests = [];
+  const router = {
+    async generate(value) {
+      requests.push(value);
+      normalizeStructuredBrainRequest({ model: value.brain.model, messages: value.messages, schema: value.schema }, { maxRequestBytes: 2 * 1024 * 1024 });
+      return JSON.stringify(completeDecision());
+    },
+    describe() { return { ...brain(), remote: false }; },
+  };
+  for (const roleId of ["tester", "developer"]) {
+    const engine = new RoleDecisionEngine({
+      definition: definition(roleId), permissions: permissions("complete"), brain: brain(), brainRouter: router,
+    });
+    await engine.decide({ item: {}, context: { requirements: {} } });
+  }
+  const skill = await readFile(new URL("../src/skills/controlled-testing/SKILL.md", import.meta.url), "utf8");
+  assert.equal(requests[0].messages[0].content.includes(skill), true);
+  assert.equal(requests[1].messages[0].content.includes(skill), false);
+  assert.deepEqual(requests[0].schema, requests[1].schema);
 });
 
 test("RoleDecisionEngine reuses one entity session across roles and event revisions", async () => {
@@ -386,7 +594,8 @@ test("RoleDecisionEngine checks its configured provider without generating a dec
 
   assert.equal(generateCalls, 0);
   assert.equal(availabilityCalls.length, 1);
-  assert.deepEqual(availabilityCalls[0].config, configuredBrain);
+  assert.deepEqual(availabilityCalls[0].config, { ...configuredBrain,
+    remoteData: { ...configuredBrain.remoteData, dingtalk: false } });
   assert.strictEqual(availabilityCalls[0].options.signal, controller.signal);
 });
 
@@ -429,6 +638,35 @@ test("RoleDecisionEngine uses supplied trusted context without invoking its lega
     engine.decide({ context: { secret: { value: true } } }),
     /role context is invalid/,
   );
+});
+
+test("RoleDecisionEngine admits a bounded UTF-8 review preview while retaining total size and text checks", async () => {
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("pr-engineer"),
+    permissions: permissions("complete"),
+    brain: brain(),
+    brainRouter: {
+      describe() { return { ...brain(), remote: false }; },
+      async generate(request) {
+        requests.push(request);
+        return JSON.stringify(completeDecision());
+      },
+    },
+  });
+  const patch = "变".repeat(22_000);
+  const context = { requirements: {}, code: { pullRequest: { reviewMaterial: { patch } } } };
+  await engine.decide({ context });
+  assert.equal(JSON.parse(requests[0].messages[1].content).code.pullRequest.reviewMaterial.patch, patch);
+  await assert.rejects(
+    engine.decide({ context: { requirements: {}, code: { patch, otherText: patch } } }),
+    { code: "ROLE_CONTEXT_TOO_LARGE" },
+  );
+  await assert.rejects(
+    engine.decide({ context: { requirements: {}, code: { patch: "invalid\u0000text" } } }),
+    /role context contains invalid text/u,
+  );
+  assert.equal(requests.length, 1, "invalid contexts must never reach the model");
 });
 
 test("RoleDecisionEngine rejects intents outside the independent role permissions", async () => {
@@ -618,6 +856,149 @@ test("RoleDecisionEngine rejects premature completion of initial structured PR t
   assert.equal(result.intent.action.capability, "development");
 });
 
+function externalRereviewContext(children = []) {
+  return {
+    requirements: { coordination: { directChildren: children } },
+    code: { sourceEvent: {
+      eventType: "pull_request.owner_requested",
+      source: { provider: "local-owner" },
+      payload: { workType: "general", nextAction: "rereview", suggestedCapability: "pr-review",
+        expectedHeadRefOid: "a".repeat(40) },
+    } },
+  };
+}
+
+function oneResponseEngine(roleId, result) {
+  return new RoleDecisionEngine({ definition: definition(roleId),
+    permissions: permissions("complete", "orchestrate", "submit_delivery", "propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify(result) } });
+}
+
+test("external rereview requires a required authoritative contract and accepted publication before root completion", async (t) => {
+  for (const invalidKind of ["text-report", "test-report"]) {
+    await t.test(`reject ${invalidKind} decomposition`, async () => {
+      const result = triageDecompositionDecision("pr-review");
+      result.intent.action.acceptanceContract.expectedDeliverables[0].kind = invalidKind;
+      await assert.rejects(oneResponseEngine("orchestrator", result).decide({ context: externalRereviewContext() }),
+        { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+    });
+  }
+  const accepted = { status: "completed", responsibility: { type: "role", id: "pr-engineer" },
+    hasAcceptedRequiredReview: true, deliverables: [{ kind: "github-review", required: true, state: "accepted" }] };
+  for (const child of [
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], kind: "text-report" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], required: false }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], state: "submitted" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [{ ...accepted.deliverables[0], state: "none" }] },
+    { ...accepted, hasAcceptedRequiredReview: false, deliverables: [] },
+    { ...accepted, status: "in_progress" },
+    { ...accepted, responsibility: { type: "role", id: "developer" } },
+    { ...accepted, hasAcceptedRequiredReview: "true" },
+    { ...accepted, hasAcceptedRequiredReview: undefined },
+  ]) {
+    if (child.hasAcceptedRequiredReview === undefined) delete child.hasAcceptedRequiredReview;
+    await assert.rejects(oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([child]) }),
+      { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  }
+  assert.equal((await oneResponseEngine("orchestrator", completeDecision()).decide({ context: externalRereviewContext([accepted]) })).intent.type, "complete");
+});
+
+test("external rereview permits an auxiliary specialist child while preserving authoritative completion", async () => {
+  const original = { taskId: "existing-review", status: "in_progress",
+    responsibility: { type: "role", id: "pr-engineer" }, hasAcceptedRequiredReview: false };
+  const context = externalRereviewContext([original]);
+  const result = triageDecompositionDecision("testing");
+  result.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
+  const decision = await oneResponseEngine("orchestrator", result).decide({ context });
+  assert.equal(decision.intent.action.capability, "testing");
+  assert.deepEqual(context.requirements.coordination.directChildren, [original]);
+  await assert.rejects(oneResponseEngine("orchestrator", completeDecision()).decide({ context }),
+    { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  const review = triageDecompositionDecision("pr-review");
+  review.intent.action.acceptanceContract.expectedDeliverables[0].kind = "text-report";
+  await assert.rejects(oneResponseEngine("orchestrator", review).decide({ context }),
+    { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+});
+
+test("a legacy coordinator child does not inherit the root Review completion rule", async () => {
+  const context = externalRereviewContext();
+  delete context.requirements.coordination;
+  context.requirements.currentTask = { parentTaskId: "review-root", acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "diagnosis", kind: "text-report", required: true }],
+  } };
+  // Decision scope is distinct from delivery acceptance. The ledger still
+  // requires the child's accepted delivery before completing its contract.
+  const decision = await oneResponseEngine("orchestrator", completeDecision()).decide({ context });
+  assert.equal(decision.intent.type, "complete");
+});
+
+test("contracted external reviewer proposes publication with its exact deliverable and Head", async () => {
+  const context = externalRereviewContext();
+  delete context.requirements.coordination;
+  context.requirements.currentTask = { acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "review-result", kind: "review-report", required: true }],
+  } };
+  const publish = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review",
+    summary: "Review completed", reason: "Full current diff read", verdict: "comment", body: "Review findings",
+    deliverableId: "review-result", evidence: [`head:${"a".repeat(40)}`] } });
+  assert.equal((await oneResponseEngine("pr-engineer", publish).decide({ context })).intent.type, "propose_github_review");
+  const unverifiedReview = deliveryDecision(); unverifiedReview.intent.deliverableId = "review-result";
+  for (const result of [completeDecision(), unverifiedReview,
+    { ...publish, intent: { ...publish.intent, deliverableId: "other" } },
+    { ...publish, intent: { ...publish.intent, evidence: [`head:${"b".repeat(40)}`] } },
+  ]) {
+    await assert.rejects(oneResponseEngine("pr-engineer", result).decide({ context }),
+      { code: "ROLE_DECISION_TRIAGE_CONTRACT_VIOLATION" });
+  }
+  context.code.internalReview = { kind: "developer_handoff" };
+  context.code.sourceEvent.payload.headRefOid = "a".repeat(40);
+  const local = completeDecision(); local.intent.evidence = [`head:${"a".repeat(40)}`];
+  assert.equal((await oneResponseEngine("pr-engineer", local).decide({ context })).intent.type, "complete");
+});
+
+test("RoleDecisionEngine asks for one orchestration reason and derives the internal wrapper", async () => {
+  const response = orchestrationDecision();
+  delete response.intent.reason;
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), async generate(request) {
+      requests.push(request);
+      return JSON.stringify(response);
+    } },
+  });
+  const result = await engine.decide();
+  assert.deepEqual(result, orchestrationDecision());
+  assert.equal(requests.length, 1);
+  const schema = requests[0].schema.properties.intent.oneOf.find(variant => variant.properties?.type?.const === "orchestrate");
+  assert.equal(Object.hasOwn(schema.properties, "reason"), false);
+  assert.equal(schema.required.includes("reason"), false);
+  assert.ok(schema.properties.action.oneOf.every(action => action.required.includes("reason")));
+});
+
+test("RoleDecisionEngine accepts the model child work shape without another model call", async () => {
+  const expected = triageDecompositionDecision();
+  const response = structuredClone(expected);
+  const action = response.intent.action;
+  delete response.intent.reason;
+  for (const key of ["capability", "dependsOn", "acceptanceContract"]) {
+    action.work[key] = action[key]; delete action[key];
+  }
+  const requests = [];
+  const engine = new RoleDecisionEngine({
+    definition: definition("orchestrator"), permissions: permissions("orchestrate"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), async generate(request) {
+      requests.push(request); return JSON.stringify(response);
+    } },
+  });
+  assert.deepEqual(await engine.decide(), expected);
+  assert.equal(requests.length, 1);
+  const orchestration = requests[0].schema.properties.intent.oneOf.find(v => v.properties?.type?.const === "orchestrate");
+  const decompose = orchestration.properties.action.oneOf.find(v => v.properties.type.const === "decompose");
+  assert.ok(decompose.properties.work.required.includes("acceptanceContract"));
+  assert.match(requests[0].messages[0].content, /title, description, capability, dependsOn and acceptanceContract together in intent\.action\.work/);
+});
+
 test("RoleDecisionEngine explains and repairs the orchestration reason binding", async () => {
   const invalid = orchestrationDecision();
   invalid.intent.reason = "wrapper reason differs";
@@ -642,8 +1023,8 @@ test("RoleDecisionEngine explains and repairs the orchestration reason binding",
 
   assert.equal(result.intent.action.type, "pause");
   assert.equal(requests.length, 2);
-  assert.match(requests[0].messages[0].content, /exactly identical/);
-  assert.match(requests[1].messages.at(-1).content, /exactly equal/);
+  assert.match(requests[0].messages[0].content, /reason once in intent\.action\.reason/);
+  assert.match(requests[1].messages.at(-1).content, /omit intent\.reason/);
 });
 
 test("RoleDecisionEngine retries one invalid structured response without replaying it", async () => {
@@ -974,7 +1355,7 @@ test("task brain is safely projected while non-task activity keeps routine routi
     provider: "remote-task-brain",
     model: "high-capability-model",
     remote: true,
-    remoteData: { requirements: true, code: true, memory: false },
+    remoteData: { requirements: true, code: true, memory: false, dingtalk: false },
   });
 
   const decision = await employee.decide({ item: { itemId: "work-1" } });
@@ -1283,6 +1664,208 @@ test("a configured role exposes a bounded work-cycle outcome summary", async () 
   assert.equal(JSON.stringify(view).includes("private-item"), false);
 });
 
+test('a real stale developer outcome keeps its host task reference through coordination and restart', async () => {
+  const store = new MemoryStore(), at = "2026-11-09T14:00:00.000Z";
+  const clock = () => at;
+  const event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "issue.observed", occurredAt: at,
+    source: { provider: "github", scopeId: "summary-fixture" },
+    subject: { id: "github:issue:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { state: "open", updatedAt: at, title: "Synthetic development task" } });
+  const record = { sequence: 1, event, assignment: { assignmentId: "summary-fixture-assignment", eventId: event.eventId,
+    target: { type: "role", id: "developer" } } };
+  const ledger = new WorkLedgerService({ store, clock, idFactory: () => "summary-fixture-lease",
+    exclusiveLease: { run: operation => operation() },
+    assignmentSource: { async readAssignmentBatch({ afterSequence }) {
+      return { items: afterSequence === 0 ? [record] : [], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 };
+    } } });
+  await ledger.recover(); await ledger.intake();
+  const task = (await ledger.listItems()).items[0];
+  assert.match(task.itemId, /^work-item-[a-f0-9]{64}$/);
+  const modelReportedId = `work-item-${"b".repeat(64)}`;
+  const engine = fakeDecisionEngine("developer");
+  engine.decide = async () => {
+    // A host transition wins while the synthetic decision is being selected.
+    // The real loop must refuse that decision rather than stage its intent.
+    const current = await ledger.readItemForReconciliation({ itemId: task.itemId });
+    await ledger.transition({ itemId: current.itemId, expectedRevision: current.revision, leaseId: current.leaseId,
+      actorId: "employee-developer", toStatus: "blocked", reason: "synthetic_input_changed", details: { code: "SYNTHETIC_INPUT_CHANGED" } });
+    const decision = completeDecision({ summary: `private model report ${modelReportedId}` });
+    decision.intent.evidence = [modelReportedId];
+    return decision;
+  };
+  let coordination, observed;
+  const options = { definition: definition("developer"), permissions: permissions("complete"), brain: brain(),
+    decisionEngine: engine, store, clock, onRun: async ({ roleId, trigger, signal }) => {
+      observed = await coordination.runCycle({ roleId, trigger, includeWork: true, signal });
+      return observed;
+    } };
+  const employee = new ConfiguredRoleEmployee(options);
+  const loop = new ProactiveWorkLoop({ ledger, clock,
+    roleDirectory: new RoleWorkerDirectory({ workers: [employee.asRoleWorker()], legacyOwnedRoleIds: [] }),
+    roleContextAssembler: new RoleContextAssembler({ graphReader: { getSnapshot: () => ledger.getGraphSnapshot() } }),
+    orchestratorService: { async execute() { assert.fail("The stale decision cannot deliver work"); } } });
+  const idle = { async runCycle() { return {}; } };
+  coordination = new WorkCoordinationService({ ledger, workLoop: loop, workLimit: 1,
+    proposalResultReconciler: idle, attentionResultReconciler: idle, conditionWaker: idle,
+    dispatcher: { async dispatchPending() { return {}; } } });
+  await employee.run({ trigger: "scheduled" });
+  assert.deepEqual(observed.stages.work.result.outcomes.map(({ itemId, status, code }) => ({ itemId, status, code })),
+    [{ itemId: task.itemId, status: "blocked", code: "ROLE_DECISION_INPUT_STALE" }]);
+  assert.equal((await ledger.listOutbox()).items.length, 0, "the rejected model decision creates no intent");
+  const view = await employee.roleView();
+  assert.ok(view.lastRun.summary.includes(task.itemId), "the canonical host task ID must survive the aggregate projection");
+  assert.equal(view.lastRun.summary.includes(modelReportedId), false, "model text never supplies the host reference");
+  assert.equal(view.lastRun.summary.includes("private"), false);
+  assert.ok(Buffer.byteLength(view.lastRun.summary) <= 512);
+  assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, view.lastRun.summary);
+});
+
+test('a graph-rejected claim retains only a bounded canonical task reference across restart', async t => {
+  for (const variant of ['canonical', 'raw-id', 'wrong-code', 'wrong-status', 'failed-stage']) await t.test(variant, async () => {
+    const itemId = `work-item-${'a'.repeat(64)}`;
+    const entry = { itemId, status: 'claim_not_acquired', code: 'WORK_LEDGER_GRAPH_BLOCKED', message: 'private-message' };
+    if (variant === 'raw-id') entry.itemId = 'private-item-with-business-text';
+    if (variant === 'wrong-code') entry.code = 'WORK_LEDGER_REVISION_CONFLICT';
+    if (variant === 'wrong-status') entry.status = 'staged';
+    const options = { definition: definition('orchestrator'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('orchestrator'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+        scanned: 100, workAttempts: 0, outcomes: [entry, { ...entry, itemId: variant === 'raw-id' ? 'private-other-item' : `work-item-${'b'.repeat(64)}` }] } } } }) };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const summary = (await employee.roleView()).lastRun.summary;
+    assert.equal(summary.includes(itemId), variant === 'canonical');
+    assert.equal(summary.includes(`work-item-${'b'.repeat(64)}`), false, 'only one stable reference is retained');
+    assert.equal(summary.includes('private-'), false);
+    assert.ok(Buffer.byteLength(summary) <= 512);
+    assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+  });
+});
+
+test('stale-input summaries retain only a canonical host reference for the exact failed outcome', async t => {
+  for (const variant of ['canonical', 'raw-id', 'uppercase-id', 'short-id', 'wrong-code', 'wrong-status', 'malicious-code', 'malicious-status', 'malicious-id', 'trailing-newline', 'trailing-unicode-separator', 'model-only', 'failed-stage', 'accessor']) {
+    await t.test(variant, async () => {
+      const itemId = `work-item-${'a'.repeat(64)}`, otherId = `work-item-${'b'.repeat(64)}`;
+      const entry = { itemId, status: 'blocked', code: 'ROLE_DECISION_INPUT_STALE', message: 'private-message' };
+      if (variant === 'raw-id') entry.itemId = 'private-business-task';
+      if (variant === 'uppercase-id') entry.itemId = `work-item-${'A'.repeat(64)}`;
+      if (variant === 'short-id') entry.itemId = 'work-item-abcd';
+      if (variant === 'wrong-code') entry.code = 'ROLE_DECISION_FAILED';
+      if (variant === 'wrong-status') entry.status = 'retry_scheduled';
+      if (variant === 'malicious-code') entry.code = 'ROLE_DECISION_INPUT_STALE\nprivate-code';
+      if (variant === 'malicious-status') entry.status = 'blocked\nprivate-status';
+      if (variant === 'malicious-id') entry.itemId = `${itemId}\nprivate-id`;
+      if (variant === 'trailing-newline') entry.itemId = `${itemId}\n`;
+      if (variant === 'trailing-unicode-separator') entry.itemId = `${itemId}\u2028`;
+      if (variant === 'model-only') { delete entry.itemId; entry.summary = itemId; entry.modelReportedItemId = itemId; }
+      if (variant === 'accessor') Object.defineProperty(entry, 'itemId', { enumerable: true, get() { assert.fail('No untrusted getters'); } });
+      const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+        decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+        onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+          scanned: 1, workAttempts: 1, outcomes: [entry, { itemId: otherId, status: 'staged', code: 'ROLE_DECISION_INPUT_STALE', summary: 'private-message' }],
+        } } } }) };
+      const employee = new ConfiguredRoleEmployee(options);
+      await employee.run({ trigger: 'scheduled' });
+      const summary = (await employee.roleView()).lastRun.summary;
+      assert.equal(summary.includes(itemId), variant === 'canonical');
+      assert.equal(summary.includes(otherId), false);
+      assert.equal(summary.includes('private-'), false);
+      assert.ok(Buffer.byteLength(summary) <= 512);
+      assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+    });
+  }
+});
+
+test('the first safe host reference is shared by graph and stale-input outcomes within the summary budget', async t => {
+  for (const [first, includeRecovery] of [['graph', false], ['stale', false], ['graph', true], ['stale', true]]) await t.test(`${first} recovery=${includeRecovery}`, async () => {
+    const firstId = `work-item-${'c'.repeat(64)}`, secondId = `work-item-${'d'.repeat(64)}`;
+    const graph = { status: 'claim_not_acquired', code: 'WORK_LEDGER_GRAPH_BLOCKED' };
+    const stale = { status: 'blocked', code: 'ROLE_DECISION_INPUT_STALE' };
+    const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: true, result: { scanned: Number.MAX_SAFE_INTEGER, workAttempts: Number.MAX_SAFE_INTEGER,
+        outcomes: [{ itemId: 'private-invalid', ...stale }, { itemId: firstId, ...(first === 'graph' ? graph : stale) },
+          { itemId: secondId, ...(first === 'graph' ? stale : graph) },
+          ...Array.from({ length: 20 }, (_, index) => ({ status: 'blocked', code: `OTHER_HOST_FAILURE_${index}` }))],
+      } }, ...(includeRecovery ? { own_pr_material_recovery: { ok: true, result: { verificationRecovery: {
+        scanned: Number.MAX_SAFE_INTEGER, requeued: Number.MAX_SAFE_INTEGER, failed: Number.MAX_SAFE_INTEGER,
+        lastFailure: 'R'.repeat(128),
+      } } } } : {}) } }) };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const summary = (await employee.roleView()).lastRun.summary;
+    assert.equal(summary.includes(firstId), true, 'only the first valid reference survives even when details exceed 512 bytes');
+    assert.equal(summary.includes(secondId), false);
+    assert.equal(summary.includes('private-'), false);
+    assert.equal(summary.includes('验证准备恢复'), includeRecovery);
+    assert.ok(Buffer.byteLength(summary) <= 512);
+  });
+});
+
+test('a continuation observer cannot attribute another task or ambiguous work outcomes to its target', async t => {
+  for (const variant of ['other-task', 'duplicate', 'failed-stage', 'missing-code']) await t.test(variant, async () => {
+    const target = { itemId: 'work-target', fingerprint: 'a'.repeat(64) };
+    const entry = { itemId: target.itemId, status: 'decision_deferred', code: 'PR_FACTS_STALE' };
+    if (variant === 'other-task') entry.itemId = 'other-task';
+    if (variant === 'missing-code') delete entry.code;
+    const employee = new ConfiguredRoleEmployee({ definition: definition('orchestrator'), permissions: permissions('complete'),
+      brain: brain(), decisionEngine: fakeDecisionEngine('orchestrator'), store: new MemoryStore(),
+      onRun: async () => ({ stages: { work: { ok: variant !== 'failed-stage', result: {
+        outcomes: variant === 'duplicate' ? [entry, { ...entry }] : [entry] } } } }) });
+    const observed = [];
+    await employee.run({ continuationTarget: target, onContinuationOutcome: value => { observed.push(value); } });
+    assert.deepEqual(observed, [null]);
+    await employee.run({ onContinuationOutcome: () => { assert.fail('routine work has no continuation target'); } });
+  });
+});
+
+test('a role exposes automatic verification recovery failures even when its work scan is empty', async () => {
+  const employee = new ConfiguredRoleEmployee({ definition: definition('developer'), permissions: permissions('complete'),
+    brain: brain(), decisionEngine: fakeDecisionEngine('developer'), store: new MemoryStore(),
+    onRun: async () => ({ stages: {
+      work: { ok: true, result: { scanned: 0, workAttempts: 0, outcomes: [] } },
+      own_pr_material_recovery: { ok: true, result: { verificationRecovery: {
+        scanned: 1, requeued: 0, failed: 1, lastFailure: 'OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED',
+      } } },
+    } }),
+  });
+  await employee.run({ trigger: 'scheduled' });
+  assert.equal((await employee.roleView()).lastRun.summary,
+    '扫描 0 项，尝试 0 项；验证准备恢复：扫描 1 项，入队 0 项，失败 1 项（OWN_PR_REPAIR_OBJECT_PREFLIGHT_FAILED）');
+});
+
+test('verification recovery summaries remain bounded and omit unsafe diagnostic data', async t => {
+  for (const scenario of ['zero', 'requeued', 'unsafe-code', 'malformed-count', 'accessor', 'long-work-summary']) await t.test(scenario, async () => {
+    const store = new MemoryStore(), recovery = { scanned: 1, requeued: 0, failed: 0, privateTarget: 'private-recovery-target' };
+    let getters = 0;
+    if (scenario === 'zero') recovery.scanned = 0;
+    if (scenario === 'requeued') recovery.requeued = 1;
+    if (scenario === 'unsafe-code') recovery.lastFailure = 'token=private-recovery-target\nunsafe';
+    if (scenario === 'malformed-count') recovery.scanned = -1;
+    if (scenario === 'accessor') Object.defineProperty(recovery, 'lastFailure', { enumerable: true, get() { getters++; throw new Error('must not read'); } });
+    if (scenario === 'long-work-summary') recovery.lastFailure = 'X'.repeat(128);
+    const options = { definition: definition('developer'), permissions: permissions('complete'), brain: brain(),
+      decisionEngine: fakeDecisionEngine('developer'), store,
+      onRun: async () => ({ stages: {
+        work: { ok: true, result: { scanned: 1, workAttempts: 1,
+          outcomes: scenario === 'long-work-summary' ? Array.from({ length: 8 }, (_, index) => ({ status: `outcome_${index}`, code: 'Y'.repeat(128) })) : [] } },
+        own_pr_material_recovery: { ok: true, result: { verificationRecovery: recovery } },
+      } }),
+    };
+    const employee = new ConfiguredRoleEmployee(options);
+    await employee.run({ trigger: 'scheduled' });
+    const view = await employee.roleView(), summary = view.lastRun.summary;
+    assert.equal(getters, 0);
+    assert.ok(Buffer.byteLength(summary, 'utf8') <= 512);
+    assert.equal(summary.includes('private-recovery-target'), false);
+    assert.equal(summary.includes('验证准备恢复'), !['malformed-count', 'accessor'].includes(scenario));
+    if (scenario === 'zero') assert.ok(summary.includes('验证准备恢复：扫描 0 项'));
+    if (scenario === 'requeued') assert.ok(summary.includes('入队 1 项'));
+    if (scenario === 'long-work-summary') assert.ok(summary.endsWith(`（${'X'.repeat(128)}）`));
+    assert.equal((await new ConfiguredRoleEmployee(options).roleView()).lastRun.summary, summary);
+  });
+});
+
 test("an employee run forwards its shutdown signal and performs no state write after abort", async () => {
   const store = new MemoryStore();
   const started = deferred();
@@ -1364,7 +1947,7 @@ test("pausing a role invalidates a task-brain decision already in flight", async
   await assert.rejects(deciding, (error) => error.code === "ROLE_PAUSED");
 });
 
-test("onRun self-control fails explicitly instead of deadlocking the role queue", async () => {
+test("onRun can persist a pause without waiting for its own role queue", async () => {
   const store = new MemoryStore();
   let employee;
   employee = new ConfiguredRoleEmployee({
@@ -1379,12 +1962,43 @@ test("onRun self-control fails explicitly instead of deadlocking the role queue"
     },
   });
 
-  await assert.rejects(
-    employee.run({ trigger: "manual" }),
-    (error) => error.code === "ROLE_RUN_IN_PROGRESS",
-  );
+  await employee.run({ trigger: "manual" });
   assert.equal(employee.running, null);
-  assert.equal((await employee.view()).lastErrorCode, "ROLE_RUN_IN_PROGRESS");
+  assert.equal((await employee.roleView()).paused, true);
+  assert.equal((await employee.view()).lastErrorCode, "");
+});
+
+test('coordination failures retain bounded stage and cause codes for automatic recovery diagnosis', async () => {
+  const store = new MemoryStore();
+  const failure = Object.assign(new Error('private provider response'), {
+    code: 'WORK_COORDINATION_STAGE_FAILED', stage: 'work', causeCodes: ['ORCHESTRATOR_CONTEXT_STALE'],
+  });
+  const employee = new ConfiguredRoleEmployee({ definition: definition('orchestrator'),
+    permissions: permissions('complete'), brain: brain(), decisionEngine: fakeDecisionEngine('orchestrator'),
+    store, onRun: async () => { throw failure; } });
+  await assert.rejects(employee.run({ trigger: 'scheduled' }), e => e === failure);
+  const persisted = await store.read('configured-role-orchestrator-state');
+  assert.match(persisted.lastRun.summary, /work.*ORCHESTRATOR_CONTEXT_STALE/);
+  assert.doesNotMatch(JSON.stringify(persisted), /private provider response/);
+});
+
+test('failure diagnostics preserve original errors without invoking accessor properties', async (t) => {
+  let getterCalls = 0;
+  const accessors = Object.assign(new Error('private'), { stage: 'work' });
+  for (const name of ['causeCodes', 'errors']) Object.defineProperty(accessors, name, { get() { getterCalls += 1; throw new Error('accessed'); } });
+  const { proxy, revoke } = Proxy.revocable({}, {}); revoke();
+  for (const [name, failure] of [['accessors', accessors], ['revoked-proxy', proxy]]) {
+    await t.test(name, async () => {
+      const store = new MemoryStore();
+      const employee = new ConfiguredRoleEmployee({ definition: definition('tester'), permissions: permissions('complete'),
+        brain: brain(), decisionEngine: fakeDecisionEngine('tester'), store, onRun: async () => { throw failure; } });
+      let caught;
+      try { await employee.run({ trigger: 'scheduled' }); } catch (error) { caught = error; }
+      assert.equal(caught, failure);
+      assert.equal((await store.read('configured-role-tester-state')).lastErrorCode, 'ROLE_RUN_FAILED');
+    });
+  }
+  assert.equal(getterCalls, 0);
 });
 
 test("persisted failures and public state never contain provider secrets", async () => {
@@ -1411,4 +2025,91 @@ test("persisted failures and public state never contain provider secrets", async
   assert.equal(view.lastErrorCode, "REMOTE_PROVIDER_FAILED");
   assert.equal(JSON.stringify(view).includes(secret), false);
   assert.equal(JSON.stringify(persisted).includes(secret), false);
+});
+
+
+test("PR decisions send the pinned target and complete feedback binding to a CLI reader instead of treating preview truncation as final", async () => {
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
+  let request;
+  const engine = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("complete", "propose_github_review"), brain: brain(), brainRouter: {
+    describe() { return { ...brain(), remote: false, supportsReviewReading: true }; },
+    async generate(value) { request = value; return JSON.stringify(completeDecision()); },
+  } });
+  const context = { requirements: { currentTask: { taskId: "review-task" } }, code: { sourceEvent: { subject: { number: 42 } },
+    pullRequest: { materialDigest: "c".repeat(64), reviewMaterial: { gitTarget, patchTruncated: true, filesTruncated: true } } } };
+  await engine.decide({ item: assignedTask(), context });
+  assert.deepEqual(request.reviewTarget, { gitTarget, pullRequestNumber: 42, feedbackSnapshot: { taskId: "review-task", materialDigest: "c".repeat(64) } });
+  assert.match(request.messages[0].content, /Use the pr_review read-only tools/);
+  normalizeStructuredBrainRequest({ model: request.brain.model, messages: request.messages, schema: request.schema, reviewTarget: request.reviewTarget }, { maxRequestBytes: 2 * 1024 * 1024 });
+  request = null;
+  delete context.code.pullRequest.materialDigest;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+  assert.equal(request, null, "incomplete feedback fails before another model call");
+});
+
+test("Review reuse requires a host candidate and the complete native material reading boundary", async () => {
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main",
+    baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40) };
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64), coverageDigest: "e".repeat(64) };
+  const decision = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Adopt verified Review",
+    reason: "Current materials assessed", verdict: "approve", body: "Local current coverage assessment", evidence: ["head:bbbbbbbb"], publicationReuse } });
+  const engine = fixedDecisionEngine("pr-engineer", decision);
+  const context = { requirements: { currentTask: { taskId: "review-task" } }, code: { sourceEvent: { subject: { number: 42 } },
+    pullRequest: { materialDigest: publicationReuse.materialDigest, reviewMaterial: { gitTarget } } } };
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  context.code.reviewPublicationReuse = { complete: true, candidates: [{ ...publicationReuse, verdict: "approve" }] };
+  assert.equal((await engine.decide({ item: assignedTask(), context })).intent.publicationReuse.candidateId, publicationReuse.candidateId);
+  const noRead = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true }), generate: async () => JSON.stringify(decision) } });
+  await assert.rejects(noRead.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+});
+
+test("host-proven code Review uses a residual decision without native review tools and retains extra obligations", async t => {
+  const publicationReuse = { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64),
+    coverageDigest: "e".repeat(64), readProofId: "review-read-proof-" + "f".repeat(64) };
+  const decision = completeDecision({ intent: { schemaVersion: 1, type: "propose_github_review", summary: "Reuse proven code Review",
+    reason: "Host coverage proof", verdict: "approve", body: "Code Review reused; QA note remains pending", evidence: ["head:bbbbbbbb"],
+    deliverableId: "review", publicationReuse } });
+  let request, responseDecision = decision, brainCalls = 0;
+  const engine = new RoleDecisionEngine({ definition: definition("pr-engineer"), permissions: permissions("propose_github_review"), brain: brain(),
+    brainRouter: { describe: () => ({ singleAttempt: true, supportsReviewReading: true, supportsNativeReviewSkills: true }),
+      async generate(value) { brainCalls++; request = value; return JSON.stringify(responseDecision); } } });
+  const context = { requirements: { currentTask: { taskId: "owner-child", acceptanceContract: {
+    expectedDeliverables: [{ deliverableId: "review", kind: "github-review", required: true }, { deliverableId: "qa-note", kind: "text-report", required: true }] } } },
+    code: { sourceEvent: { subject: { number: 42 } }, pullRequest: { materialDigest: publicationReuse.materialDigest },
+      reviewPublicationReuse: { complete: true, candidates: [{ ...publicationReuse, verdict: "approve", deliverableId: "review" }],
+        verifiedResult: { ...publicationReuse, verdict: "approve", deliverableId: "review" } } } };
+  const fullContext = structuredClone(context);
+  delete fullContext.code.reviewPublicationReuse.verifiedResult;
+  fullContext.code.pullRequest.reviewMaterial = { patch: "diff preview ".repeat(5000), gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "fix", headRefOid: "b".repeat(40) } };
+  responseDecision = structuredClone(decision);
+  delete responseDecision.intent.publicationReuse.readProofId;
+  await engine.decide({ item: assignedTask(), context: fullContext });
+  const fullRequestBytes = Buffer.byteLength(JSON.stringify({ messages: request.messages, schema: request.schema }));
+  assert.ok(request.reviewTarget);
+  responseDecision = decision;
+  const result = await engine.decide({ item: assignedTask(), context });
+  assert.equal(brainCalls, 2);
+  t.diagnostic(JSON.stringify({ fixture: "same-task-same-brain-capture-only", fullRequestBytes,
+    reusedRequestBytes: Buffer.byteLength(JSON.stringify({ messages: request.messages, schema: request.schema })),
+    fullRoleBrainCalls: 1, reusedResidualBrainCalls: 1, fullNativeReviewReadingRequired: true, reusedNativeReviewReadingRequired: false,
+    nativeBillingMeasured: false }));
+  assert.equal(result.intent.type, "propose_github_review");
+  assert.equal(request.reviewTarget, undefined, "no reader, native skill or T3 reviewers should be launched");
+  assert.equal(JSON.stringify(request.messages).includes("diff preview"), false);
+  assert.match(request.messages[0].content, /without another T3 assessment/);
+  const supplied = JSON.parse(request.messages.find(m => m.role === "user").content);
+  assert.equal(supplied.requirements.currentTask.acceptanceContract.expectedDeliverables[1].required, true);
+  context.code.reviewPublicationReuse.verifiedResult.automaticSettlement = { kind: "automatic_review_settlement", taskId: "owner-child" };
+  responseDecision = completeDecision();
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  responseDecision = decision;
+  delete context.code.reviewPublicationReuse.verifiedResult.automaticSettlement;
+  const retainedReuse = decision.intent.publicationReuse;
+  delete decision.intent.publicationReuse;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
+  decision.intent.publicationReuse = retainedReuse;
+  delete context.code.reviewPublicationReuse.verifiedResult;
+  await assert.rejects(engine.decide({ item: assignedTask(), context }), { code: "ROLE_DECISION_REVIEW_REUSE_UNAVAILABLE" });
 });

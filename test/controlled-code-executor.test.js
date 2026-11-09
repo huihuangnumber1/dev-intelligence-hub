@@ -12,9 +12,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DockerSandboxError } from "../src/adapters/docker-test-sandbox.js";
+import { WindowsFixedTestRunner, WindowsTestRunnerError } from "../src/adapters/windows-fixed-test-runner.js";
+import { ConfiguredTestRunner } from "../src/adapters/configured-test-runner.js";
+import { SettledVerificationRecoveryReader } from '../src/adapters/settled-verification-recovery-reader.js';
+import { readonlyVerificationFixture } from './support/readonly-verification-fixture.js';
+import { pullRequestExternalActionBinding } from './support/pull-request-external-action-fixture.js';
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
+import { preparationSignal, throwIfPreparationAborted } from "../src/lib/preparation-cancellation.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
 import {
@@ -22,6 +28,7 @@ import {
   ControlledCodeExecutorError,
 } from "../src/services/controlled-code-executor.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+import { startApplicationBackgroundWork } from "../src/server.js";
 
 const profileImage =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
@@ -32,9 +39,34 @@ const profileDefinitions = {
     timeoutMs: 30_000,
   },
 };
-const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
-  ? "requires workstation timing guarantees"
-  : false;
+const passedTap = [
+  "TAP version 13",
+  "ok 1 - runs a real assertion",
+  "1..1",
+  "# tests 1",
+  "# suites 0",
+  "# pass 1",
+  "# fail 0",
+  "# cancelled 0",
+  "# skipped 0",
+  "# todo 0",
+  "# duration_ms 5",
+].join("\n");
+
+function tapSummary({ tests, pass, fail = 0, cancelled = 0, skipped = 0, todo = 0 }) {
+  return [
+    "TAP version 13",
+    `1..${tests}`,
+    `# tests ${tests}`,
+    "# suites 0",
+    `# pass ${pass}`,
+    `# fail ${fail}`,
+    `# cancelled ${cancelled}`,
+    `# skipped ${skipped}`,
+    `# todo ${todo}`,
+    "# duration_ms 5",
+  ].join("\n");
+}
 
 class FakeSandbox {
   constructor({
@@ -127,7 +159,7 @@ function sandboxResult(overrides = {}) {
   return {
     exitCode: 0,
     signal: null,
-    stdout: "tests passed",
+    stdout: passedTap,
     stderr: "",
     durationMs: 5,
     imageId: `sha256:${"a".repeat(64)}`,
@@ -136,6 +168,139 @@ function sandboxResult(overrides = {}) {
     ...overrides,
   };
 }
+
+function windowsProfileResult(profile, request, overrides = {}) {
+  const { imageId: _image, ...result } = sandboxResult();
+  return { ...result, profileFingerprint: digestValue(profile), workspaceRevision: request.workspaceRevision,
+    assetVersion: profile.asset.version, verificationKind: profile.kind === "windows-test" ? "test" : "build",
+    runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: request.executionId,
+      actionId: request.actionId, pid: 4321, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: profile.nodeSha256 }, ...overrides };
+}
+
+test("Windows test proofs complete, survive restart, and retain native identity without image IDs", async (t) => {
+  const profile = { kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Native", description: "Fixed assertions", version: 2, source: "fixed" } };
+  const profiles = { "node-tests": profile };
+  const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request)] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({ profiles });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-test", profileId: "node-tests" }));
+  assert.equal((await setup.innerStore.read("code-executor-state")).schemaVersion, 3);
+  assert.equal(tested.action.status, "succeeded");
+  assert.equal(tested.result.testSummary.passed, 1);
+  assert.equal(Object.hasOwn(tested.result, "imageId"), false);
+  const completed = await executor.perform(actionRequest(session, { type: "complete", actionId: "complete-native" }));
+  assert.equal(completed.session.status, "completed");
+  const restarted = setup.createExecutor({ profiles }).executor;
+  await restarted.recover();
+  const changeSet = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "complete-native", expectedWorkspaceRevision: session.workspaceRevision });
+  assert.equal(changeSet.passedProfiles[0].runtimeIdentity.pid, 4321);
+  assert.equal(changeSet.passedProfiles[0].assetVersion, 2);
+  const state = await setup.innerStore.read("code-executor-state");
+  state.sessions[session.id].verifiedProfiles["node-tests"].runtimeIdentity.pid += 1;
+  await setup.innerStore.write("code-executor-state", state);
+  await assert.rejects(setup.createExecutor({ profiles }).executor.recover(), { code: "EXECUTOR_STATE_INVALID" });
+});
+
+test("Windows build proof remains distinct from unit test statistics", async (t) => {
+  const profile = { kind: "windows-build", nodeExecutable: "C:/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Build", description: "Fixed compilation", version: 1, source: "fixed" } };
+  const profiles = { "node-tests": profile };
+  const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request, { stdout: "Compilation succeeded" })] });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({ profiles });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-build", profileId: "node-tests" }));
+  assert.equal(tested.action.status, "succeeded");
+  assert.equal(tested.result.verificationKind, "build");
+  assert.equal(Object.hasOwn(tested.result, "testSummary"), false);
+});
+
+for (const transientCleanupFailure of [false, true]) {
+  test(`real Windows asset, broker, journal and executor produce a restartable completed proof (${transientCleanupFailure ? "transient cleanup failure" : "normal cleanup"})`, { skip: process.platform !== "win32" }, async (t) => {
+    const setup = await fixture(t);
+    await mkdir(path.join(setup.sourceRoot, "test"));
+    await writeFile(path.join(setup.sourceRoot, "test", "value.test.mjs"), 'import test from "node:test"; import assert from "node:assert/strict"; test("product value",()=>assert.equal(2+2,4));');
+    const profile = { kind: "windows-test", nodeExecutable: process.execPath,
+      nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"), timeoutMs: 20_000,
+      asset: { schemaVersion: 1, title: "Native integration", description: "Real assertions through the controlled executor", version: 1,
+        source: 'import { spawnSync } from "node:child_process"; const r=spawnSync(process.execPath,["--test","--test-isolation=none","--test-reporter=tap","test/value.test.mjs"],{stdio:"inherit",env:process.env}); process.exitCode=r.status??1;' } };
+    const profiles = { "node-tests": profile };
+    const windowsRunner = new WindowsFixedTestRunner({ allowedWorkspaceRoot: setup.scratchRoot, runRoot: path.join(setup.root, "native-runs"), profiles });
+    const cleanup = windowsRunner.cleanup.bind(windowsRunner);
+    let cleanupCalls = 0, cleanupRequest;
+    if (transientCleanupFailure) windowsRunner.cleanup = async request => {
+      cleanupRequest = request;
+      cleanupCalls += 1;
+      if (cleanupCalls === 1) {
+        const evidence = JSON.parse(await readFile(path.join(windowsRunner.executionDirectory(request.executionId, request.actionId), "result.json"), "utf8"));
+        assert.equal(evidence.exitCode, 0);
+        throw new WindowsTestRunnerError("SANDBOX_CLEANUP_FAILED", "Stopped profile cleanup is temporarily busy", { cleanupPending: true });
+      }
+      return cleanup(request);
+    };
+    const sandbox = new ConfiguredTestRunner({ windowsRunner, profiles });
+    const { executor } = setup.createExecutor({ profiles, nextSandbox: sandbox });
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    try {
+      const checked = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "native-real-test", profileId: "node-tests" }));
+      assert.equal(checked.action.status, "succeeded");
+      assert.equal(checked.result.testSummary.passed, 1);
+      const completed = await executor.perform(actionRequest(checked.session, { type: "complete", actionId: "native-real-complete" }));
+      assert.equal(completed.session.status, "completed");
+      const restarted = setup.createExecutor({ profiles, nextSandbox: sandbox }).executor;
+      await restarted.recover();
+      const exported = await restarted.exportCompletedChangeSet({ sessionId: session.id, completedActionId: "native-real-complete", expectedWorkspaceRevision: session.workspaceRevision });
+      assert.equal(exported.passedProfiles[0].runtimeIdentity.executableSha256, profile.nodeSha256);
+      if (transientCleanupFailure) assert.equal(cleanupCalls, 2);
+    } finally {
+      if (cleanupRequest) await cleanup(cleanupRequest);
+    }
+  });
+}
+
+test("Windows test proof rejects zero tests, mismatched workspace, and forged Docker identity", async (t) => {
+  const profile = { kind: "windows-test", nodeExecutable: "C:/node.exe", nodeSha256: "d".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Native", description: "Fixed assertions", version: 1, source: "fixed" } };
+  for (const [name, overrides, expectedCode] of [
+    ["empty", { stdout: "compiled successfully" }, null],
+    ["revision", { workspaceRevision: "e".repeat(64) }, "SANDBOX_RESULT_INVALID"],
+    ["image", { imageId: `sha256:${"f".repeat(64)}` }, "SANDBOX_RESULT_INVALID"],
+    ["asset", { assetVersion: 99 }, "SANDBOX_RESULT_INVALID"],
+    ["kind", { verificationKind: "build" }, "SANDBOX_RESULT_INVALID"],
+  ]) {
+    const profiles = { "node-tests": profile };
+    const sandbox = new FakeSandbox({ profiles, results: [(request) => windowsProfileResult(profile, request, overrides)] });
+    const setup = await fixture(t, { sandbox });
+    const { executor } = setup.createExecutor({ profiles });
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const tested = await executor.perform(actionRequest(session, { type: "run_profile", actionId: `native-${name}`, profileId: "node-tests" }));
+    assert.equal(tested.action.status, "failed");
+    if (expectedCode) assert.equal(tested.action.error.code, expectedCode);
+    const completion = await executor.perform(actionRequest(tested.session, { type: "complete", actionId: `complete-${name}` }));
+    assert.equal(completion.result.error.code, "CHECKS_NOT_PASSED");
+  }
+});
+
+test("schema v2 Docker completion proofs migrate without changing historical session evidence", async (t) => {
+  const setup = await fixture(t);
+  const { completed } = await createCompletedSessionWithRead(setup);
+  const legacy = await setup.innerStore.read("code-executor-state");
+  legacy.schemaVersion = 2;
+  const originalSession = structuredClone(legacy.sessions[completed.session.id]);
+  await setup.innerStore.write("code-executor-state", legacy);
+  const restarted = setup.createExecutor().executor;
+  await restarted.recover();
+  const upgraded = await setup.innerStore.read("code-executor-state");
+  assert.equal(upgraded.schemaVersion, 3);
+  assert.deepEqual(upgraded.sessions[completed.session.id], originalSession);
+  assert.equal(Object.hasOwn(upgraded.sessions[completed.session.id].verifiedProfiles["node-tests"], "runtimeIdentity"), false);
+});
 
 function deferred() {
   let resolve;
@@ -377,6 +542,55 @@ async function createCompletedSessionWithRead(setup) {
   return { read, failedCompletion, completed };
 }
 
+test('terminal execution history does not exhaust active session capacity and its proof remains readable', async (t) => {
+  const setup = await fixture(t);
+  const { read, completed } = await createCompletedSessionWithRead(setup);
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+  await executor.recover();
+  const next = await executor.start(startRequest({ sessionId: 'session-two' }));
+  assert.equal(next.status, 'active');
+  const old = await executor.getActionResult({ sessionId: completed.session.id, actionId: read.action.id });
+  assert.equal(old.action.id, read.action.id);
+  assert.deepEqual(old.result, read.result);
+  await assert.rejects(executor.start(startRequest({ sessionId: 'session-three' })), { code: 'SESSION_LIMIT' });
+  assert.equal((await executor.start(startRequest({ sessionId: 'session-two' }))).id, next.id);
+});
+
+test('failed and cancelled sessions release capacity while interrupted sessions retain it', async (t) => {
+  for (const status of ['failed', 'cancelled']) {
+    const setup = await fixture(t);
+    if (status === 'failed') {
+      const broker = overrideBroker(setup.createBroker(), { async createExecution() { throw new Error('creation failed'); } });
+      const { executor } = setup.createExecutor({ broker });
+      await executor.recover();
+      await assert.rejects(executor.start(startRequest()), { code: 'START_FAILED' });
+    } else {
+      const { executor } = setup.createExecutor();
+      await executor.recover();
+      const session = await executor.start(startRequest());
+      await executor.reconcileCancellation(cancellationRequest(session));
+    }
+    const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+    await executor.recover();
+    assert.equal((await executor.start(startRequest({ sessionId: 'next' }))).status, 'active');
+    const retained = await setup.innerStore.read('code-executor-state');
+    assert.equal(retained.sessions['session-one'].status, status);
+    const restarted = setup.createExecutor({ limits: { maxSessions: 1 } }).executor;
+    await restarted.recover();
+    assert.equal((await restarted.view({ sessionId: 'next' })).status, 'interrupted');
+    await assert.rejects(restarted.start(startRequest({ sessionId: 'third' })), { code: 'SESSION_LIMIT' });
+  }
+});
+
+test('concurrent new sessions cannot exceed active capacity', async (t) => {
+  const setup = await fixture(t);
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
+  await executor.recover();
+  const results = await Promise.allSettled(['a', 'b'].map(sessionId => executor.start(startRequest({ sessionId }))));
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(results.find(r => r.status === 'rejected').reason.code, 'SESSION_LIMIT');
+});
+
 async function createCompletedSessionWithChanges(setup) {
   const first = setup.createExecutor();
   await first.executor.recover();
@@ -458,6 +672,143 @@ test("startup recovery gates creation and create is idempotent", async (t) => {
   );
 });
 
+test("cancelled workspace preparation drains and remains resumable without losing confirmed writes", async t => {
+  for (const phase of ["start", "resume"]) await t.test(phase, async t => {
+    const setup = await fixture(t);
+    let current = setup.createExecutor();
+    await current.executor.recover();
+    let prior = null;
+    if (phase === "resume") {
+      const initial = await current.executor.start(startRequest());
+      const read = await current.executor.perform(actionRequest(initial, { type: "read_text", actionId: "cancel-read", path: "src/app.js" }));
+      prior = (await current.executor.perform(actionRequest(read.session, { type: "write_text", actionId: "cancel-write", path: "src/app.js",
+        content: "export const saved = true;\n", expectedSha256: read.result.sha256 }))).session;
+      current = setup.createExecutor();
+      await current.executor.recover();
+    }
+    const entered = deferred(), release = deferred(), controller = new AbortController();
+    const create = current.broker.createExecution.bind(current.broker);
+    let received;
+    current.broker.createExecution = async request => {
+      received = preparationSignal();
+      entered.resolve();
+      await new Promise(resolve => {
+        release.promise.then(resolve);
+        if (received?.aborted) resolve();
+        else received?.addEventListener("abort", resolve, { once: true });
+      });
+      throwIfPreparationAborted();
+      return create(request);
+    };
+    const operation = phase === "start" ? current.executor.start(startRequest(), { signal: controller.signal }) :
+      current.executor.resume(sessionRequest("session-one"), { signal: controller.signal });
+    // Observe rejection immediately, including while asserting the plumbing.
+    const settled = operation.then(value => ({ value }), error => ({ error }));
+    await entered.promise;
+    try {
+      assert.strictEqual(received, controller.signal);
+      controller.abort(new Error("managed shutdown"));
+    } finally { release.resolve(); }
+    const outcome = await settled;
+    assert.equal(outcome.error?.code, "CODE_PREPARATION_ABORTED");
+    const interrupted = await current.executor.view({ sessionId: "session-one" });
+    assert.equal(interrupted.status, "interrupted");
+    if (prior) {
+      assert.equal(interrupted.workspaceRevision, prior.workspaceRevision);
+      assert.equal(interrupted.actions.find(action => action.id === "cancel-write").status, "succeeded");
+    }
+    assert.equal(current.broker.executions.size, 0, "the aborted owned attempt is disposed before returning");
+    current.broker.createExecution = create;
+    const resumed = await current.executor.resume(sessionRequest("session-one"));
+    assert.equal(resumed.status, "active");
+    const read = await current.executor.perform(actionRequest(resumed, { type: "read_text", actionId: "after-cancel", path: "src/app.js" }));
+    assert.equal(read.result.content, prior ? "export const saved = true;\n" : "export const value = 1;\n");
+  });
+});
+
+test("preparation abort never disguises persistence, cleanup or integrity failure as a safe interruption", async t => {
+  for (const failure of ["persist", "cleanup", "integrity"]) await t.test(failure, async t => {
+    const setup = await fixture(t, { failingStore: true });
+    const current = setup.createExecutor(), controller = new AbortController();
+    await current.executor.recover();
+    const create = current.broker.createExecution.bind(current.broker);
+    current.broker.createExecution = async request => {
+      const result = await create(request);
+      controller.abort();
+      if (failure === "persist") setup.store.failNextWrite = true;
+      if (failure === "cleanup") current.broker.discardExecution = async () => { throw new Error("scratch still locked"); };
+      if (failure === "integrity") throw Object.assign(new Error("manifest was tampered"), { code: "GIT_SNAPSHOT_OBJECT_MISMATCH" });
+      throwIfPreparationAborted();
+      return result;
+    };
+    const outcome = await current.executor.start(startRequest(), { signal: controller.signal }).then(() => null, error => error);
+    assert.ok(outcome);
+    assert.notEqual(outcome.code, "CODE_PREPARATION_ABORTED");
+    assert.notEqual((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+    if (failure !== "integrity") await assert.rejects(current.executor.resume(sessionRequest("session-one")), { code: "EXECUTION_FENCED" });
+  });
+});
+
+test("resume cancellation stops the final workspace hash traversal instead of reading the remaining tree", async t => {
+  const setup = await fixture(t);
+  await writeFile(path.join(setup.sourceRoot, "src", "z-unneeded.js"), "must not be scanned after cancellation\n");
+  const initial = setup.createExecutor(); await initial.executor.recover();
+  await initial.executor.start(startRequest());
+  const current = setup.createExecutor(); await current.executor.recover();
+  const controller = new AbortController(), policy = current.broker.workspaces.get("dashboard").policy;
+  const excluded = policy.isExcluded.bind(policy), revision = current.broker.getWorkspaceRevision.bind(current.broker);
+  let hashing = false, unnecessary = 0;
+  current.broker.getWorkspaceRevision = async request => { hashing = true; return revision(request); };
+  policy.isExcluded = relative => {
+    if (hashing && preparationSignal() === controller.signal) {
+      if (relative === "src/app.js") controller.abort();
+      if (controller.signal.aborted && relative === "src/z-unneeded.js") unnecessary++;
+    }
+    return excluded(relative);
+  };
+  await assert.rejects(current.executor.resume(sessionRequest("session-one"), { signal: controller.signal }), { code: "CODE_PREPARATION_ABORTED" });
+  assert.equal(unnecessary, 0, "stop at a file boundary instead of hashing the remaining repository");
+  assert.equal((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+  assert.equal(current.broker.executions.size, 0);
+  const retried = await current.executor.resume(sessionRequest("session-one"));
+  assert.equal(retried.status, "active");
+});
+
+test("background shutdown drains owned preparation and its scratch cleanup before completing", { timeout: 5_000 }, async t => {
+  const setup = await fixture(t), current = setup.createExecutor();
+  await current.executor.recover();
+  const create = current.broker.createExecution.bind(current.broker), entered = deferred(), release = deferred();
+  current.broker.createExecution = async request => {
+    const result = await create(request), signal = preparationSignal();
+    entered.resolve();
+    await new Promise(resolve => { release.promise.then(resolve); signal?.addEventListener("abort", resolve, { once: true }); });
+    throwIfPreparationAborted(); return result;
+  };
+  let launched = false;
+  const background = startApplicationBackgroundWork({
+    config: { refreshMinutes: 7, githubActions: { enabled: true, automaticOwnPrRepair: true } },
+    refreshService: { refresh: async () => {} }, employeeRegistry: { schedules: () => [], runSelected: async () => {} },
+    codeJobExecution: { async runCycle({ signal }, runOperation) {
+      if (!launched) {
+        launched = true;
+        runOperation(async () => {
+          try { return await current.executor.start(startRequest(), { signal }); }
+          catch (error) { signal.throwIfAborted(); throw error; }
+        }).catch(() => {});
+      }
+      return { scheduled: 1 };
+    } },
+  }, { setIntervalFn: () => ({ unref() {} }), clearIntervalFn() {}, reportError() {} });
+  try {
+    await background.initialRefresh; await entered.promise;
+    assert.equal(current.broker.executions.size, 1);
+    await background.stop();
+    assert.equal(current.broker.executions.size, 0);
+    assert.equal((await current.executor.view({ sessionId: "session-one" })).status, "interrupted");
+    assert.equal(background.drainStatus().activeTaskCount, 0);
+  } finally { release.resolve(); await background.stop(); }
+});
+
 test("start persists the exact PR input binding and requires the broker to echo it", async (t) => {
   const setup = await fixture(t);
   const baseBroker = setup.createBroker();
@@ -487,7 +838,7 @@ test("start persists the exact PR input binding and requires the broker to echo 
     },
   ]);
   const stored = await setup.innerStore.read("code-executor-state");
-  assert.equal(stored.schemaVersion, 2);
+  assert.equal(stored.schemaVersion, 3);
   assert.deepEqual(stored.sessions[created.id].inputBinding, inputBinding);
   assert.equal(
     stored.sessions[created.id].requestDigest,
@@ -720,7 +1071,7 @@ test("schema v1 sessions migrate to null binding and cannot be claimed by a PR",
   assert.equal(migrated.status, "interrupted");
   assert.equal(migrated.inputBinding, null);
   const migratedState = await setup.innerStore.read("code-executor-state");
-  assert.equal(migratedState.schemaVersion, 2);
+  assert.equal(migratedState.schemaVersion, 3);
   assert.equal(migratedState.sessions[active.id].inputBinding, null);
   assert.equal(
     migratedState.sessions[active.id].requestDigest,
@@ -765,7 +1116,7 @@ test("schema v1 migration is durably persisted even without recovery mutations",
   await recovered.executor.recover();
 
   const stored = await setup.innerStore.read("code-executor-state");
-  assert.equal(stored.schemaVersion, 2);
+  assert.equal(stored.schemaVersion, 3);
   assert.equal(stored.revision, 8);
   assert.deepEqual(stored.sessions, {});
 });
@@ -794,12 +1145,86 @@ test("schema v1 migration rejects a legacy identity whose digest no longer match
   );
 });
 
+test('settled verification reader validates real executor projections and immutable action artifacts after restart', async t => {
+  const sandbox = new FakeSandbox({ results: [new WindowsTestRunnerError('SANDBOX_START_FAILED', 'Windows test preparation was interrupted')] });
+  const setup = await fixture(t, { sandbox });
+  const { job } = readonlyVerificationFixture({ binding: pullRequestExternalActionBinding(), workspaceId: 'dashboard',
+    requiredProfile: { id: 'node-tests', configDigest: sandbox.getProfileFingerprint('node-tests') } });
+  const createBoundBroker = () => new CodeWorkspaceBroker({ scratchRoot: setup.scratchRoot,
+    workspaces: [{ id: 'dashboard', sourceRoot: setup.sourceRoot, writablePaths: ['src'], gitBoundaryDigest: 'f'.repeat(64),
+      gitExecutableIdentity: { gitCommand: path.join(setup.root, 'git.exe'), gitExecutableSha256: 'e'.repeat(64),
+        gitExecutableBytes: 1, gitExecutableMode: 0o755, gitExecutableUid: 0, gitExecutableGid: 0 } }],
+    gitSnapshotter: { async materialize({ targetRoot, headOid }) {
+      const content = await readFile(path.join(setup.sourceRoot, 'src/app.js'));
+      await mkdir(path.join(targetRoot, 'src'), { recursive: true });
+      await writeFile(path.join(targetRoot, 'src/app.js'), content);
+      return { headOid, fileCount: 1, totalBytes: content.length, modes: new Map([['src/app.js', '100644']]),
+        baseline: new Map([['src/app.js', createHash('sha256').update(content).digest('hex')]]) };
+    } } });
+  const { executor } = setup.createExecutor({ broker: createBoundBroker() });
+  await executor.recover();
+  let session = await executor.start(startRequest({ sessionId: job.jobId, requestedBy: job.requestedBy, inputBinding: job.inputBinding }));
+  session = (await executor.perform(actionRequest(session, { type: 'read_text', actionId: 'read-before-profile', path: 'src/app.js' }))).session;
+  const failed = await executor.perform(actionRequest(session, { type: 'run_profile', actionId: 'interrupted-profile', profileId: 'node-tests' }));
+  assert.equal(failed.action.status, 'failed');
+  assert.equal(failed.result.error.code, 'SANDBOX_START_FAILED');
+  const restarted = setup.createExecutor({ broker: createBoundBroker() }).executor;
+  await restarted.recover();
+  const reader = new SettledVerificationRecoveryReader({ executor: restarted,
+    artifacts: { read: ref => setup.journal.readBytes(ref) },
+    sandbox: { async readSettledPreparationFailure(request) { return { ...request,
+      profileConfigDigest: sandbox.getProfileFingerprint(request.profileId), reason: 'preparation_interrupted_cleanup_confirmed' }; } } });
+  const proof = await reader.read({ jobId: job.jobId, job });
+  assert.equal(proof?.jobId, job.jobId);
+  assert.equal(proof.workspaceRevision, failed.session.workspaceRevision);
+  assert.equal(proof.actionId, failed.action.id);
+  assert.equal(sandbox.calls.length, 1, 'reading recovery evidence never re-executes the failed profile');
+  await writeFile(path.join(setup.root, 'execution-artifacts', job.jobId, failed.action.id, 'input.json'), '{}');
+  assert.equal(await reader.read({ jobId: job.jobId, job }), null, 'audit tampering invalidates recovery');
+});
+
+test("only a trusted Windows prelaunch abort preserves unexecuted proof in the executor receipt", async t => {
+  for (const trusted of [true, false]) await t.test(String(trusted), async t => {
+    const details = { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false };
+    const error = trusted
+      ? new WindowsTestRunnerError("SANDBOX_ABORTED", "Windows fixed test was cancelled before launch", details)
+      : new DockerSandboxError("SANDBOX_ABORTED", "Other runner was interrupted", details);
+    const setup = await fixture(t, { sandbox: new FakeSandbox({ results: [error] }) });
+    const { executor } = setup.createExecutor();
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const response = await executor.perform(actionRequest(session, { type: "run_profile", actionId: "unstarted-test", profileId: "node-tests" }));
+    assert.equal(response.action.status, "failed");
+    assert.equal(response.session.status, "active");
+    assert.equal(response.result.exitCode ?? null, null);
+    assert.equal(response.result.error.details?.notExecuted, trusted ? true : undefined);
+    assert.equal(response.result.error.details?.origin, trusted ? "windows_fixed_prelaunch" : undefined);
+    const restarted = setup.createExecutor().executor;
+    await restarted.recover();
+    assert.deepEqual((await restarted.getActionResult({ sessionId: session.id, actionId: response.action.id })).result, response.result);
+    if (trusted) {
+      const valid = await setup.innerStore.read("code-executor-state");
+      for (const variant of ["wrong-source", "cleanup", "false-proof", "extra-field", "write-action", "changed-workspace"]) {
+        const changed = structuredClone(valid), stored = changed.sessions[session.id].actions.at(-1);
+        if (variant === "wrong-source") stored.error.details.origin = "other";
+        if (variant === "cleanup") stored.error.details.cleanupPending = true;
+        if (variant === "false-proof") stored.error.details.notExecuted = false;
+        if (variant === "extra-field") stored.error.details.extra = true;
+        if (variant === "write-action") stored.type = "write_text";
+        if (variant === "changed-workspace") stored.workspaceRevisionAfter = "f".repeat(64);
+        await setup.innerStore.write("code-executor-state", changed);
+        await assert.rejects(setup.createExecutor().executor.recover(), error => error.code === "EXECUTOR_STATE_INVALID", variant);
+      }
+    }
+  });
+});
+
 test("writes, tests, and completion stay bound to an exact workspace revision", async (t) => {
   const sandbox = new FakeSandbox({
     results: [
       sandboxResult(),
       sandboxResult({ exitCode: 1, stdout: "", stderr: "assertion failed" }),
-      sandboxResult({ stdout: "fixed" }),
+      sandboxResult(),
     ],
   });
   const setup = await fixture(t, { sandbox });
@@ -906,6 +1331,122 @@ test("writes, tests, and completion stay bound to an exact workspace revision", 
     await readFile(path.join(setup.sourceRoot, "src", "app.js"), "utf8"),
     "export const value = 1;\n",
   );
+});
+
+test("node-test proof requires an actual passing test in a complete TAP report", async (t) => {
+  const cases = [
+    { name: "zero tests", stdout: tapSummary({ tests: 0, pass: 0 }), passed: false, executed: 0 },
+    { name: "all skipped", stdout: tapSummary({ tests: 2, pass: 0, skipped: 2 }), passed: false, executed: 0 },
+    { name: "all todo", stdout: tapSummary({ tests: 1, pass: 0, todo: 1 }), passed: false, executed: 0 },
+    { name: "missing summary", stdout: "TAP version 13\nok 1 - incomplete", passed: false },
+    { name: "truncated summary", stdout: "TAP version 13\nok 1 - incomplete\n1..1\n# tests 1\n# pass 1", passed: false },
+    { name: "one pass", stdout: passedTap, passed: true, executed: 1 },
+    { name: "nested passes", stdout: "TAP version 13\n    ok 1 - nested\n    1..1\nok 1 - suite\n1..1\n# tests 2\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0", passed: true, executed: 2 },
+    { name: "one failure", stdout: tapSummary({ tests: 2, pass: 1, fail: 1 }), passed: false, executed: 2 },
+  ];
+  for (const entry of cases) {
+    const sandbox = new FakeSandbox({
+      results: [sandboxResult({ stdout: entry.stdout, stderr: "diagnostic output" })],
+    });
+    const setup = await fixture(t, { sandbox });
+    const { executor } = setup.createExecutor();
+    await executor.recover();
+    const session = await executor.start(startRequest());
+    const checked = await executor.perform(actionRequest(session, {
+      type: "run_profile",
+      actionId: "run-tests",
+      profileId: "node-tests",
+    }));
+    assert.equal(checked.action.status, entry.passed ? "succeeded" : "failed", entry.name);
+    if (entry.passed) {
+      assert.equal(checked.result.testSummary.executed, entry.executed);
+      const state = await setup.innerStore.read("code-executor-state");
+      const auditedAction = state.sessions[session.id].actions.find((action) => action.id === "run-tests");
+      const output = await setup.journal.readJson(auditedAction.outputArtifacts.output);
+      assert.equal(output.testSummary.executed, entry.executed);
+      const completed = await executor.perform(actionRequest(checked.session, {
+        type: "complete",
+        actionId: "complete-tests",
+      }));
+      assert.equal(completed.action.status, "succeeded", entry.name);
+    } else {
+      assert.equal(checked.result.error.code, "TESTS_FAILED", entry.name);
+      if (entry.executed !== undefined) {
+        assert.equal(checked.result.testSummary.executed, entry.executed);
+      }
+      const completion = await executor.perform(actionRequest(checked.session, {
+        type: "complete",
+        actionId: "complete-tests",
+      }));
+      assert.equal(completion.action.status, "failed", entry.name);
+      assert.equal(completion.result.error.code, "CHECKS_NOT_PASSED", entry.name);
+    }
+  }
+});
+
+test("node-script proof still follows its fixed script exit code", async (t) => {
+  const profiles = {
+    "script-check": {
+      kind: "node-script",
+      image: profileImage,
+      timeoutMs: 30_000,
+      asset: {
+        schemaVersion: 1,
+        title: "Script",
+        description: "Fixed script",
+        version: 1,
+        source: "process.exit(0);",
+      },
+    },
+  };
+  const sandbox = new FakeSandbox({
+    profiles,
+    results: [sandboxResult({
+      stdout: "script passed without TAP",
+      profileFingerprint: digestValue(profiles["script-check"]),
+    })],
+  });
+  const setup = await fixture(t, { sandbox });
+  const { executor } = setup.createExecutor({
+    profiles,
+    workspaceProfiles: { dashboard: ["script-check"] },
+  });
+  await executor.recover();
+  const session = await executor.start(startRequest());
+  const checked = await executor.perform(actionRequest(session, {
+    type: "run_profile",
+    actionId: "run-script",
+    profileId: "script-check",
+  }));
+  assert.equal(checked.action.status, "succeeded");
+  assert.equal(Object.hasOwn(checked.result, "testSummary"), false);
+  const completed = await executor.perform(actionRequest(checked.session, {
+    type: "complete",
+    actionId: "complete-script",
+  }));
+  assert.equal(completed.action.status, "succeeded");
+
+  const failedSandbox = new FakeSandbox({
+    profiles,
+    results: [sandboxResult({
+      exitCode: 1,
+      stdout: passedTap,
+      profileFingerprint: digestValue(profiles["script-check"]),
+    })],
+  });
+  const failedSetup = await fixture(t, { sandbox: failedSandbox });
+  const failedExecutor = failedSetup.createExecutor({
+    profiles,
+    workspaceProfiles: { dashboard: ["script-check"] },
+  }).executor;
+  await failedExecutor.recover();
+  const failedSession = await failedExecutor.start(startRequest());
+  const failedCheck = await failedExecutor.perform(actionRequest(failedSession, {
+    type: "run_profile",
+    actionId: "run-script",
+    profileId: "script-check",
+  }));
+  assert.equal(failedCheck.action.status, "failed");
 });
 
 test("completed change export rebuilds exact package material after scratch loss", async (t) => {
@@ -1779,9 +2320,7 @@ test("actions are rejected before creating orphan input artifacts", async (t) =>
   assert.equal(recordingJournal.writeCalls.length, writesAfterAllowedAction);
 });
 
-test("concurrent retries share one in-flight action", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("concurrent retries share one in-flight action", async (t) => {
   const pending = deferred();
   const sandbox = new FakeSandbox({ results: [() => pending.promise] });
   const setup = await fixture(t, { sandbox });
@@ -2561,7 +3100,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
     cleanupResults: [cleanupPendingError("still cleaning"), undefined],
   });
   const setup = await fixture(t, { sandbox });
-  const { executor } = setup.createExecutor();
+  const { executor } = setup.createExecutor({ limits: { maxSessions: 1 } });
   await executor.recover();
   const session = await executor.start(startRequest());
   const profileAction = {
@@ -2591,6 +3130,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
   const pending = await executor.view({ sessionId: session.id });
   assert.equal(pending.status, "cancelling");
   assert.equal(pending.cleanupPending, true);
+  await assert.rejects(executor.start(startRequest({ sessionId: "while-cleaning" })), { code: "SESSION_LIMIT" });
   assert.equal(sandbox.cleanupCalls.length, 1);
   assert.equal(
     await readFile(attemptFile(setup, session.id, 1), "utf8"),
@@ -2602,6 +3142,7 @@ test("cancellation remains retryable until sandbox cleanup is confirmed", async 
   assert.equal(settled.session.cleanupPending, false);
   assert.equal(settled.proof.sandboxCleanupConfirmed, true);
   assert.equal(sandbox.cleanupCalls.length, 2);
+  assert.equal((await executor.start(startRequest({ sessionId: "after-cleanup" }))).status, "active");
   await assert.rejects(
     readFile(attemptFile(setup, session.id, 1)),
     (error) => error?.code === "ENOENT",

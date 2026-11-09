@@ -85,6 +85,7 @@ export class ManagedProcess {
     cwd,
     env = {},
     input,
+    keepStdinOpen = false,
     onLine = () => {},
     onExit = () => {},
     onError = () => {},
@@ -157,8 +158,14 @@ export class ManagedProcess {
         resolveDone({ code, signal });
       }
     });
-    child.stdin?.end(input);
+    if (keepStdinOpen) { if (input !== undefined) child.stdin?.write(input); }
+    else child.stdin?.end(input);
     return { pid: child.pid };
+  }
+
+  write(input) {
+    if (!this.child?.stdin?.writable || this.exited) throw new ManagedProcessError('PROCESS_NOT_WRITABLE','Process input is closed');
+    this.child.stdin.write(input);
   }
 
   async stop({ gracefulMs = 0 } = {}) {

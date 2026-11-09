@@ -62,6 +62,16 @@ test("attention requests use a strict, content-addressable display contract", ()
   );
 });
 
+test("optional recovery projection preserves historical absence and bounds new metadata", () => {
+  assert.equal(Object.hasOwn(normalizeAttentionRequest(request()), "recoveryCode"), false);
+  assert.equal(normalizeAttentionRequest(request({ recoveryCode: null })).recoveryCode, null);
+  assert.equal(normalizeAttentionRequest(request({ recoveryCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" })).recoveryCode,
+    "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  for (const recoveryCode of [undefined, false, "UNKNOWN_FAILURE", "STRUCTURED_PROVIDER_MODEL_CAPACITY", {}, { code: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED" }]) {
+    assert.throws(() => normalizeAttentionRequest(request({ recoveryCode })), { code: "INVALID_ATTENTION_REQUEST" });
+  }
+});
+
 test("attention request normalization rejects accessors without invoking them", () => {
   let invoked = false;
   const context = [];

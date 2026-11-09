@@ -58,6 +58,9 @@
           <button class="nav-item" data-view="system">
             <span>系统状态</span><kbd>S</kbd>
           </button>
+          <button class="nav-item" data-view="workbench">
+            <span>任务工作台</span>
+          </button>
         </nav>
 
         <div class="source-health" id="source-health">
@@ -76,6 +79,7 @@
             <h1 id="page-title" tabindex="-1">今天需要你推动什么</h1>
           </div>
           <div class="topbar-actions">
+            <button class="secondary-button" id="lan-board-open" type="button">局域网查看</button>
             <span id="last-updated" class="last-updated">尚未刷新</span>
             <button class="refresh-button" id="refresh-button">
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -87,6 +91,7 @@
         </header>
 
         <div id="status-banner" class="status-banner" role="status" aria-live="polite" hidden></div>
+        <section id="task-runs" class="task-runs" aria-labelledby="task-runs-title"></section>
         <section id="content" aria-live="polite">
           <div class="skeleton-header"></div>
           <div class="skeleton-row"></div>
@@ -100,11 +105,31 @@
       <div id="dialog-content"></div>
     </dialog>
 
+    <dialog id="task-run-dialog" aria-label="当前运行任务详情">
+      <button type="button" class="dialog-close" data-task-run-close aria-label="关闭任务详情">×</button>
+      <div data-task-run-content></div>
+    </dialog>
+
     <dialog id="confirmation-dialog" aria-label="待确认操作">
       <button class="dialog-close confirmation-close" aria-label="稍后确认">×</button>
       <div id="confirmation-content"></div>
     </dialog>
 
+    <dialog id="lan-board-dialog" aria-labelledby="lan-board-title">
+      <div class="detail">
+        <h2 id="lan-board-title">局域网只读访问</h2>
+        <p>白名单中的设备可以浏览 MyDashboard 的工作页面。钉钉、记忆、管理配置和 CLI 对话仅本机可见。应用后的设置会保存，并在服务重启后恢复。</p>
+        <form id="lan-board-form">
+          <label><input type="checkbox" name="enabled"> 允许局域网查看</label>
+          <p><label>本机监听 IPv4 <input name="host" placeholder="192.168.1.20"></label></p>
+          <p><label>同事设备的 IPv4，每行一个<br><textarea name="allow" rows="4" placeholder="192.168.1.35"></textarea></label></p>
+          <p><output id="lan-board-status" aria-live="polite"></output></p>
+          <button class="secondary-button" type="submit">应用设置</button>
+          <button class="secondary-button" id="lan-board-close" type="button">关闭窗口</button>
+        </form>
+      </div>
+    </dialog>
+    <script type="module" src="/lan-board-settings.js"></script>
     <script type="module" src="/app.js"></script>
   </body>
 </html>

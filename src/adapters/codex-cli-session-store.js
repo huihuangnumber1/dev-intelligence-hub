@@ -5,8 +5,10 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   writeFile,
@@ -21,7 +23,8 @@ import { normalizeSessionKey } from "../lib/session-key.js";
 const PROFILE_ENTRY = /^sessions$/u;
 const MAX_SESSION_ID_BYTES = 128;
 const MAX_PROFILE_FILES = 20_000;
-const MAX_PROFILE_BYTES = 512 * 1024 * 1024;
+export const CODEX_SESSION_PROFILE_MAX_BYTES = 512 * 1024 * 1024;
+const MAX_PROFILE_BYTES = CODEX_SESSION_PROFILE_MAX_BYTES;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/u;
 
 function text(value, name, maximumBytes) {
@@ -184,6 +187,81 @@ async function moveIfPresent(source, destination) {
   }
 }
 
+function sameFile(left, right) {
+  return right.isFile() && !right.isSymbolicLink() && right.nlink === 1 &&
+    left.dev === right.dev && left.ino === right.ino &&
+    left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+async function checkedEntry(file) {
+  const details = await lstat(file);
+  const resolved = await realpath(file);
+  const canonical = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+  if (details.isSymbolicLink() || canonical(resolved) !== canonical(path.resolve(file))) {
+    throw new Error("Codex session verification encountered an unsafe path");
+  }
+  if (details.isFile() && details.nlink !== 1) {
+    throw new Error("Codex session verification encountered a linked file");
+  }
+  return details;
+}
+
+async function sessionFiles(directory, signal, budget, files = []) {
+  throwIfAborted(signal);
+  const details = await checkedEntry(directory);
+  if (++budget.entries > MAX_PROFILE_FILES || budget.depth > 16) {
+    throw new Error("Codex session profile exceeds its verification limit");
+  }
+  if (details.isFile()) {
+    budget.bytes += details.size;
+    if (budget.bytes > MAX_PROFILE_BYTES) throw new Error("Codex session profile exceeds its storage limit");
+    files.push({ path: directory, details });
+  } else if (details.isDirectory()) {
+    budget.depth++;
+    for (const name of await readdir(directory)) {
+      await sessionFiles(path.join(directory, name), signal, budget, files);
+    }
+    budget.depth--;
+  } else {
+    throw new Error("Codex session profile contains an unsupported entry");
+  }
+  return files;
+}
+
+// A newer capture may append turns. Every byte of the retained file must still
+// exist as an unchanged prefix before that older temporary copy can be removed.
+async function archivedPrefix(source, saved, signal) {
+  const before = source.details;
+  const savedBefore = await checkedEntry(saved);
+  if (!savedBefore.isFile() || savedBefore.size < before.size || savedBefore.size > MAX_PROFILE_BYTES) return false;
+  let sourceHandle;
+  let savedHandle;
+  try {
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
+    sourceHandle = await open(source.path, flags);
+    savedHandle = await open(saved, flags);
+    if (!sameFile(before, await sourceHandle.stat()) || !sameFile(savedBefore, await savedHandle.stat())) return false;
+    const sourceBytes = Buffer.alloc(64 * 1024);
+    const savedBytes = Buffer.alloc(sourceBytes.length);
+    for (let position = 0; position < before.size;) {
+      throwIfAborted(signal);
+      const length = Math.min(sourceBytes.length, before.size - position);
+      const left = await sourceHandle.read(sourceBytes, 0, length, position);
+      const right = await savedHandle.read(savedBytes, 0, length, position);
+      if (left.bytesRead !== length || right.bytesRead !== length ||
+          !sourceBytes.subarray(0, length).equals(savedBytes.subarray(0, length))) return false;
+      position += length;
+    }
+    return sameFile(before, await sourceHandle.stat()) &&
+      sameFile(savedBefore, await savedHandle.stat()) &&
+      sameFile(before, await checkedEntry(source.path)) &&
+      sameFile(savedBefore, await checkedEntry(saved));
+  } finally {
+    await sourceHandle?.close();
+    await savedHandle?.close();
+  }
+}
+
 export class CodexCliSessionStore {
   #root;
   #protectedRoots;
@@ -300,8 +378,49 @@ export class CodexCliSessionStore {
         throw error;
       }
       if (backedUp) await rm(backup, { recursive: true, force: true });
+      return Object.freeze({ profileBytes: profile.bytes });
     } finally {
       await rm(stage, { recursive: true, force: true });
+    }
+  }
+
+  async verifyCapture({ sessionKey, sessionId, codexHome, signal = null } = {}) {
+    const key = normalizeSessionKey(sessionKey);
+    const id = text(sessionId, "sessionId", MAX_SESSION_ID_BYTES);
+    const home = absolutePath(codexHome, "codexHome");
+    this.#assertRootLocation();
+    if (pathsOverlap(home, this.#root)) throw new Error("Codex session verification roots overlap");
+    throwIfAborted(signal);
+    try {
+      const entry = path.join(this.#root, digest(key));
+      const metadataFile = path.join(entry, "metadata.json");
+      const details = await checkedEntry(metadataFile);
+      if (!details.isFile() || details.size > 4096) return null;
+      const handle = await open(metadataFile, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      let metadata;
+      try {
+        if (!sameFile(details, await handle.stat())) return null;
+        const bytes = await handle.readFile();
+        if (bytes.length > 4096 || !sameFile(details, await handle.stat())) return null;
+        metadata = JSON.parse(bytes.toString("utf8"));
+      } finally {
+        await handle.close();
+      }
+      if (metadata?.schemaVersion !== 1 || metadata.sessionKey !== key || metadata.sessionId !== id) return null;
+      const sourceRoot = path.join(home, "sessions");
+      const savedRoot = path.join(entry, "profile", "sessions");
+      const budget = { entries: 0, bytes: 0, depth: 0 };
+      const files = await sessionFiles(sourceRoot, signal, budget);
+      if (!files.some((file) => path.basename(file.path).includes(id) && path.extname(file.path) === ".jsonl")) return null;
+      for (const file of files) {
+        const saved = path.join(savedRoot, path.relative(sourceRoot, file.path));
+        if (!await archivedPrefix(file, saved, signal)) return null;
+      }
+      throwIfAborted(signal);
+      return Object.freeze({ profileBytes: budget.bytes });
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
     }
   }
 }

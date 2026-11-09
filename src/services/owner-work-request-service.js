@@ -1,5 +1,10 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { isDeepStrictEqual } from "node:util";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
+import { currentWorkItemExecutionBinding } from "./work-ledger-pr-source.js";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
+import { isExpiredCodeConfirmation } from "./work-ledger-pr-cutover-commands.js";
 
 import {
   createOwnerIssueEvent,
@@ -23,9 +28,40 @@ function throwIfCancelled(signal) {
   if (signal?.aborted) throw signal.reason ?? new DOMException("Owner request cancelled", "AbortError");
 }
 
+function isOrchestratedRepairRequest(request) {
+  return request.schemaVersion === 5 && request.workType === "general" &&
+    request.triage?.suggestedCapability === "development" &&
+    ["fix_ci", "resolve_conflict", "address_review"].includes(request.triage.nextAction);
+}
+
+function isInternalRepairReviewRequest(request) {
+  return request.schemaVersion === 7 && request.workType === "pull_request";
+}
+
+function hasExpiredInternalCodeDecision(item) {
+  return item?.status === "blocked" && item.statusReason === "proposal_stale" &&
+    item.decisionContext?.source === "proposal" && isExpiredCodeConfirmation(item.decisionContext);
+}
+
+function isRefreshableInternalReviewRoot(item) {
+  return item?.kind === "source_root" && (["queued", "retry_wait"].includes(item.status) ||
+    hasExpiredInternalCodeDecision(item)) &&
+    item.currentTarget?.type === "role" && ["pr-engineer", "developer"].includes(item.currentTarget.id) &&
+    item.graph.parentItemId === null && item.graph.deliveries.length === 0 &&
+    item.source?.scope.kind === "internal_review" && item.source.scope.active === true;
+}
+
+function isRefreshableRepairRoot(item) {
+  return item?.kind === "source_root" && (["queued", "retry_wait"].includes(item.status) || isAutomaticChildWait(item)) &&
+    item.currentTarget?.type === "role" && item.currentTarget.id === "orchestrator" &&
+    item.graph.parentItemId === null && item.source?.scope.kind === "owner_requested" &&
+    item.source.scope.active === true;
+}
+
 const INTAKE_BATCH_LIMIT = 100;
 const MAX_INTAKE_PAGES = 50;
 const MAX_ITEM_PAGES = 50;
+const MAX_SOURCE_REFRESH_COMMIT_ATTEMPTS = 2;
 const SAFE_REQUEST_ID =
   /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
@@ -148,13 +184,47 @@ function workflowEventInput(event) {
   };
 }
 
+function normalizeSourceUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw ownerRequestError("OWNER_WORK_REQUEST_QUERY_INVALID", "工作来源地址无效");
+  }
+  const match = url.pathname.match(/^\/([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})\/(pull|issues)\/([1-9][0-9]*)\/?$/u);
+  if (
+    typeof value !== "string" || url.protocol !== "https:" ||
+    url.hostname !== "github.com" || url.port || url.username || url.password ||
+    !match || match.slice(1, 3).some((part) => [".", ".."].includes(part)) ||
+    !Number.isSafeInteger(Number(match[4]))
+  ) {
+    throw ownerRequestError("OWNER_WORK_REQUEST_QUERY_INVALID", "工作来源地址无效");
+  }
+  return {
+    repository: `${match[1]}/${match[2]}`.toLowerCase(),
+    number: Number(match[4]),
+    kind: match[3] === "pull" ? "pullRequest" : "issue",
+    url: `https://github.com/${match[1]}/${match[2]}/${match[3]}/${match[4]}`.toLowerCase(),
+  };
+}
+
+function matchesSource(record, source) {
+  const target = record.request[source.kind];
+  if (target) {
+    return target.repository.toLowerCase() === source.repository && target.number === source.number;
+  }
+  // Older detail forms stored the origin as a dedicated line, before structured targets existed.
+  return record.request.schemaVersion === 1 && record.request.description.split(/\r?\n/u)
+    .some((line) => line.trim().toLowerCase() === `原始地址：${source.url}`);
+}
+
 function listOptions(value = {}) {
   if (
     value === null ||
     typeof value !== "object" ||
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some((key) => !["limit", "cursor"].includes(key))
+    Object.keys(value).some((key) => !["limit", "cursor", "sourceUrl"].includes(key))
   ) {
     throw ownerRequestError(
       "OWNER_WORK_REQUEST_QUERY_INVALID",
@@ -171,10 +241,13 @@ function listOptions(value = {}) {
   return {
     limit,
     cursor: value.cursor === undefined ? null : requestId(value.cursor),
+    source: value.sourceUrl === undefined ? null : normalizeSourceUrl(value.sourceUrl),
   };
 }
 
 export class OwnerWorkRequestService {
+  #requestEpoch = 0;
+
   constructor({
     store,
     workflowRouting,
@@ -182,6 +255,7 @@ export class OwnerWorkRequestService {
     roleReadiness,
     capabilityReadiness,
     pullRequestResolver,
+    incomingReviewReader,
     exclusiveLease,
     actionAdmissionGate,
     operationQueue,
@@ -209,6 +283,8 @@ export class OwnerWorkRequestService {
           ["resolvePullRequestTarget"],
           "pullRequestResolver",
         );
+    this.incomingReviewReader = incomingReviewReader === undefined ? null
+      : requirePort(incomingReviewReader, ["read"], "incomingReviewReader");
     this.exclusiveLease = requirePort(exclusiveLease, ["run"], "exclusiveLease");
     const gate = actionAdmissionGate ?? DIRECT_ADMISSION;
     this.runNewWorkAdmission = requirePort(
@@ -219,18 +295,25 @@ export class OwnerWorkRequestService {
     if (typeof clock !== "function") throw new TypeError("clock must be a function");
     this.clock = clock;
     this.operationQueue = operationQueue || new OperationQueue();
+    this.refreshQueue = new OperationQueue();
     this.state = emptyOwnerWorkRequestState();
+    this.refreshCursor = null;
     this.ready = false;
   }
 
+  #withRequestLease(operation) {
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.#requestEpoch += 1;
+      return operation();
+    }));
+  }
+
   async recover() {
-    const recovered = await this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    const recovered = await this.#withRequestLease(async () => {
         this.state = await this.#readState();
         this.ready = true;
         return this.#recoveryStatus();
-      }),
-    );
+      });
     if (recovered.pending > 0) await this.resumePending();
     return this.#recoveryStatus();
   }
@@ -242,53 +325,205 @@ export class OwnerWorkRequestService {
       .map(({ requestId: id }) => id);
     let resumed = 0;
     for (const id of pendingIds) {
-      await this.operationQueue.enqueue(() =>
-        this.exclusiveLease.run(async () => {
+      await this.#withRequestLease(async () => {
           this.state = await this.#readState();
           const record = this.#requireRecord(id);
           if (record.phase === "intaken") return;
           await this.#advance(record);
           resumed += 1;
-        }),
-      );
+        });
     }
     return { resumed, ...this.#recoveryStatus() };
   }
 
+  // Continue admitted work through ordinary source intake. Repair roots retain
+  // their original authorization, as do host-issued repair reviews. Ordinary
+  // owner Review recovery still checks current assignment.
+  async refreshBlockedPullRequestSources({ limit = 10, signal = null } = {}) {
+    limit = listOptions({ limit }).limit;
+    normalizeAbortSignal(signal);
+    this.#assertReady();
+    if (typeof this.ledger.readItemForReconciliation !== "function" ||
+        typeof this.ledger.listOutbox !== "function" ||
+        typeof this.ledger.verifyPullRequestExecutionBinding !== "function") return { refreshed: 0 };
+    // Serialize sweeps without holding the shared request lease over remote reads.
+    const admitted = await this.runNewWorkAdmission(() => ({ operation: this.refreshQueue.enqueue(async () => {
+        const records = await this.#withRequestLease(async () => {
+          this.state = await this.#readState();
+          const eligible = this.state.records.filter(record => record.phase === "intaken" &&
+            (isOrchestratedRepairRequest(record.request) || isInternalRepairReviewRequest(record.request) ||
+              (this.incomingReviewReader !== null && [2, 3, 4].includes(record.request.schemaVersion) &&
+                record.request.workType === "pull_request")))
+            .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.requestId.localeCompare(right.requestId));
+          const start = eligible.findIndex(record => record.requestId === this.refreshCursor) + 1;
+          const count = Math.min(eligible.length, Math.max(50, limit * 5));
+          return structuredClone(Array.from({ length: count }, (_, offset) => eligible[(start + offset) % eligible.length]));
+        });
+        let refreshed = 0, deferred = 0, remoteAttempts = 0;
+        for (const record of records) {
+          if (remoteAttempts >= limit) break;
+          throwIfCancelled(signal);
+          this.refreshCursor = record.requestId;
+          const item = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
+          const repair = isOrchestratedRepairRequest(record.request);
+          const internalReview = isInternalRepairReviewRequest(record.request);
+          const continuation = repair || internalReview;
+          const eligible = repair ? isRefreshableRepairRoot(item) : internalReview ? isRefreshableInternalReviewRoot(item) :
+            item?.kind === "source_root" && item.status === "blocked" && item.currentTarget?.id === "pr-engineer" &&
+              item.statusReason === "decision_attempts_exhausted" && item.graph.deliveries.length === 0;
+          if (!eligible ||
+              (item.decisionContext !== null && !(internalReview && hasExpiredInternalCodeDecision(item))) ||
+              item.activeIntentId !== null || item.leaseId !== null || item.ownerId !== null ||
+              item.sourceQuarantine !== null || item.source?.pendingRevision !== null ||
+              item.source.current.event.source.provider !== record.event.source.provider ||
+              item.source.current.event.source.scopeId !== record.event.source.scopeId) continue;
+          try {
+            const binding = currentWorkItemExecutionBinding(item);
+            if (binding?.schemaVersion !== 2) continue;
+            await this.ledger.verifyPullRequestExecutionBinding(binding);
+            if (!continuation && (await this.ledger.listOutbox({ itemId: item.itemId, limit: 1 })).items.length !== 0) continue;
+            remoteAttempts++;
+            if (!continuation && !await this.#hasCurrentReviewAssignment(binding, null)) continue;
+            let event = await this.#createPullRequestEvent(record.request, this.#now(), signal, continuation ? binding : null);
+            const previous = item.source.current.event.payload;
+            if (event.payload.headRefOid === previous.headRefOid &&
+                isDeepStrictEqual(event.payload.gitTarget, previous.gitTarget)) continue;
+            if (event.payload.headRefOid !== previous.headRefOid) event = normalizeWorkflowEvent({
+              ...workflowEventInput(event), payload: { ...event.payload,
+                previousHeadRefOid: previous.headRefOid, changedFields: ["headRefOid"] } });
+            if (await this.#applySourceRefresh({ record, item, event, binding, signal })) refreshed++;
+          } catch (error) {
+            throwIfCancelled(signal);
+            // One unavailable PR must not suppress other ordinary source refreshes.
+            if (!["OWNER_PULL_REQUEST_RESOLUTION_FAILED", "OWNER_WORK_REQUEST_INVALID", "OWNER_WORK_REQUEST_ROUTING_NOT_READY",
+              "OWNER_WORK_REQUEST_ROLE_NOT_READY", "WORK_LEDGER_PR_EXECUTION_BINDING_STALE", "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE"].includes(error?.code)) throw error;
+            deferred++;
+          }
+        }
+        return { refreshed, deferred };
+      }) }));
+    return admitted.operation;
+  }
+
+  async #applySourceRefresh({ record, item, event, binding, signal }) {
+    for (let attempt = 0; attempt < MAX_SOURCE_REFRESH_COMMIT_ATTEMPTS; attempt++) {
+      const observation = await this.#withRequestLease(async () => {
+        this.state = await this.#readState();
+        if (!isDeepStrictEqual(this.state.records.find(entry => entry.requestId === record.requestId), record)) return null;
+        await this.#preflight(event);
+        return { ownerRevision: this.state.revision, requestEpoch: this.#requestEpoch };
+      });
+      if (observation === null || (!isOrchestratedRepairRequest(record.request) && !isInternalRepairReviewRequest(record.request) &&
+          !await this.#hasCurrentReviewAssignment(binding, event.payload.headRefOid))) return false;
+      const applied = await this.#withRequestLease(async () => {
+        this.state = await this.#readState();
+        if (!isDeepStrictEqual(this.state.records.find(entry => entry.requestId === record.requestId), record)) return false;
+        // A queued request can take time to resolve. Refresh the remote facts
+        // again if any owner operation intervened, even one that failed without a write.
+        if (this.#requestEpoch !== observation.requestEpoch + 1 || this.state.revision !== observation.ownerRevision) return null;
+        const latest = await this.ledger.readItemForReconciliation({ itemId: item.itemId });
+        if (!isDeepStrictEqual(latest, item)) return false;
+        await this.ledger.verifyPullRequestExecutionBinding(binding);
+        throwIfCancelled(signal);
+        const assignment = oneRoleAssignment(await this.workflowRouting.ingest({ event: workflowEventInput(event) }), "persisted");
+        await this.#intakeAssignment(assignment.assignmentId, signal);
+        return true;
+      });
+      if (applied !== null) return applied;
+    }
+    return false;
+  }
+
+  async #hasCurrentReviewAssignment(binding, expectedHead) {
+    let facts;
+    try {
+      if (this.incomingReviewReader === null) throw new Error("Incoming assignment reader unavailable");
+      facts = await this.incomingReviewReader.read({ repository: binding.repository,
+        number: binding.pullRequestNumber, account: binding.gitTarget.sourceAccountId });
+      if (facts?.incomingReviewFactsAvailable !== true || facts.kind !== "pull_request" ||
+          !["open", "closed", "merged"].includes(facts.state?.toLowerCase()) || typeof facts.isDraft !== "boolean" ||
+          !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(facts.headRefOid || "")) {
+        throw new Error("Incoming assignment facts incomplete");
+      }
+    } catch (cause) {
+      throw ownerRequestError("OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE", "无法核验 PR 的当前分配关系", 503, { cause });
+    }
+    return facts.kind === "pull_request" && facts.state?.toLowerCase() === "open" && facts.isDraft === false &&
+      (expectedHead === null || facts.headRefOid === expectedHead) &&
+      typeof facts.reviewRecipient === "string" &&
+      facts.reviewRecipient.toLowerCase() === binding.gitTarget.sourceAccountId.toLowerCase() &&
+      facts.reviewReceivedVia === "assignee" && typeof facts.reviewRequestEventId === "string" &&
+      facts.reviewRequestEventId.length > 0;
+  }
+
+  async verifyAutomaticReviewContinuation(binding) {
+    this.#assertReady();
+    const state = await this.#readState();
+    const record = state.records.find(record => record.phase === "intaken" && record.workItemId === binding.rootItemId &&
+      [2, 3, 4].includes(record.request.schemaVersion) && record.request.workType === "pull_request");
+    if (!record) return binding;
+    const root = await this.ledger.readItemForReconciliation({ itemId: record.workItemId });
+    const source = root?.source;
+    // New explicit requests have a new immutable record and scope. Only a
+    // later accepted event continuing the original host-owned scope is gated.
+    if (source?.kind !== "pull_request" || source.current.eventId === record.event.eventId) return binding;
+    const original = source.bindings.find(entry => entry.assignmentId === record.assignment.assignmentId &&
+      entry.eventId === record.event.eventId);
+    if (!original || source.scope.kind !== "owner_requested" ||
+        source.identity.scopeId !== record.event.source.scopeId ||
+        !isDeepStrictEqual(source.current.event.source, record.event.source) ||
+        !isDeepStrictEqual(source.current.event.subject, record.event.subject) ||
+        source.current.sourceSequence <= original.sourceSequence ||
+        source.revisions[source.activeRevision - 1]?.disposition !== "accepted") return binding;
+    await this.ledger.verifyPullRequestExecutionBinding(binding);
+    if (!await this.#hasCurrentReviewAssignment(binding, binding.headRefOid)) {
+      throw ownerRequestError("OWNER_REVIEW_ASSIGNMENT_REVOKED", "历史 Review 续接已不再分配给当前账号", 409);
+    }
+    await this.ledger.verifyPullRequestExecutionBinding(binding);
+    return binding;
+  }
+
   async submit(value, { signal = null } = {}) {
+    if (value?.schemaVersion === 7) throw ownerRequestError("OWNER_WORK_REQUEST_INTERNAL_ONLY", "内部复审请求只能由受信服务提交", 403);
+    return this.#submit(value, signal);
+  }
+
+  async submitInternalReview(value, { signal = null } = {}) {
+    if (value?.schemaVersion !== 7) throw ownerRequestError("OWNER_WORK_REQUEST_INVALID", "内部复审请求类型无效");
+    return this.#submit(value, signal);
+  }
+
+  async #submit(value, signal) {
     normalizeAbortSignal(signal);
     throwIfCancelled(signal);
     this.#assertReady();
     const request = normalizeOwnerWorkRequest(value);
     const admitted = await this.runNewWorkAdmission(() => ({
-      operation: this.operationQueue.enqueue(() =>
-        this.exclusiveLease.run(() => this.#submitLocked(request, signal)),
-      ),
+      operation: this.#withRequestLease(() => this.#submitLocked(request, signal)),
     }));
-    return admitted.operation;
+    return (await this.#withProgress([await admitted.operation]))[0];
   }
 
   async get(idValue) {
     this.#assertReady();
     const id = requestId(idValue);
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    return this.#withRequestLease(async () => {
         this.state = await this.#readState();
         const record = this.state.records.find(
           ({ requestId: candidate }) => candidate === id,
         );
-        return record ? publicRecord(record) : null;
-      }),
-    );
+        return record ? (await this.#withProgress([publicRecord(record)]))[0] : null;
+      });
   }
 
   async list(optionsValue = {}) {
     this.#assertReady();
     const options = listOptions(optionsValue);
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
+    return this.#withRequestLease(async () => {
         this.state = await this.#readState();
-        const records = [...this.state.records].reverse();
+        const records = [...this.state.records].reverse().filter(
+          (record) => options.source === null || matchesSource(record, options.source),
+        );
         const cursorIndex = options.cursor === null
           ? -1
           : records.findIndex(({ requestId: id }) => id === options.cursor);
@@ -301,14 +536,24 @@ export class OwnerWorkRequestService {
         const start = cursorIndex + 1;
         const page = records.slice(start, start + options.limit);
         return {
-          items: page.map((record) => publicRecord(record)),
+          items: await this.#withProgress(page.map((record) => publicRecord(record))),
           nextCursor:
             start + page.length < records.length && page.length > 0
               ? page.at(-1).requestId
               : null,
         };
-      }),
-    );
+      });
+  }
+
+  async #withProgress(records) {
+    const itemIds = records.map((record) => record.workItemId).filter(Boolean);
+    const progress = itemIds.length && typeof this.ledger.readItemProgress === "function"
+      ? await this.ledger.readItemProgress(itemIds)
+      : [];
+    const byId = new Map(progress.map((item) => [item.itemId, item]));
+    return records.map((record) => ({
+      ...record, progress: byId.get(record.workItemId) ?? null,
+    }));
   }
 
   async #submitLocked(request, signal = null) {
@@ -359,7 +604,7 @@ export class OwnerWorkRequestService {
         await this.#requireCapabilityReady(request.triage.suggestedCapability);
       }
       const createdAt = this.#now();
-      const event = [2, 3, 4, 5].includes(request.schemaVersion)
+      const event = [2, 3, 4, 5, 7].includes(request.schemaVersion)
         ? await this.#createPullRequestEvent(request, createdAt, signal)
         : request.schemaVersion === 6
         ? createOwnerIssueEvent(request, createdAt)
@@ -373,7 +618,7 @@ export class OwnerWorkRequestService {
     return publicRecord(record, deduplicated);
   }
 
-  async #createPullRequestEvent(request, createdAt, signal) {
+  async #createPullRequestEvent(request, createdAt, signal, continuationBinding = null) {
     throwIfCancelled(signal);
     if (this.pullRequestResolver === null) {
       throw ownerRequestError(
@@ -389,6 +634,20 @@ export class OwnerWorkRequestService {
         { signal },
       );
       throwIfCancelled(signal);
+      if (continuationBinding !== null) {
+        const previous = continuationBinding.gitTarget;
+        const identityFields = ["provider", "sourceAccountId", "baseRepository", "baseRefName", "headRepository", "headRefName"];
+        const internalReview = isInternalRepairReviewRequest(request);
+        if ((!isOrchestratedRepairRequest(request) && !internalReview) ||
+            (internalReview && resolved.gitTarget?.headRefOid !== previous.headRefOid) ||
+            identityFields.some(field => resolved.gitTarget?.[field] !== previous[field])) {
+          throw ownerRequestError("OWNER_WORK_REQUEST_INVALID", "修复续接不能改变原 PR 的账号、仓库或分支");
+        }
+        // Only this new source event follows the current Head. The persisted
+        // request and its original frozen event are never rewritten.
+        if (!internalReview) request = normalizeOwnerWorkRequest({ ...request,
+          triage: { ...request.triage, expectedHeadRefOid: resolved.gitTarget.headRefOid } });
+      }
       return createOwnerPullRequestEvent(request, resolved, createdAt);
     } catch (cause) {
       throwIfCancelled(signal);

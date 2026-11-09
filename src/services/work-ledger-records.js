@@ -1,4 +1,5 @@
 import { normalizeWorkIntent } from "../domain/work-intent.js";
+import { sameBrainRecoveryOrigin } from "./brain-recovery-intent.js";
 import {
   boundedLedgerString,
   canonicalLedgerValue,
@@ -484,6 +485,7 @@ export function createWorkIntentRecord(item, intent, requestedBy, createdAt) {
     inputDigest: item.inputDigest,
     requestedBy,
     intent,
+    brainRecovery: null,
     sourceBinding: currentWorkItemInputBinding(item),
     dispatchBinding: null,
     status: "pending",
@@ -495,5 +497,26 @@ export function createWorkIntentRecord(item, intent, requestedBy, createdAt) {
     outcome: null,
     createdAt,
     updatedAt: createdAt,
+  };
+}
+
+export function pendingWorkIntentRecord(existing, candidate, now) {
+  if (!existing) return candidate;
+  if (!sameBrainRecoveryOrigin(existing, candidate)) {
+    throw workLedgerError("WORK_LEDGER_INTENT_CONFLICT", "相同意图的恢复来源不一致", 409);
+  }
+  if (existing.status !== "failed") {
+    throw workLedgerError("WORK_LEDGER_INTENT_CONFLICT", "相同工作意图已经进入 outbox", 409);
+  }
+  return {
+    ...existing,
+    status: "pending",
+    revision: existing.revision + 1,
+    dispatcherId: null,
+    dispatchLeaseId: null,
+    dispatchLeaseUntil: null,
+    dispatchBinding: null,
+    outcome: null,
+    updatedAt: now,
   };
 }

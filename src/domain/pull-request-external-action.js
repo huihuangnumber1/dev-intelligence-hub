@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { normalizePublishedReviewReuse } from "./review-result-proof.js";
+import { isHeadRepairExecutionSource } from "./code-execution-source.js";
 import { types as utilTypes } from "node:util";
 
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
@@ -320,7 +322,8 @@ function normalizeProposalAction(value, binding) {
     const target = binding.inputBinding.gitTarget;
     if (
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (!isHeadRepairExecutionSource(evidence.executionSource) &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw invalid("受控 commit 证据 parents 与 PR Git target 不一致");
     }
@@ -512,7 +515,7 @@ function normalizeConfirmationAction(kind, value) {
     return { type: expectedType, body: actionBody(value.body, "action.body"), inputBinding };
   }
   if (expectedType === "pull_request_review") {
-    exact(value, ["type", "reviewEvent", "body", "inputBinding"], "action");
+    exact(value, ["type", "reviewEvent", "body", "inputBinding", ...(Object.hasOwn(value, "publishedReviewReuse") ? ["publishedReviewReuse"] : [])], "action");
     normalizeBindingField();
     if (!Object.values(REVIEW_EVENTS).includes(value.reviewEvent)) {
       throw invalid("action.reviewEvent 无效");
@@ -522,6 +525,7 @@ function normalizeConfirmationAction(kind, value) {
       reviewEvent: value.reviewEvent,
       body: actionBody(value.body, "action.body"),
       inputBinding,
+      ...(Object.hasOwn(value, "publishedReviewReuse") ? { publishedReviewReuse: normalizePublishedReviewReuse(value.publishedReviewReuse) } : {}),
     };
   }
   if (expectedType === "pull_request_update_branch") {
@@ -605,7 +609,8 @@ function normalizeConfirmationAction(kind, value) {
         inputBinding,
       ) ||
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (!isHeadRepairExecutionSource(evidence.executionSource) &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw invalid("push 未精确绑定受控 commit 与远程 Head");
     }

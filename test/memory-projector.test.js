@@ -15,10 +15,13 @@ import {
 } from "../src/services/local-memory-journal.js";
 import { createMemoryRuntime } from "../src/memory-runtime.js";
 import { MemoryContextRetriever } from "../src/services/memory-context-retriever.js";
-import { MemoryProjector } from "../src/services/memory-projector.js";
+import { MemoryProjector, planAuthorityBoundProjectionCandidate } from "../src/services/memory-projector.js";
+import { ConfirmationQueue } from "../src/services/confirmation-queue.js";
 import {
+  externalActionControlledCommit,
   pullRequestExternalActionBinding,
   pullRequestExternalActionPlan,
+  pullRequestExternalActionQueuePlan,
 } from "./support/pull-request-external-action-fixture.js";
 
 function workItem(id, status, revision = 1) {
@@ -297,6 +300,91 @@ function completedConfirmationMemoryItem(
     ownerDecision: null,
     invalidation: null,
   };
+}
+
+for (const { reviewRepair, sealedUnknown, invalidParents, invalidCase } of [
+  { reviewRepair: false, sealedUnknown: false },
+  { reviewRepair: true, sealedUnknown: false },
+  { reviewRepair: true, sealedUnknown: true },
+  { reviewRepair: true, invalidCase: "no parent", invalidParents: [] },
+  { reviewRepair: true, invalidCase: "wrong Head", invalidParents: ["e".repeat(40)] },
+  { reviewRepair: false, invalidCase: "wrong Base", invalidParents: ["2".repeat(40), "e".repeat(40)] },
+  { reviewRepair: false, invalidCase: "extra parent", invalidParents: ["2".repeat(40), "1".repeat(40), "e".repeat(40)] },
+]) {
+  test(`${invalidCase ? `rejects ${invalidCase} in` : "projects"} the real confirmation queue's ${reviewRepair ? "single-parent review repair" : "conflict merge"} ${sealedUnknown ? "sealed unknown" : "completed"} push${invalidCase ? "" : " idempotently"}`, async () => {
+    const binding = pullRequestExternalActionBinding();
+    const evidence = externalActionControlledCommit(binding, { reviewRepair });
+    const { journal, store, values } = await localMemoryFixture();
+    const queue = new ConfirmationQueue({
+      store,
+      exclusiveLease: { run: (operation) => operation() },
+      executor: {
+        async execute() {
+          return sealedUnknown ? { status: "unknown", code: "TEST_UNKNOWN" }
+            : { status: "applied", receipt: { id: evidence.commit.oid } };
+        },
+        async reconcile() { return { status: "already", receipt: { id: evidence.commit.oid } }; },
+      },
+      clock: () => new Date("2026-08-08T07:01:00.000Z"),
+    });
+    await queue.recover();
+    const pending = await queue.enqueue(pullRequestExternalActionQueuePlan({
+      type: "push", controlledCommitEvidence: evidence,
+    }, { binding }));
+    const approved = await queue.approve(pending.id, {
+      requestId: "publish-review-repair-projection",
+      expectedQueueRevision: pending.queueRevision,
+      expectedItemRevision: pending.itemRevision,
+      displayedPayloadDigest: pending.displayedPayloadDigest,
+      approvalBindingDigest: pending.approvalBindingDigest,
+    });
+    if (sealedUnknown) {
+      await queue.reject(approved.id, {
+        requestId: "seal-unknown-push-projection",
+        expectedQueueRevision: approved.queueRevision,
+        expectedItemRevision: approved.itemRevision,
+        displayedPayloadDigest: approved.displayedPayloadDigest,
+        approvalBindingDigest: approved.approvalBindingDigest,
+        reason: "Preserve unknown publication and forbid replay",
+      });
+    }
+    const graphSource = graphProjectionSource();
+    const projector = new MemoryProjector({
+      memoryLifecycleProducer: journal,
+      memoryAuthorityReader: journal,
+      memoryAuthoritySource: memoryAuthoritySource([pullRequestWorkItem(binding)], [], graphSource),
+      graphProjectionSource: graphSource,
+      confirmationProjectionSource: {
+        async readMemoryPage(input) {
+          const page = structuredClone(await queue.readMemoryPage(input));
+          if (invalidParents !== undefined) {
+            page.items[0].action.controlledCommit.commit.parents = invalidParents;
+          }
+          return page;
+        },
+      },
+      inputAuthorityVerifier: { async verify(value) { return structuredClone(value); } },
+      store,
+    });
+    if (invalidParents !== undefined) {
+      await assert.rejects(projector.runCycle(), /confirmation memory projection item is invalid/u);
+      assert.equal(values.has("unified-memory-records"), false, "invalid projection must not write memory");
+      return;
+    }
+    await projector.runCycle();
+    assert.equal((await projector.runCycle()).added, 0);
+    const records = values.get("unified-memory-records").records;
+    const confirmation = records.find((record) => record.source.kind === "confirmation");
+    const externalResult = records.find((record) => record.source.kind === "external-result");
+    assert.deepEqual(JSON.parse(confirmation.content).action.controlledCommit.commit.parents, evidence.commit.parents);
+    const result = JSON.parse(externalResult.content);
+    if (sealedUnknown) {
+      assert.equal(result.failure.outcome, "unknown");
+      assert.equal(result.ownerDecision.type, "seal_unknown_and_forbid_replay");
+    } else {
+      assert.equal(result.receipt.id, evidence.commit.oid);
+    }
+  });
 }
 
 function sealedUnknownConfirmationMemoryItem(binding, options = {}) {
@@ -931,6 +1019,83 @@ test("memory projector captures confirmation authority after earlier projection 
     2,
   );
 });
+
+test("projection without an authority verifier still advances an empty authority checkpoint", async () => {
+  const { journal, store } = await localMemoryFixture();
+  const graphSource = graphProjectionSource();
+  const projector = new MemoryProjector({
+    memoryLifecycleProducer: journal,
+    memoryAuthorityReader: journal,
+    memoryAuthoritySource: memoryAuthoritySource([], [], graphSource, 7),
+    graphProjectionSource: graphSource,
+    store,
+  });
+  await projector.runCycle();
+  assert.equal(journal.getAuthorityProjectionState().workLedgerRevision, 7);
+  assert.deepEqual(journal.getAuthorityProjectionState().entries, []);
+});
+
+for (const mode of ["once", "persistent", "unknown", "aborted"]) {
+  test(`authority snapshot contention is bounded without replaying historical projection (${mode})`, async () => {
+    const binding = pullRequestExternalActionBinding();
+    const item = pullRequestWorkItem(binding);
+    const graphSource = graphProjectionSource();
+    const { journal, store, values } = await localMemoryFixture();
+    let revision = 1, historyWrites = 0, workWrites = 0, authorityWrites = 0;
+    const verified = [];
+    const controller = new AbortController();
+    const failure = Object.assign(new Error("snapshot changed"), {
+      code: mode === "unknown" ? "MEMORY_STORAGE_FAILED" : "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE",
+    });
+    const projector = new MemoryProjector({
+      memoryLifecycleProducer: {
+        appendGraphEvents: input => journal.appendGraphEvents(input),
+        adoptGraphCheckpoint: input => journal.adoptGraphCheckpoint(input),
+        appendProjectionRecords: input => { historyWrites++; return journal.appendProjectionRecords(input); },
+        appendWorkItems: input => { workWrites++; return journal.appendWorkItems(input); },
+        appendAuthorityProjection: input => { authorityWrites++; return journal.appendAuthorityProjection(input); },
+      },
+      memoryAuthorityReader: journal,
+      memoryAuthoritySource: { async readSnapshot({ limit }) {
+        return { ledgerRevision: revision, items: [item], timeline: [proposalDecisionTimeline(item, "contention")],
+          graph: await graphSource.readBatch({ limit }) };
+      } },
+      graphProjectionSource: graphSource,
+      inputAuthorityVerifier: { async verify() { assert.fail("batch verification is required"); } },
+      inputAuthorityBatchVerifier: { async verify({ ledgerRevision, bindings }) {
+        verified.push(ledgerRevision);
+        if (mode !== "once" || verified.length === 1) {
+          revision++;
+          if (mode === "aborted") controller.abort(failure);
+          throw failure;
+        }
+        assert.equal(ledgerRevision, revision, "retry must capture a new ledger snapshot");
+        return { ledgerRevision, current: bindings.map(() => false) };
+      } }, store,
+    });
+    const cycle = projector.runCycle({ signal: controller.signal });
+    if (["unknown", "aborted"].includes(mode)) {
+      await assert.rejects(cycle, error => error === failure);
+      assert.equal(verified.length, 1);
+    } else {
+      const result = await cycle;
+      assert.deepEqual(verified, [1, 2]);
+      if (mode === "persistent") {
+        assert.equal(result.authorityBound.status, "deferred");
+        assert.equal(result.authorityBound.code, failure.code);
+        assert.equal(result.authorityBound.attempts, 2);
+      } else {
+        assert.equal(journal.getAuthorityProjectionState().workLedgerRevision, 2);
+        const records = values.get("unified-memory-records").records.filter(record => record.source.kind === "work-decision");
+        assert.ok(records.length > 0);
+        assert.ok(records.every(record => JSON.parse(record.content).authority.current === false));
+      }
+    }
+    assert.equal(historyWrites, 1);
+    assert.equal(workWrites, 1);
+    assert.equal(authorityWrites, mode === "once" ? 1 : 0);
+  });
+}
 
 test("authority verification runs once per distinct binding for a large projection cycle", async () => {
   const bindingFor = (number, marker) => pullRequestExternalActionBinding({
@@ -2102,4 +2267,37 @@ test("a lost graph append response replays idempotently before batch acknowledge
   assert.equal(records.size, 1);
   assert.equal(appendCalls, 2);
   assert.deepEqual(source.acknowledgements.map(({ length }) => length), [1]);
+});
+
+
+test("an unbound consultation leaving the projection window is explicitly retired and survives restart", async () => {
+  const values = new Map();
+  const store = { read: async (key, fallback = null) => structuredClone(values.get(key) ?? fallback),
+    write: async (key, value) => { values.set(key, structuredClone(value)); } };
+  const journal = new LocalMemoryJournal({ store, exclusiveLease: { run: operation => operation() } });
+  await journal.recover();
+  const candidate = { schemaVersion: 1, source: { kind: "consultation-request", id: "window-consultation" },
+    occurredAt: "2026-08-02T01:00:00.000Z", roleId: null, repository: null,
+    eventType: "consultation_request.fixture", title: "Historical consultation", summary: "Read-only history",
+    content: JSON.stringify({ memoryType: "consultation-request", authority: {
+      applies: false, current: true, bindingDigest: null, inputBinding: null,
+    } }), evidence: [], tags: ["consultation-request"], sourceUrl: null, subjectNumber: null };
+  const record = normalizeMemoryRecord(candidate);
+  await journal.appendAuthorityProjection({ records: [candidate], projectionState: {
+    schemaVersion: 4, revision: 1, workLedgerRevision: 0, authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST,
+    confirmationHighWatermark: 0, entries: [{ key: "consultation-request:window", fingerprint: "a".repeat(64),
+      recordId: record.recordId, sourceKind: "consultation-request", binding: null, current: true, occurredAt: candidate.occurredAt }],
+  } });
+  const planned = await planAuthorityBoundProjectionCandidate({ stored: journal.getAuthorityProjectionState(),
+    snapshot: { ledgerRevision: 0, items: [], timeline: [], graph: { cursor: 0, highWatermark: 0,
+      checkpointDigest: null, highWatermarkDigest: null, authorityStateDigest: EMPTY_AUTHORITY_STATE_DIGEST, items: [] } },
+    confirmationSnapshot: { highWatermark: 0, items: [] }, verifyInputAuthority: async () => assert.fail("no PR binding"),
+    requiresJournalAdoption: false, strictBindings: true });
+  assert.equal(planned.lifecycleInvalidations, 1);
+  assert.deepEqual(planned.records[0].evidence, [`supersedes:${record.recordId}`]);
+  assert.deepEqual(planned.projectionState.entries, []);
+  await journal.appendAuthorityProjection({ records: planned.records, projectionState: planned.projectionState });
+  const restarted = new LocalMemoryJournal({ store, exclusiveLease: { run: operation => operation() } });
+  await restarted.recover();
+  assert.equal(restarted.readRecords({ recordIds: [record.recordId] }).items[0].labels.lifecycle, "obsolete");
 });

@@ -1,6 +1,8 @@
 const IMPORTANT_FIELDS = [
   "state",
   "reviewDecision",
+  "reviewFeedbackAvailable",
+  "reviewFeedbackDigest",
   "actionState",
   "nextAction",
   "nextActor",

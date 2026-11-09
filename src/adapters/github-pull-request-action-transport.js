@@ -1,4 +1,6 @@
 import path from "node:path";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
+import { currentPullRequestTargetArgs, githubCurrentPullRequestGitTarget, projectGitHubCurrentPullRequestTarget } from "./github-current-pull-request-target.js";
 import { types as utilTypes } from "node:util";
 
 import { normalizeControlledCommitEvidence } from "../domain/controlled-commit-evidence.js";
@@ -326,7 +328,8 @@ function normalizeAction(value, input) {
         binding,
       ) ||
       evidence.commit.parents[0] !== target.headRefOid ||
-      evidence.commit.parents[1] !== target.baseRefOid
+      (!isHeadRepairExecutionSource(evidence.executionSource) &&
+        evidence.commit.parents[1] !== target.baseRefOid)
     ) {
       throw transportError("GITHUB_PROTOCOL_ERROR", "absent");
     }
@@ -801,16 +804,28 @@ class GitHubPullRequestActionTransport {
   }
 
   async #readPullRequest(input, environment, trust, operation) {
-    const record = await this.#runJson(
-      [
-        "api",
-        "--method",
-        "GET",
-        `repos/${input.repository}/pulls/${input.pullRequestNumber}`,
-      ],
+    const identity = { repository: input.repository, number: input.pullRequestNumber, sourceAccountId: input.actorAccountId };
+    const args = currentPullRequestTargetArgs(identity);
+    const response = await this.#runJson(
+      ["api", "--method", "POST", ...args.slice(3)],
       { environment, trust, operation },
     );
     try {
+      const observed = projectGitHubCurrentPullRequestTarget(response, identity);
+      const pr = response.data.repository.pullRequest;
+      // Receipt reconciliation can inspect an already terminal PR whose head
+      // branch was deleted. The base must still be live; perform rejects this
+      // terminal state before considering any mutation.
+      const observedGit = observed.gitTarget ?? githubCurrentPullRequestGitTarget(pr, {
+        baseRepository: input.repository, sourceAccountId: input.actorAccountId, terminal: true,
+      });
+      const record = {
+        number: observed.number, html_url: observed.url, state: observed.state === "OPEN" ? "open" : "closed",
+        user: { login: observed.authorAccountId }, merged_at: pr.mergedAt,
+        merge_commit_sha: pr.mergeCommit?.oid ?? null, merged_by: pr.mergedBy,
+        base: { ref: observedGit.baseRefName, sha: observedGit.baseRefOid, repo: { full_name: observedGit.baseRepository } },
+        head: { ref: observedGit.headRefName, sha: observedGit.headRefOid, repo: { full_name: observedGit.headRepository } },
+      };
       const number = record?.number;
       const url = record?.html_url;
       const expectedUrl = canonicalPullRequestUrl(
@@ -1322,7 +1337,7 @@ class GitHubPullRequestActionTransport {
     let result;
     try {
       this.#assertOperationCurrent(operation, trust);
-      const timeoutMs = operation.deadline - this.#clock();
+      const timeoutMs = Math.min(this.#timeoutMs, operation.deadline - this.#clock());
       result = await this.#runner.run({
         command: this.#ghCommand,
         args: [

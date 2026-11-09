@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation,
+  watchPreparationProcess, PreparationAbortedError } from "../lib/preparation-cancellation.js";
 import { execFile } from "node:child_process";
 import {
   lstat,
@@ -15,13 +17,15 @@ import {
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
+import { isWindowsGitImplementationPath } from "../lib/windows-git-implementation.js";
+import { MAX_BLOBS_PER_BATCH, parseGitBlobBatch } from "../lib/git-blob-batch.js";
 import { types as utilTypes } from "node:util";
 
 import {
   CodeExecutionPolicy,
   normalizeWorkspacePath,
 } from "../domain/code-execution-policy.js";
-import { normalizeCodeExecutionSource } from "../domain/code-execution-source.js";
+import { normalizeCodeExecutionSource, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
 import {
   createControlledCommitMessage,
@@ -96,8 +100,10 @@ const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
   maxObjectFiles: 10_000,
   maxDirectories: 10_000,
-  maxBlobBytes: 1_000_000,
-  maxTotalBytes: 8_000_000,
+  // Preparation seals the full result tree, including unchanged deployment
+  // assets. OCT currently needs about 34 MB total and 5.2 MB for one blob.
+  maxBlobBytes: 8_000_000,
+  maxTotalBytes: 64_000_000,
   maxResultObjectBytes: 32_000_000,
   maxProtocolBytes: 1_000_000,
   maxManifestBytes: 16_000_000,
@@ -185,6 +191,22 @@ function dataObject(value, { allowed, required = allowed, code, message }) {
     throw controlledGitError(code, message);
   }
   return fields;
+}
+
+function exactRepositoryMirrorEntries(value) {
+  if (!isPlainRecord(value)) throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 配置无效");
+  const entries = dataObject(value, { allowed: Reflect.ownKeys(value),
+    code: "INVALID_CONTROLLED_GIT_CONFIG", message: "Head mirror 配置无效" });
+  const seen = new Set();
+  return [...entries].map(([repository, root]) => {
+    if (!GITHUB_REPOSITORY.test(repository) || seen.has(repository.toLowerCase())) {
+      throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 仓库标识无效");
+    }
+    seen.add(repository.toLowerCase());
+    const mirrorRoot = requireAbsolutePath(root, "INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 路径无效");
+    if (isNetworkPath(mirrorRoot)) throw controlledGitError("INVALID_CONTROLLED_GIT_CONFIG", "Head mirror 必须为本地路径");
+    return [repository, mirrorRoot];
+  });
 }
 
 function bindDataMethod(port, name) {
@@ -507,6 +529,37 @@ function normalizeConflictPath(value, limits) {
   return normalized;
 }
 
+function pathIdentity(relativePath) {
+  return process.platform === "win32" ? relativePath.toLowerCase() : relativePath;
+}
+
+function compareEvidencePaths(left, right) {
+  return pathIdentity(left.path).localeCompare(pathIdentity(right.path), "en");
+}
+
+function assertTreePathIdentities(entries, limits, code) {
+  const identities = new Map();
+  let directories = 0;
+  for (const { path: relativePath } of entries) {
+    const segments = relativePath.split("/");
+    for (let index = 0; index < segments.length; index += 1) {
+      const candidate = segments.slice(0, index + 1).join("/");
+      const kind = index === segments.length - 1 ? "file" : "directory";
+      const identity = pathIdentity(candidate);
+      const existing = identities.get(identity);
+      if (existing && (existing.path !== candidate || existing.kind !== kind || kind === "file")) {
+        throw controlledGitError(code, "Git tree 路径在目标文件系统中冲突");
+      }
+      if (!existing) {
+        identities.set(identity, { path: candidate, kind });
+        if (kind === "directory" && ++directories > limits.maxDirectories) {
+          throw controlledGitError(code, "Git tree 目录数量超过限制");
+        }
+      }
+    }
+  }
+}
+
 function parseMergeTree(bytes, exitCode, oidLength, limits) {
   const text = decodeUtf8(
     bytes,
@@ -566,13 +619,10 @@ function parseMergeTree(bytes, exitCode, oidLength, limits) {
     };
   });
   const conflicts = [];
-  let previousComparablePath = null;
+  let previousPath = null;
   for (let index = 0; index < parsed.length; index += 3) {
     const stages = parsed.slice(index, index + 3);
     const conflictPath = stages[0].path;
-    const comparablePath = process.platform === "win32"
-      ? conflictPath.toLowerCase()
-      : conflictPath;
     if (
       stages.some(
         (stage, stageIndex) =>
@@ -580,17 +630,19 @@ function parseMergeTree(bytes, exitCode, oidLength, limits) {
           stage.stage !== stageIndex + 1 ||
           stage.mode !== "100644",
       ) ||
-      (previousComparablePath !== null &&
-        comparablePath.localeCompare(previousComparablePath, "en") <= 0)
+      (previousPath !== null &&
+        Buffer.compare(Buffer.from(conflictPath), Buffer.from(previousPath)) <= 0)
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
         "仅支持排序后的 ordinary 100644 both-modified conflicts",
       );
     }
-    previousComparablePath = comparablePath;
+    previousPath = conflictPath;
     conflicts.push({ path: conflictPath, mode: "100644", stages });
   }
+  assertTreePathIdentities(conflicts, limits, "CONTROLLED_GIT_UNSUPPORTED_CONFLICT");
+  conflicts.sort(compareEvidencePaths);
   return { status: "conflicted", resultTreeOid, conflicts };
 }
 
@@ -603,7 +655,7 @@ function splitNullProtocol(bytes, code, message) {
   return records;
 }
 
-function parseRawDiff(bytes, oidLength, limits) {
+function parseRawDiff(bytes, oidLength, limits, conflictPaths) {
   const records = splitNullProtocol(
     bytes,
     "CONTROLLED_GIT_PROTOCOL_ERROR",
@@ -623,21 +675,33 @@ function parseRawDiff(bytes, oidLength, limits) {
       );
     }
     const [, oldMode, newMode, oldOid, newOid, status] = match;
+    const zeroOid = "0".repeat(oidLength);
+    const regularOld = oldMode === "100644" && oldOid !== zeroOid;
+    const regularNew = newMode === "100644" && newOid !== zeroOid;
+    const ordinaryModification = status === "M" && regularOld && regularNew;
+    const rename = /^R(?:100|0[0-9]{2})$/u.test(status) && regularOld && regularNew;
+    const addition = status === "A" && oldMode === "000000" && oldOid === zeroOid && regularNew;
+    const deletion = status === "D" && newMode === "000000" && newOid === zeroOid && regularOld;
     if (
-      status !== "M" ||
-      oldMode !== "100644" ||
-      newMode !== "100644" ||
-      !oidPattern(oidLength).test(oldOid) ||
-      !oidPattern(oidLength).test(newOid)
+      !(ordinaryModification || rename || addition || deletion) ||
+      !oidPattern(oidLength).test(oldOid) || !oidPattern(oidLength).test(newOid)
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CHANGE",
-        "首版仅支持 ordinary 100644 content modifications",
+        "Git changes 必须是普通文件的内容修改、新增、删除或重命名",
       );
     }
-    const relativePath = normalizeConflictPath(records[index], limits);
-    index += 1;
-    changes.push({ path: relativePath, oldOid, newOid });
+    for (let pathIndex = 0; pathIndex < (rename ? 2 : 1); pathIndex += 1) {
+      if (index >= records.length) throw controlledGitError(
+        "CONTROLLED_GIT_PROTOCOL_ERROR", "Git rename record 不完整",
+      );
+      const relativePath = normalizeConflictPath(records[index], limits);
+      index += 1;
+      if (conflictPaths.has(relativePath) && !ordinaryModification) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_CHANGE", "冲突路径仅允许普通文件内容修改");
+      }
+      changes.push({ path: relativePath, oldOid, newOid });
+    }
   }
   const paths = changes.map(({ path: relativePath }) => relativePath);
   if (new Set(paths).size !== paths.length || paths.length > limits.maxFiles) {
@@ -649,7 +713,7 @@ function parseRawDiff(bytes, oidLength, limits) {
   return changes;
 }
 
-function parseNumstat(bytes, limits) {
+function parseNumstat(bytes, limits, conflictPaths) {
   const records = splitNullProtocol(
     bytes,
     "CONTROLLED_GIT_PROTOCOL_ERROR",
@@ -663,7 +727,11 @@ function parseNumstat(bytes, limits) {
         "git diff --numstat record 无效",
       );
     }
+    const relativePath = normalizeConflictPath(match[3], limits);
     if (match[1] === "-" || match[2] === "-") {
+      if (match[1] === "-" && match[2] === "-" && !conflictPaths.has(relativePath)) {
+        return { path: relativePath, added: null, deleted: null };
+      }
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_CHANGE",
         "Binary Git changes 不受支持",
@@ -678,7 +746,7 @@ function parseNumstat(bytes, limits) {
       );
     }
     return {
-      path: normalizeConflictPath(match[3], limits),
+      path: relativePath,
       added,
       deleted,
     };
@@ -686,10 +754,10 @@ function parseNumstat(bytes, limits) {
 }
 
 function assertMatchingChanges(rawChanges, numstatChanges) {
-  const rawPaths = rawChanges.map(({ path: relativePath }) => relativePath);
-  const numstatPaths = numstatChanges.map(({ path: relativePath }) => relativePath);
+  const rawPaths = rawChanges.map(({ path: relativePath }) => relativePath).sort();
+  const numstatPaths = numstatChanges.map(({ path: relativePath }) => relativePath).sort();
   if (
-    rawPaths.length !== numstatPaths.length ||
+    rawPaths.length !== numstatPaths.length || new Set(numstatPaths).size !== numstatPaths.length ||
     rawPaths.some((relativePath, index) => relativePath !== numstatPaths[index])
   ) {
     throw controlledGitError(
@@ -725,12 +793,6 @@ function parseResultTree(bytes, oidLength, limits) {
       );
     }
     const relativePath = normalizeConflictPath(match[4], limits);
-    if (CODE_JOB_PATH_POLICY.isExcluded(relativePath)) {
-      throw controlledGitError(
-        "CONTROLLED_GIT_UNSUPPORTED_TREE",
-        "Result tree 包含 Code Job 默认排除路径",
-      );
-    }
     return {
       path: relativePath,
       mode: "100644",
@@ -739,18 +801,18 @@ function parseResultTree(bytes, oidLength, limits) {
   });
   let previous = null;
   for (const entry of entries) {
-    const comparable = process.platform === "win32"
-      ? entry.path.toLowerCase()
-      : entry.path;
-    if (previous !== null && comparable.localeCompare(previous, "en") <= 0) {
+    if (previous !== null && Buffer.compare(Buffer.from(entry.path), Buffer.from(previous)) <= 0) {
       throw controlledGitError(
         "CONTROLLED_GIT_UNSUPPORTED_TREE",
         "Result tree 路径排序或文件系统身份冲突",
       );
     }
-    previous = comparable;
+    previous = entry.path;
   }
-  return entries;
+  // Git orders UTF-8 bytes; host manifests use canonical evidence ordering.
+  // Filesystem aliases are a separate invariant and may be non-adjacent in Git.
+  assertTreePathIdentities(entries, limits, "CONTROLLED_GIT_UNSUPPORTED_TREE");
+  return entries.sort(compareEvidencePaths);
 }
 
 function gitBlobOid(objectFormat, bytes) {
@@ -805,7 +867,6 @@ async function executableIdentity(gitCommand) {
       cause,
     );
   }
-  const windowsSegments = path.win32.normalize(canonical).toLowerCase().split("\\");
   const permissions = initial.mode & 0o7777;
   if (
     initial.isSymbolicLink() ||
@@ -815,10 +876,7 @@ async function executableIdentity(gitCommand) {
     !samePath(canonical, gitCommand) ||
     (process.platform !== "win32" &&
       ((permissions & 0o111) === 0 || (permissions & 0o7022) !== 0)) ||
-    (process.platform === "win32" &&
-      !(windowsSegments.at(-1) === "git.exe" &&
-        windowsSegments.at(-2) === "bin" &&
-        /^mingw(?:32|64)$/u.test(windowsSegments.at(-3) ?? "")))
+    (process.platform === "win32" && !isWindowsGitImplementationPath(canonical))
   ) {
     throw controlledGitError(
       "CONTROLLED_GIT_EXECUTABLE_UNTRUSTED",
@@ -889,6 +947,20 @@ function normalizeBoundary(value, expected) {
   });
 }
 
+function preparationMirrorIdentity(boundary) {
+  // Fetch/repack changes boundaryDigest. Reuse still requires a fresh safe
+  // preflight and verification of the sealed files and recomputed merge result.
+  return {
+    schemaVersion: boundary.schemaVersion,
+    repository: boundary.repository,
+    canonicalRoot: boundary.canonicalRoot,
+    objectDirectory: boundary.objectDirectory,
+    objectFormat: boundary.objectFormat,
+    oidLength: boundary.oidLength,
+    commitOid: boundary.commitOid,
+  };
+}
+
 function assertSeparateBoundaries(
   base,
   head,
@@ -927,10 +999,10 @@ function assertSeparateBoundaries(
   }
 }
 
-function validatedBlob(bytes, oid, limits, objectFormat) {
+function validatedBlob(bytes, oid, limits, objectFormat, { textOnly = true } = {}) {
   if (
     bytes.length > limits.maxBlobBytes ||
-    bytes.includes(0) ||
+    (textOnly && bytes.includes(0)) ||
     gitBlobOid(objectFormat, bytes) !== oid
   ) {
     throw controlledGitError(
@@ -938,7 +1010,7 @@ function validatedBlob(bytes, oid, limits, objectFormat) {
       "Conflict blob 是 binary 或超过限制",
     );
   }
-  decodeUtf8(
+  if (textOnly) decodeUtf8(
     bytes,
     "CONTROLLED_GIT_UNSUPPORTED_CONFLICT",
     "Conflict blob 不是 UTF-8",
@@ -1242,7 +1314,8 @@ function normalizeControlledCommitPublicationAction(value) {
       inputBinding,
     ) ||
     evidence.commit.parents[0] !== target.headRefOid ||
-    evidence.commit.parents[1] !== target.baseRefOid
+    (!isHeadRepairExecutionSource(evidence.executionSource) &&
+      evidence.commit.parents[1] !== target.baseRefOid)
   ) {
     throw controlledGitError(
       "INVALID_CONTROLLED_GIT_PUBLISH_REQUEST",
@@ -1397,8 +1470,10 @@ function parsePublishedHead(result, refName, oidLength) {
 
 class BinaryExecFileRunner {
   async run({ command, args, cwd, env, input, timeoutMs, maxOutputBytes }) {
+    throwIfPreparationAborted();
     return new Promise((resolve, reject) => {
       let child;
+      let releaseAbort = () => false;
       try {
         child = execFile(
           command,
@@ -1414,6 +1489,7 @@ class BinaryExecFileRunner {
             windowsHide: true,
           },
           (error, stdout, stderr) => {
+            if (releaseAbort() && error?.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") { reject(new PreparationAbortedError()); return; }
             if (error?.killed || error?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
               reject(
                 controlledGitError(
@@ -1449,6 +1525,7 @@ class BinaryExecFileRunner {
         );
         return;
       }
+      releaseAbort = watchPreparationProcess(child);
       child.stdin?.once("error", (error) => {
         if (error?.code !== "EPIPE") child.kill("SIGKILL");
       });
@@ -1465,6 +1542,7 @@ export class ControlledGitService {
   #preparationRoot;
   #run;
   #limits;
+  #reviewHeadMirrors;
 
   constructor(value = {}) {
     const fields = dataObject(value, {
@@ -1475,6 +1553,7 @@ export class ControlledGitService {
         "processRunner",
         "limits",
         "commitIdentity",
+        "headMirrorsByRepository",
       ],
       required: ["gitCommand", "mirrorInspector", "preparationRoot"],
       code: "INVALID_CONTROLLED_GIT_CONFIG",
@@ -1519,6 +1598,11 @@ export class ControlledGitService {
     this.#mirrorInspector = bindDataMethod(mirrorInspector, "preflight");
     this.#run = bindDataMethod(processRunner, "run");
     this.#limits = validateLimits(limits);
+    this.#reviewHeadMirrors = new Map();
+    for (const [repository, mirrorRoot] of fields.has("headMirrorsByRepository")
+      ? exactRepositoryMirrorEntries(fields.get("headMirrorsByRepository")) : []) {
+      this.#reviewHeadMirrors.set(repository.toLowerCase(), mirrorRoot);
+    }
     this.#commitIdentity = normalizeCommitIdentity(commitIdentity);
     this.#commitBuilder = new ControlledGitCommitBuilder({
       preparationRoot: this.#preparationRoot,
@@ -1539,6 +1623,12 @@ export class ControlledGitService {
           this.#runControlledCommitGit("read-tree", request),
         hashObject: (request) =>
           this.#runControlledCommitGit("hash-object", request),
+        listTrees: (request) =>
+          this.#runControlledCommitGit("list-trees", request),
+        packObjects: (request) =>
+          this.#runControlledCommitGit("pack-objects", request),
+        indexPack: (request) =>
+          this.#runControlledCommitGit("index-pack", request),
         updateIndex: (request) =>
           this.#runControlledCommitGit("update-index", request),
         writeTree: (request) =>
@@ -1589,7 +1679,9 @@ export class ControlledGitService {
       expectedCommitOid: gitTarget.headRefOid,
     };
     const baseBoundary = await this.#preflight(baseRequest);
+    throwIfPreparationAborted();
     const headBoundary = await this.#preflight(headRequest);
+    throwIfPreparationAborted();
     assertSeparateBoundaries(
       baseBoundary,
       headBoundary,
@@ -1662,6 +1754,10 @@ export class ControlledGitService {
   }
 
   async verifyConflictPreparation(value) {
+    return (await this.#verifiedConflictManifest(value)).binding;
+  }
+
+  async #verifiedConflictManifest(value) {
     const fields = exactDataObject(value, ["binding"]);
     let binding;
     try {
@@ -1690,7 +1786,44 @@ export class ControlledGitService {
         "Conflict preparation binding 与 sealed evidence 不一致",
       );
     }
-    return deepFreeze(expected);
+    return { binding: deepFreeze(expected), manifest };
+  }
+
+  async readConflictInspection(value) {
+    const { binding, manifest } = await this.#verifiedConflictManifest(value);
+    const directory = await this.#preparationDirectory(binding.preparationId);
+    let remainingCharacters = 12_000;
+    const conflicts = [];
+    for (const conflict of manifest.conflicts) {
+      const versions = [];
+      for (const evidence of [...conflict.stages, manifest.treeEntries.find(entry => entry.path === conflict.path)]) {
+        const bytes = await this.#readSealedBlob(directory, evidence, manifest.baseBoundary.objectFormat, { textOnly: true });
+        const text = bytes.toString("utf8");
+        const start = evidence.stage === undefined ? Math.max(0, text.indexOf("<<<<<<<") - 300) : 0;
+        const excerpt = text.slice(start, start + Math.min(2_000, remainingCharacters));
+        remainingCharacters -= excerpt.length;
+        versions.push({ stage: evidence.stage ?? "merged", oid: evidence.oid,
+          sha256: evidence.sha256, byteLength: evidence.byteLength,
+          excerpt, startLine: text.slice(0, start).split("\n").length, complete: excerpt.length === text.length });
+      }
+      conflicts.push({ path: conflict.path, mode: conflict.mode, versions });
+    }
+    return deepFreeze({ schemaVersion: 1, preparationBinding: binding, conflicts });
+  }
+
+  async readConflictSources(value) {
+    const { binding, manifest } = await this.#verifiedConflictManifest(value);
+    const directory = await this.#preparationDirectory(binding.preparationId);
+    const versions = ["ancestor", "head", "base"];
+    const documents = [];
+    for (const conflict of manifest.conflicts) {
+      for (const evidence of conflict.stages) {
+        const bytes = await this.#readSealedBlob(directory, evidence, manifest.baseBoundary.objectFormat, { textOnly: true });
+        documents.push({ path: conflict.path, version: versions[evidence.stage - 1],
+          oid: evidence.oid, sha256: evidence.sha256, bytes: bytes.length, content: bytes.toString("utf8") });
+      }
+    }
+    return deepFreeze(documents);
   }
 
   async materializeConflictPreparationForCodeJob(value) {
@@ -1714,6 +1847,7 @@ export class ControlledGitService {
   }
 
   async materializeForCodeJob(value) {
+    throwIfPreparationAborted();
     const hasExcludePaths = isPlainRecord(value) &&
       Object.hasOwn(value, "excludePaths");
     const fields = exactDataObject(value, [
@@ -1751,6 +1885,7 @@ export class ControlledGitService {
         preparationId,
       );
       for (const entry of manifest.treeEntries) {
+        throwIfPreparationAborted();
         if (materializationPolicy.isExcluded(entry.path)) continue;
         await this.#assertMaterializationFence(targetBoundary, lease);
         const content = await this.#readSealedBlob(
@@ -1797,7 +1932,8 @@ export class ControlledGitService {
           createdFiles.push({ path: target, stats: initialStats, content });
           await handle.writeFile(content);
           await handle.chmod(0o644);
-          await handle.sync();
+          // This scratch copy is rebuilt from sealed evidence after restart;
+          // readback below verifies it without flushing every file to disk.
           const finalStats = await handle.stat();
           if (
             !finalStats.isFile() ||
@@ -1838,6 +1974,7 @@ export class ControlledGitService {
         createdDirectories.ordered,
       );
       for (const file of createdFiles) {
+        throwIfPreparationAborted();
         await this.#assertMaterializedFile(file);
       }
       await this.#releaseMaterializationLease(targetBoundary, lease);
@@ -1848,12 +1985,13 @@ export class ControlledGitService {
         "Code Job target root 在 materialization 结束时发生变化",
       );
     } catch (cause) {
-      await this.#cleanupMaterialization({
+      await withoutPreparationCancellation(() => this.#cleanupMaterialization({
         targetBoundary,
         lease,
         files: createdFiles,
         directories: createdDirectories.ordered,
-      });
+      }));
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof ControlledGitServiceError) throw cause;
       throw controlledGitError(
         "CONTROLLED_GIT_MATERIALIZATION_FAILED",
@@ -1916,6 +2054,15 @@ export class ControlledGitService {
         cause,
       );
     }
+  }
+
+  async readSealedControlledCommit(value) {
+    const fields = exactDataObject(value, ["evidenceId"]);
+    const evidenceId = fields.get("evidenceId");
+    if (!CONTROLLED_COMMIT_ID.test(evidenceId)) {
+      throw controlledGitError("INVALID_CONTROLLED_GIT_REQUEST", "Controlled commit evidenceId 无效");
+    }
+    return this.#commitBuilder.readSealed(evidenceId);
   }
 
   async verifyControlledCommit(value) {
@@ -2012,7 +2159,8 @@ export class ControlledGitService {
         "--no-follow-tags",
         "--no-signed",
         "--recurse-submodules=no",
-        `--force-with-lease=${fullRefName}:${target.headRefOid}`,
+        ...(isHeadRepairExecutionSource(finalSource.evidence.executionSource)
+          ? [] : [`--force-with-lease=${fullRefName}:${target.headRefOid}`]),
         "--",
         remoteUrl,
         `${commitOid}:${fullRefName}`,
@@ -2059,7 +2207,7 @@ export class ControlledGitService {
     return Object.freeze({
       evidence: source.evidence,
       commitObjectDirectory: source.objectDirectory,
-      preparationObjectDirectory: path.join(
+      preparationObjectDirectory: isHeadRepairExecutionSource(preparation) ? null : path.join(
         this.#preparationRoot,
         "preparations",
         preparation.preparationId,
@@ -2118,7 +2266,7 @@ export class ControlledGitService {
       ...this.#gitEnvironment(
         scratch.objectDirectory,
         source.commitObjectDirectory,
-        source.preparationObjectDirectory,
+        ...(source.preparationObjectDirectory === null ? [] : [source.preparationObjectDirectory]),
         source.baseObjectDirectory,
         source.headObjectDirectory,
       ),
@@ -2194,6 +2342,9 @@ export class ControlledGitService {
   }
 
   async #verifiedCommitPreparation(executionSource, manifest) {
+    if (isHeadRepairExecutionSource(executionSource)) {
+      return this.#verifiedReviewRepairHead(executionSource, manifest);
+    }
     const binding = executionSource.preparationBinding;
     const preparation = await this.#verifiedManifest(binding.preparationId);
     if (preparation.status !== "conflicted") {
@@ -2224,6 +2375,89 @@ export class ControlledGitService {
       );
     }
     return preparation;
+  }
+
+  async #verifiedReviewRepairHead(executionSource, manifest) {
+    const target = executionSource.inputBinding.gitTarget;
+    const mirrorRoot = this.#reviewHeadMirrors.get(target.headRepository.toLowerCase());
+    if (mirrorRoot === undefined) {
+      throw controlledGitError("CONTROLLED_GIT_MIRROR_NOT_CONFIGURED", "Review repair 原 PR Head 缺少可信 mirror");
+    }
+    const headBoundary = await this.#preflight({
+      repository: target.headRepository,
+      mirrorRoot,
+      expectedCommitOid: target.headRefOid,
+    });
+    if ([headBoundary.canonicalRoot, headBoundary.objectDirectory].some((entry) =>
+      pathsOverlap(entry, this.#preparationRoot) || pathsOverlap(entry, this.#gitCommand))) {
+      throw controlledGitError("CONTROLLED_GIT_BOUNDARY_OVERLAP", "Review repair Head mirror 与运行边界重叠");
+    }
+    const gitExecutable = await executableIdentity(this.#gitCommand);
+    const prefix = [...SAFE_GIT_PREFIX, `--git-dir=${headBoundary.canonicalRoot}`,
+      "-c", "core.fsmonitor=false", "-c", "protocol.allow=never"];
+    const run = async (args, maximum) => checkedProcessOutput(await this.#runGit({
+      args: [...prefix, ...args], cwd: headBoundary.canonicalRoot,
+      env: this.#gitEnvironment(headBoundary.objectDirectory, headBoundary.objectDirectory, headBoundary.objectDirectory), maxOutputBytes: maximum,
+    }), [0], maximum).stdout;
+    const resultTreeOid = parseSingleOid(await run(["rev-parse", `${target.headRefOid}^{tree}`], 256), headBoundary.oidLength, "CONTROLLED_GIT_PROTOCOL_ERROR");
+    const records = splitNullProtocol(await run(["ls-tree", "-rz", "--full-tree", resultTreeOid], this.#limits.maxProtocolBytes),
+      "CONTROLLED_GIT_PROTOCOL_ERROR", "Review repair Head tree 输出无效");
+    if (records.length > this.#limits.maxFiles) {
+      throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Review repair Head 文件数超过配置限制");
+    }
+    const treeEntries = records.map((record) => {
+      const match = /^(\d{6}) (blob|commit) ([a-f0-9]{40}|[a-f0-9]{64})\t(.+)$/u.exec(record);
+      if (!match || !oidPattern(headBoundary.oidLength).test(match[3])) {
+        throw controlledGitError("CONTROLLED_GIT_PROTOCOL_ERROR", "Review repair Head tree 记录无效");
+      }
+      return { path: normalizeWorkspacePath(match[4]), mode: match[1], oid: match[3] };
+    });
+    const byPath = new Map(treeEntries.map((entry) => [entry.path, entry]));
+    for (const change of [...manifest.changes.modified, ...manifest.changes.deleted]) {
+      const entry = byPath.get(change.path);
+      if (!entry || !["100644", "100755"].includes(entry.mode)) {
+        throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair 修改路径不是原 PR 普通文件");
+      }
+      const before = validatedBlob(await run(["cat-file", "blob", entry.oid], this.#limits.maxBlobBytes),
+        entry.oid, this.#limits, headBoundary.objectFormat);
+      if (before.sha256 !== change.beforeSha256) {
+        throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair beforeSha256 未绑定原 PR Head");
+      }
+    }
+    if (manifest.changes.created.some(({ path }) => byPath.has(path))) {
+      throw controlledGitError("CONTROLLED_GIT_CHANGE_PACKAGE_MISMATCH", "Review repair 新建路径已存在于原 PR Head");
+    }
+    return Object.freeze({ kind: executionSource.kind, headBoundary, baseBoundary: headBoundary,
+      resultTreeOid, treeEntries, gitExecutable });
+  }
+
+  async #mergeInIsolatedObjects({ scratchRoot, gitDirectory, prefix, environment, commits, oidLength }) {
+    // merge-tree can freshen a packed alternate when its result reuses an
+    // existing subtree. Seed only these commits and their trees, without
+    // history, so every Git write is confined to disposable object stores.
+    const output = checkedProcessOutput(await this.#runGit({ args: [...prefix, "rev-list", "--objects", "--no-object-names",
+      ...commits.map(oid => `${oid}^{tree}`)], cwd: scratchRoot, env: environment,
+      maxOutputBytes: this.#limits.maxProtocolBytes }), [0], this.#limits.maxProtocolBytes).stdout;
+    const records = decodeUtf8(output, "CONTROLLED_GIT_PROTOCOL_ERROR", "Merge seed object list 不是 UTF-8").trim().split("\n");
+    if (records.some(oid => !oidPattern(oidLength).test(oid))) {
+      throw controlledGitError("CONTROLLED_GIT_PROTOCOL_ERROR", "Merge seed object list 无效");
+    }
+    const seedRoot = path.join(scratchRoot, "merge-seed-objects");
+    await mkdir(seedRoot);
+    await mkdir(path.join(seedRoot, "info"));
+    await mkdir(path.join(seedRoot, "pack"));
+    const context = { gitDirectory, cwd: scratchRoot, environment };
+    const pack = await this.#runControlledCommitGit("pack-objects", { ...context,
+      records: Buffer.from([...new Set([...commits, ...records])].join("\n") + "\n") });
+    await this.#runControlledCommitGit("index-pack", { ...context, content: pack,
+      environment: { ...environment, GIT_OBJECT_DIRECTORY: seedRoot, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" } });
+    try {
+      return await this.#runGit({ args: [...prefix, "merge-tree", "--write-tree", `--merge-base=${commits[2]}`,
+        "--no-messages", "-z", commits[0], commits[1]], cwd: scratchRoot,
+        env: { ...environment, GIT_ALTERNATE_OBJECT_DIRECTORIES: seedRoot }, maxOutputBytes: this.#limits.maxProtocolBytes });
+    } finally {
+      await rm(seedRoot, { recursive: true, force: true });
+    }
   }
 
   async #inspectInScratch({
@@ -2293,6 +2527,19 @@ export class ControlledGitService {
       mergeBaseOutput.exitCode,
       baseBoundary.oidLength,
     );
+    const mergeTreeOutput = checkedProcessOutput(
+      await this.#mergeInIsolatedObjects({ scratchRoot, gitDirectory: scratchGitDirectory,
+        prefix, environment, commits: [gitTarget.headRefOid, gitTarget.baseRefOid, mergeBaseOid], oidLength: baseBoundary.oidLength }),
+      [0, 1],
+      this.#limits.maxProtocolBytes,
+    );
+    const merge = parseMergeTree(
+      mergeTreeOutput.stdout,
+      mergeTreeOutput.exitCode,
+      baseBoundary.oidLength,
+      this.#limits,
+    );
+    const conflictPaths = new Set(merge.conflicts.map(({ path }) => path));
     for (const tipOid of [gitTarget.headRefOid, gitTarget.baseRefOid]) {
       const raw = parseRawDiff(
         checkedProcessOutput(
@@ -2317,6 +2564,7 @@ export class ControlledGitService {
         ).stdout,
         baseBoundary.oidLength,
         this.#limits,
+        conflictPaths,
       );
       const numstat = parseNumstat(
         checkedProcessOutput(
@@ -2338,37 +2586,18 @@ export class ControlledGitService {
           this.#limits.maxProtocolBytes,
         ).stdout,
         this.#limits,
+        conflictPaths,
       );
       assertMatchingChanges(raw, numstat);
     }
-    const mergeTreeOutput = checkedProcessOutput(
-      await this.#runGit({
-        args: [
-          ...prefix,
-          "merge-tree",
-          "--write-tree",
-          `--merge-base=${mergeBaseOid}`,
-          "--no-messages",
-          "-z",
-          gitTarget.headRefOid,
-          gitTarget.baseRefOid,
-        ],
-        cwd: scratchRoot,
-        env: environment,
-        maxOutputBytes: this.#limits.maxProtocolBytes,
-      }),
-      [0, 1],
-      this.#limits.maxProtocolBytes,
-    );
-    const merge = parseMergeTree(
-      mergeTreeOutput.stdout,
-      mergeTreeOutput.exitCode,
-      baseBoundary.oidLength,
-      this.#limits,
-    );
     const conflicts = [];
     let totalBytes = 0;
     for (const conflict of merge.conflicts) {
+      // Unrelated excluded files stay in the sealed Git tree and are skipped
+      // during materialization. Only editable conflict documents need access.
+      if (CODE_JOB_PATH_POLICY.isExcluded(conflict.path)) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_CONFLICT", "Conflict path 被 Code Job 策略排除");
+      }
       const stages = [];
       for (const stage of conflict.stages) {
         const output = checkedProcessOutput(
@@ -2423,38 +2652,52 @@ export class ControlledGitService {
       this.#limits.maxProtocolBytes,
     );
     const treeEntries = [];
-    for (const entry of parseResultTree(
-      treeProtocol.stdout,
-      baseBoundary.oidLength,
-      this.#limits,
-    )) {
-      const output = checkedProcessOutput(
-        await this.#runGit({
-          args: [...prefix, "cat-file", "blob", entry.oid],
-          cwd: scratchRoot,
-          env: environment,
-          maxOutputBytes: this.#limits.maxBlobBytes,
-        }),
-        [0],
-        this.#limits.maxBlobBytes,
-      );
-      totalBytes += output.stdout.length;
-      if (totalBytes > this.#limits.maxTotalBytes) {
-        throw controlledGitError(
-          "CONTROLLED_GIT_UNSUPPORTED_TREE",
-          "Result tree blobs 超过总大小限制",
-        );
+    const parsedEntries = parseResultTree(treeProtocol.stdout, baseBoundary.oidLength, this.#limits);
+    const oids = [...new Set(parsedEntries.map(({ oid }) => oid))];
+    const blobs = new Map();
+    let uniqueBlobBytes = 0;
+    for (let offset = 0; offset < oids.length; offset += MAX_BLOBS_PER_BATCH) {
+      const batchOids = oids.slice(offset, offset + MAX_BLOBS_PER_BATCH);
+      const remainingBytes = this.#limits.maxTotalBytes - totalBytes - uniqueBlobBytes;
+      const outputLimit = Math.min(Number.MAX_SAFE_INTEGER, remainingBytes + batchOids.length * 160 + 1);
+      const output = checkedProcessOutput(await this.#runGit({
+        args: [...prefix, "cat-file", "--batch"], cwd: scratchRoot, env: environment,
+        input: Buffer.from(batchOids.map((oid) => `${oid}\n`).join("")), maxOutputBytes: outputLimit,
+      }), [0], outputLimit);
+      let batch;
+      try {
+        batch = parseGitBlobBatch(output.stdout, batchOids, {
+          objectFormat: baseBoundary.objectFormat, maxBlobBytes: this.#limits.maxBlobBytes,
+          maxTotalBytes: remainingBytes,
+        });
+      } catch (cause) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Result tree blob batch 无效或超过限制", cause);
       }
-      const evidence = validatedBlob(
-        output.stdout,
-        entry.oid,
-        this.#limits,
-        baseBoundary.objectFormat,
-      );
-      await this.#sealBlob(blobDirectory, output.stdout);
+      for (const [oid, bytes] of batch) { blobs.set(oid, bytes); uniqueBlobBytes += bytes.length; }
+    }
+    for (const entry of parsedEntries) {
+      const bytes = blobs.get(entry.oid);
+      totalBytes += bytes.length;
+      if (totalBytes > this.#limits.maxTotalBytes) {
+        throw controlledGitError("CONTROLLED_GIT_UNSUPPORTED_TREE", "Result tree blobs 超过总大小限制");
+      }
+      const evidence = validatedBlob(bytes, entry.oid, this.#limits, baseBoundary.objectFormat,
+        { textOnly: conflictPaths.has(entry.path) });
       treeEntries.push(deepFreeze({ ...entry, ...evidence }));
     }
-    const conflictPaths = new Set(conflicts.map(({ path: relativePath }) => relativePath));
+    // Different tree paths can share one blob. Seal each OID once so concurrent
+    // writers never mistake a still-open duplicate for corrupted evidence.
+    const uniqueBlobs = [...blobs.values()];
+    for (let offset = 0; offset < uniqueBlobs.length; offset += 4) {
+      throwIfPreparationAborted();
+      const results = await Promise.allSettled(
+        uniqueBlobs.slice(offset, offset + 4).map((bytes) =>
+          this.#sealBlob(blobDirectory, bytes)),
+      );
+      // Drain started writers before failure can trigger scratch cleanup.
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    }
     const treePaths = new Set(treeEntries.map(({ path: relativePath }) => relativePath));
     if ([...conflictPaths].some((relativePath) => !treePaths.has(relativePath))) {
       throw controlledGitError(
@@ -2605,6 +2848,7 @@ export class ControlledGitService {
 
     directories.push(await directorySnapshot(root, ""));
     for (let index = 0; index < directories.length; index += 1) {
+      throwIfPreparationAborted();
       const directory = directories[index];
       let entries;
       try {
@@ -2613,6 +2857,7 @@ export class ControlledGitService {
         fail("Preparation directory 不可读取", cause);
       }
       for await (const entry of entries) {
+        throwIfPreparationAborted();
         const absolute = path.join(directory.absolute, entry.name);
         const relative = normalizeEvidencePath(
           directory.relative === ""
@@ -2763,12 +3008,23 @@ export class ControlledGitService {
         input = request.content;
         returnsOid = true;
         break;
+      case "list-trees":
+        args = [...prefix, "ls-tree", "-rtdz", "--full-tree", request.treeOid];
+        break;
+      case "pack-objects":
+        args = [...prefix, "pack-objects", "--stdout"];
+        input = request.records;
+        break;
+      case "index-pack":
+        args = [...prefix, "index-pack", "--stdin"];
+        input = request.content;
+        break;
       case "update-index":
         args = [...prefix, "update-index", "-z", "--index-info"];
         input = request.records;
         break;
       case "write-tree":
-        args = [...prefix, "write-tree"];
+        args = [...prefix, "write-tree", "--missing-ok"];
         returnsOid = true;
         break;
       case "commit-tree":
@@ -2776,10 +3032,7 @@ export class ControlledGitService {
           ...prefix,
           "commit-tree",
           request.treeOid,
-          "-p",
-          request.parents[0],
-          "-p",
-          request.parents[1],
+          ...request.parents.flatMap((parent) => ["-p", parent]),
         ];
         input = request.message;
         returnsOid = true;
@@ -2790,7 +3043,9 @@ export class ControlledGitService {
           "Controlled commit Git operation 不在固定 allowlist",
         );
     }
-    const maximumBytes = returnsOid ? 256 : 64;
+    const maximumBytes = operation === "list-trees" ? this.#limits.maxProtocolBytes
+      : operation === "pack-objects" ? this.#limits.maxResultObjectBytes
+        : returnsOid || operation === "index-pack" ? 256 : 64;
     const output = checkedProcessOutput(
       await this.#runGit({
         args,
@@ -2808,10 +3063,11 @@ export class ControlledGitService {
           request.oidLength,
           "CONTROLLED_GIT_COMMIT_PROTOCOL_ERROR",
         )
-      : undefined;
+      : operation === "list-trees" || operation === "pack-objects" ? output : undefined;
   }
 
   async #runGit({ args, cwd, env, input, maxOutputBytes }) {
+    throwIfPreparationAborted();
     try {
       return await this.#run({
         command: this.#gitCommand,
@@ -2823,6 +3079,7 @@ export class ControlledGitService {
         maxOutputBytes,
       });
     } catch (cause) {
+      if (isPreparationAbort(cause)) throw cause;
       if (cause instanceof ControlledGitServiceError) throw cause;
       throw controlledGitError(
         "CONTROLLED_GIT_PROCESS_FAILED",
@@ -2904,6 +3161,7 @@ export class ControlledGitService {
   }
 
   async #verifiedManifest(preparationId) {
+    throwIfPreparationAborted();
     await this.#assertPreparationRoot();
     const manifest = await this.#loadManifest(preparationId);
     if (
@@ -2928,7 +3186,9 @@ export class ControlledGitService {
       expectedCommitOid: manifest.headBoundary.commitOid,
     };
     const baseBoundary = await this.#preflight(baseRequest);
+    throwIfPreparationAborted();
     const headBoundary = await this.#preflight(headRequest);
+    throwIfPreparationAborted();
     assertSeparateBoundaries(
       baseBoundary,
       headBoundary,
@@ -2936,8 +3196,14 @@ export class ControlledGitService {
       manifest.gitExecutable.path,
     );
     if (
-      !sameCanonicalValue(baseBoundary, manifest.baseBoundary) ||
-      !sameCanonicalValue(headBoundary, manifest.headBoundary)
+      !sameCanonicalValue(
+        preparationMirrorIdentity(baseBoundary),
+        preparationMirrorIdentity(manifest.baseBoundary),
+      ) ||
+      !sameCanonicalValue(
+        preparationMirrorIdentity(headBoundary),
+        preparationMirrorIdentity(manifest.headBoundary),
+      )
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_BOUNDARY_CHANGED",
@@ -3000,6 +3266,7 @@ export class ControlledGitService {
       ...manifest.treeEntries,
       ...manifest.conflicts.flatMap(({ stages }) => stages),
     ]) {
+      throwIfPreparationAborted();
       expectedBlobs.set(evidence.sha256, {
         path: `${evidence.sha256}.blob`,
         byteLength: evidence.byteLength,
@@ -3009,6 +3276,7 @@ export class ControlledGitService {
         directory,
         evidence,
         manifest.baseBoundary.objectFormat,
+        { textOnly: !Object.hasOwn(evidence, "path") || manifest.conflicts.some(({ path }) => path === evidence.path) },
       );
     }
     const actualBlobs = await this.#directoryEvidence(
@@ -3103,21 +3371,9 @@ export class ControlledGitService {
         );
       }
       const mergeOutput = checkedProcessOutput(
-        await this.#runGit({
-          args: [
-            ...prefix,
-            "merge-tree",
-            "--write-tree",
-            `--merge-base=${mergeBaseOid}`,
-            "--no-messages",
-            "-z",
-            manifest.gitTarget.headRefOid,
-            manifest.gitTarget.baseRefOid,
-          ],
-          cwd: scratchRoot,
-          env: environment,
-          maxOutputBytes: this.#limits.maxProtocolBytes,
-        }),
+        await this.#mergeInIsolatedObjects({ scratchRoot, gitDirectory: scratchGitDirectory,
+          prefix, environment, commits: [manifest.gitTarget.headRefOid, manifest.gitTarget.baseRefOid, mergeBaseOid],
+          oidLength: baseBoundary.oidLength }),
         [0, 1],
         this.#limits.maxProtocolBytes,
       );
@@ -3435,6 +3691,7 @@ export class ControlledGitService {
         "Conflict path 不属于 result tree",
       );
     }
+    assertTreePathIdentities(treeEntries, this.#limits, "CONTROLLED_GIT_PREPARATION_TAMPERED");
     const resultObjects = exactArray(
       manifest.resultObjects,
       "CONTROLLED_GIT_PREPARATION_TAMPERED",
@@ -3576,7 +3833,7 @@ export class ControlledGitService {
     return directory;
   }
 
-  async #readSealedBlob(preparationDirectory, evidence, objectFormat) {
+  async #readSealedBlob(preparationDirectory, evidence, objectFormat, { textOnly = false } = {}) {
     const target = path.join(
       preparationDirectory,
       "blobs",
@@ -3610,14 +3867,14 @@ export class ControlledGitService {
       !sameFileIdentity(initial, final) ||
       sha256(bytes) !== evidence.sha256 ||
       gitBlobOid(objectFormat, bytes) !== evidence.oid ||
-      bytes.includes(0)
+      (textOnly && bytes.includes(0))
     ) {
       throw controlledGitError(
         "CONTROLLED_GIT_PREPARATION_TAMPERED",
         "Sealed blob evidence 无效",
       );
     }
-    decodeUtf8(
+    if (textOnly) decodeUtf8(
       bytes,
       "CONTROLLED_GIT_PREPARATION_TAMPERED",
       "Sealed blob 不是 UTF-8",
@@ -3754,12 +4011,20 @@ export class ControlledGitService {
         "Code Job materialization lease 发生变化",
       );
     }
-    for (const boundary of directoryBoundaries) {
-      await this.#assertDirectoryBoundary(
-        boundary,
-        "CONTROLLED_GIT_TARGET_CHANGED",
-        "Code Job target parent 在 materialization 期间发生变化",
+    // Parent checks only read metadata. Bound their I/O and settle every check
+    // before returning or allowing failure cleanup to touch the workspace.
+    for (let index = 0; index < directoryBoundaries.length; index += 4) {
+      const results = await Promise.allSettled(
+        directoryBoundaries.slice(index, index + 4).map((boundary) =>
+          this.#assertDirectoryBoundary(
+            boundary,
+            "CONTROLLED_GIT_TARGET_CHANGED",
+            "Code Job target parent 在 materialization 期间发生变化",
+          ),
+        ),
       );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
     }
   }
 

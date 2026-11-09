@@ -362,7 +362,7 @@ test("production reconciliation binds a non-noop migration to migrated facts", a
         "utf8",
       ),
     ),
-    { schemaVersion: 2, revision: 0, sessions: {} },
+    { schemaVersion: 3, revision: 0, sessions: {} },
   );
 });
 
@@ -410,11 +410,11 @@ test("operations runtime makes the trusted restore pass unavoidable around exten
     directory: candidate,
     manifest: manifestFor(ownerName, legacyBytes),
   });
-  assert.deepEqual(observedVersions, [2]);
+  assert.deepEqual(observedVersions, [3]);
   assert.equal(
     JSON.parse(await readFile(path.join(candidate, ownerName), "utf8"))
       .schemaVersion,
-    2,
+    3,
   );
 });
 
@@ -433,7 +433,7 @@ test("the post-extension trusted pass rejects a future known owner", async (t) =
       async migrate({ directory }) {
         await writeFile(
           path.join(directory, "code-executor-state.json"),
-          `${JSON.stringify({ schemaVersion: 3, revision: 0, sessions: {} })}\n`,
+          `${JSON.stringify({ schemaVersion: 4, revision: 0, sessions: {} })}\n`,
           "utf8",
         );
       },

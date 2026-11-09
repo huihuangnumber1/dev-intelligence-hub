@@ -131,11 +131,11 @@ test("offline runtime brackets its candidate extension with the trusted registry
     directory: candidate,
     manifest,
   });
-  assert.deepEqual(calls.migrationOrder, [2]);
+  assert.deepEqual(calls.migrationOrder, [3]);
   assert.equal(
     JSON.parse(await readFile(path.join(candidate, ownerName), "utf8"))
       .schemaVersion,
-    2,
+    3,
   );
 
   const result = await runtime.activate({ backupId: `backup-${"a".repeat(64)}` });

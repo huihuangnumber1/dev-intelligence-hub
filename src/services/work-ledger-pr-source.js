@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { normalizeHeadAncestryReceipt, headAncestrySourceMatches, headAncestryEvent } from "../domain/head-ancestry-receipt.js";
 import {
   createPullRequestExecutionBinding,
   normalizePullRequestExecutionBinding,
@@ -47,6 +48,8 @@ const SOURCE_KEYS = [
 const LEGACY_SOURCE_KEYS = SOURCE_KEYS.filter(
   (key) => !["authorityEpoch", "scope"].includes(key),
 );
+const BUDGET_SOURCE_KEYS = [...SOURCE_KEYS, "decisionBudget"];
+const DECISION_BUDGET_KEYS = ["headRefOid", "activationRevision", "previousActiveRevision", "attemptOffset"];
 const SCOPE_KEYS = [
   "kind",
   "active",
@@ -74,37 +77,39 @@ const AUTHORED_PR_SELF_FIX_ACTIONS = new Set([
   "continue_draft",
 ]);
 
-function isTrustedPrRoleAssignment(assignment, event) {
+export function trustedPrRoleForEvent(event) {
   if (
     event?.source?.provider !== "github" ||
-    !["authored", "review_requested"].includes(event?.payload?.relation) ||
-    assignment?.target?.type !== "role"
+    !["authored", "review_requested"].includes(event?.payload?.relation)
   ) {
-    return false;
+    return null;
   }
   if (
-    assignment.ruleId === AUTHORED_PR_SELF_FIX_RULE_ID &&
-    assignment.target.id === "developer" &&
-    event.payload.relation === "authored"
+    event.payload.relation === "authored" &&
+    event.payload.actionState === "action_now" &&
+    AUTHORED_PR_SELF_FIX_ACTIONS.has(event.payload.nextAction)
   ) {
-    return event.payload.actionState === "action_now" &&
-      AUTHORED_PR_SELF_FIX_ACTIONS.has(event.payload.nextAction);
+    return { roleId: "developer", ruleId: AUTHORED_PR_SELF_FIX_RULE_ID };
   }
   const authoredApproved =
-    assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID &&
-    assignment.target.id === "tester" &&
     event.payload.relation === "authored" &&
     event.payload.actionState === "waiting_other" &&
     event.payload.nextAction === "wait_merge" &&
     event.payload.reviewDecision === "APPROVED";
   const reviewedApproved =
-    assignment.ruleId === REVIEWED_PR_APPROVED_RULE_ID &&
-    assignment.target.id === "tester" &&
     event.payload.relation === "review_requested" &&
     event.payload.actionState === "waiting_other" &&
     event.payload.nextAction === "wait_merge" &&
     event.payload.myReviewState === "APPROVED";
-  return authoredApproved || reviewedApproved;
+  if (authoredApproved) return { roleId: "tester", ruleId: AUTHORED_PR_APPROVED_RULE_ID };
+  if (reviewedApproved) return { roleId: "tester", ruleId: REVIEWED_PR_APPROVED_RULE_ID };
+  return null;
+}
+
+function isTrustedPrRoleAssignment(assignment, event) {
+  const role = trustedPrRoleForEvent(event);
+  return role !== null && assignment?.target?.type === "role" &&
+    assignment.target.id === role.roleId && assignment.ruleId === role.ruleId;
 }
 const CURRENT_KEYS = [
   "sourceSequence",
@@ -149,6 +154,7 @@ const BINDING_KEYS = [
   "eventId",
   "inputRevision",
 ];
+const SCOPE_LIFECYCLE_BINDING_KEYS = [...BINDING_KEYS, "scopeLifecycle"];
 const INPUT_BINDING_KEYS = [
   "kind",
   "rootItemId",
@@ -259,7 +265,7 @@ function plainArray(value, name) {
 function normalizePullRequestScope(value) {
   exact(value, SCOPE_KEYS, "PR scope");
   if (
-    !["automatic", "owner_requested"].includes(value.kind) ||
+    !["automatic", "owner_requested", "internal_review"].includes(value.kind) ||
     typeof value.active !== "boolean"
   ) {
     throw invalid("PR scope 状态无效");
@@ -277,7 +283,7 @@ function normalizePullRequestScope(value) {
         ),
   };
   if (
-    normalized.kind === "owner_requested" &&
+    ["owner_requested", "internal_review"].includes(normalized.kind) &&
     (!normalized.active ||
       normalized.revision !== 1 ||
       normalized.lastLifecycleEventId !== null)
@@ -336,7 +342,7 @@ function sourceInputDigest(workKey, event) {
   return ledgerDigest({ workKey, event }, { maximumEntries: 30_000 });
 }
 
-function identityFor(assignment, event, trustedLifecycle = false) {
+function identityFor(assignment, event, trustedLifecycle = false, lifecycleRoleId = "pr-engineer") {
   let target;
   try {
     target = normalizeLedgerTarget(assignment.target);
@@ -357,7 +363,9 @@ function identityFor(assignment, event, trustedLifecycle = false) {
     !(
       event.source.provider === "github" ||
       (event.source.provider === "local-owner" &&
-        event.eventType === "pull_request.owner_requested")
+        event.eventType === "pull_request.owner_requested") ||
+      (event.source.provider === "internal-review-repair" &&
+        event.eventType === "pull_request.internal_review_requested" && target.id === "pr-engineer")
     )
   ) {
     return null;
@@ -371,7 +379,7 @@ function identityFor(assignment, event, trustedLifecycle = false) {
       event.subject.number,
       "pullRequestNumber",
     ),
-    targetRoleId: trustedLifecycle ? "pr-engineer" : target.id,
+    targetRoleId: trustedLifecycle ? lifecycleRoleId : target.id,
   };
 }
 
@@ -379,7 +387,7 @@ function workKeyFor(identity) {
   return `pr-work-${ledgerDigest(identity)}`;
 }
 
-function normalizedEnvelope(value) {
+function normalizedEnvelope(value, lifecycleRoleId = "pr-engineer") {
   const sequence = positiveInteger(value.sequence, "sourceSequence");
   const assignment = canonical(value.assignment, "assignment");
   const rawEvent = canonical(value.event, "event");
@@ -412,6 +420,7 @@ function normalizedEnvelope(value) {
   const event = storedEvent(rawEvent);
   const trustedLifecycle =
     isTrustedPullRequestScopeLifecycleAssignment(assignment, event);
+  if (event.eventType === "pull_request.role_handoff" && !trustedLifecycle) return null;
   if (
     !trustedLifecycle &&
     !ordinaryTarget &&
@@ -420,7 +429,7 @@ function normalizedEnvelope(value) {
   ) {
     return null;
   }
-  const identity = identityFor(assignment, event, trustedLifecycle);
+  const identity = identityFor(assignment, event, trustedLifecycle, lifecycleRoleId);
   if (identity === null) return null;
   const assignmentId = text(
     assignment.assignmentId,
@@ -469,6 +478,10 @@ function revisionFrom(
     causalHeadRefOid,
     authorityEpochChanged,
     authorityEpochCutover: false,
+    ...(input.event.source.provider === "github" && input.event.payload.relation === "review_requested" &&
+      input.event.payload.reviewRequestEventId && Number.isFinite(Date.parse(input.event.payload.reviewReceivedAt))
+      ? { incomingReview: { eventId: input.event.payload.reviewRequestEventId,
+        receivedAt: new Date(input.event.payload.reviewReceivedAt).toISOString() } } : {}),
     disposition,
   };
 }
@@ -480,6 +493,7 @@ function bindingFrom(input, inputRevision) {
     assignmentDigest: input.assignmentDigest,
     eventId: input.event.eventId,
     inputRevision,
+    ...(input.trustedLifecycle ? { scopeLifecycle: true } : {}),
   };
 }
 
@@ -499,6 +513,35 @@ export function pullRequestWorkDescriptor(envelope) {
   return normalizedEnvelope(envelope);
 }
 
+export function pullRequestScopeLifecycleTargetRole(envelope) {
+  const input = normalizedEnvelope(envelope);
+  if (input === null || !input.trustedLifecycle) return null;
+  return trustedPrRoleForEvent(input.event)?.roleId ?? "pr-engineer";
+}
+
+export function pullRequestScopeLifecycleMatchesSource(source, envelope) {
+  if (source?.kind !== "pull_request" || source.scope.kind !== "automatic") return false;
+  const event = envelope.event;
+  if (source.identity.provider !== event.source?.provider ||
+      source.identity.scopeId !== event.source?.scopeId ||
+      source.identity.subjectId !== event.subject?.id ||
+      source.identity.repository !== event.subject?.repository ||
+      source.identity.pullRequestNumber !== event.subject?.number) return false;
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
+  if (input === null || !input.trustedLifecycle || input.workKey !== source.workKey) return false;
+  const observed = latestObservedInput(source).event;
+  if (observed.payload.relation !== input.event.payload.relation) return false;
+  if (source.identity.targetRoleId === "pr-engineer") return true;
+  // Specialist routes share the discovery lane, not the PR engineer work key.
+  // Bind that lane to its account and refs without trusting a changed Head.
+  const previousTarget = observed.payload.gitTarget;
+  const lifecycleTarget = input.event.payload.gitTarget;
+  return ["authored", "review_requested"].includes(observed.payload.relation) &&
+    previousTarget !== undefined && lifecycleTarget !== undefined &&
+    ["sourceAccountId", "baseRepository", "baseRefName", "headRepository", "headRefName"]
+      .every(key => typeof previousTarget[key] === "string" && previousTarget[key] === lifecycleTarget[key]);
+}
+
 export function createPullRequestWorkSource(envelope) {
   const input = normalizedEnvelope(envelope);
   if (input === null || input.trustedLifecycle) return null;
@@ -516,7 +559,7 @@ export function createPullRequestWorkSource(envelope) {
       scope: {
         kind: input.event.eventType === "pull_request.owner_requested"
           ? "owner_requested"
-          : "automatic",
+          : input.event.eventType === "pull_request.internal_review_requested" ? "internal_review" : "automatic",
         active: true,
         revision: 1,
         lastLifecycleEventId: null,
@@ -526,6 +569,8 @@ export function createPullRequestWorkSource(envelope) {
       pending: null,
       revisions: [revisionFrom(input, 1, 1, "accepted", null, false)],
       bindings: [bindingFrom(input, 1)],
+      decisionBudget: { headRefOid: input.headRefOid, activationRevision: 1,
+        previousActiveRevision: null, attemptOffset: 0 },
     },
   };
 }
@@ -575,8 +620,11 @@ function acceptedHeadChange(source, input, causalHeadRefOid) {
   const observed = latestObservedInput(source);
   const predecessor = causalHeadRefOid ?? observed.headRefOid;
   if (input.headRefOid === predecessor) return true;
+  if (headAncestrySourceMatches(source.headAncestryReceipt, source, input.event)) return true;
   return (
-    input.event.eventType === "pull_request.updated" &&
+    (input.event.eventType === "pull_request.updated" ||
+      (input.event.eventType === "pull_request.owner_requested" && source.scope.kind === "owner_requested" &&
+        input.event.source.provider === "local-owner" && input.event.source.scopeId === source.current.event.source.scopeId)) &&
     Array.isArray(input.event.payload.changedFields) &&
     input.event.payload.changedFields.includes("headRefOid") &&
     input.previousHeadRefOid === predecessor
@@ -591,6 +639,7 @@ export function appendPullRequestWorkSource(
     causalHeadRefOid,
     authorityEpochChanged = false,
     authorityFenceRecovery = false,
+    attemptAtActivation,
   } = {},
 ) {
   if (
@@ -604,7 +653,7 @@ export function appendPullRequestWorkSource(
     ? null
     : head(causalHeadRefOid, "causalHeadRefOid");
   const source = normalizePullRequestWorkSource(value);
-  const input = normalizedEnvelope(envelope);
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
   if (input === null || input.workKey !== source.workKey) {
     throw invalid("PR 来源工作键不一致");
   }
@@ -664,6 +713,8 @@ export function appendPullRequestWorkSource(
     input.headRefOid !== observed.headRefOid ||
     (causalHead !== null && input.headRefOid !== causalHead);
   const headProven = acceptedHeadChange(source, input, causalHead);
+  const ancestryReceipt = headAncestrySourceMatches(source.headAncestryReceipt, source, input.event)
+    ? source.headAncestryReceipt : null;
   const legacyDowngrade = gitTargetStateForEvent(input.event) === "legacy" &&
     [source.current, source.pending]
       .filter((pointer) => pointer !== null)
@@ -688,8 +739,7 @@ export function appendPullRequestWorkSource(
   const headRevision = accepted && executionAuthorityChanged
     ? source.headRevision + 1
     : source.headRevision;
-  return {
-    source: {
+  const nextSource = {
       ...source,
       inputRevision: revision,
       activeRevision: accepted && activate ? revision : source.activeRevision,
@@ -714,7 +764,16 @@ export function appendPullRequestWorkSource(
         ),
       ],
       bindings: [...source.bindings, bindingFrom(input, revision)],
-    },
+    };
+  if (accepted && ancestryReceipt !== null) {
+    nextSource.revisions.at(-1).headAncestryProof = ancestryReceipt;
+    delete nextSource.headAncestryReceipt;
+  }
+  const activatedSource = accepted && activate
+    ? applyPullRequestDecisionBudgetAtActivation(source, nextSource, attemptAtActivation)
+    : nextSource;
+  return {
+    source: activatedSource,
     changed: true,
     disposition,
     headAdvanced: accepted && executionAuthorityChanged,
@@ -722,20 +781,30 @@ export function appendPullRequestWorkSource(
   };
 }
 
-export function applyPullRequestScopeLifecycle(value, envelope) {
+function acceptedCreatedLifecycleJoin(source, eventId) {
+  const revision = source.revisions[source.activeRevision - 1];
+  const previousLifecycle = source.revisions.find(candidate => candidate.eventId === source.scope.lastLifecycleEventId);
+  return source.scope.active === false && source.current.eventId === eventId &&
+    source.current.event.eventType === "pull_request.created" &&
+    revision.disposition === "accepted" && revision.authorityEpochChanged === true &&
+    previousLifecycle !== undefined && revision.revision > previousLifecycle.revision;
+}
+
+export function applyPullRequestScopeLifecycle(value, envelope, { attemptAtActivation, activate = true } = {}) {
   const source = normalizePullRequestWorkSource(value);
-  const input = normalizedEnvelope(envelope);
+  const input = normalizedEnvelope(envelope, source.identity.targetRoleId);
   if (input === null || !input.trustedLifecycle) {
     throw invalid("PR 范围生命周期分派无效");
   }
-  if (input.workKey !== source.workKey) {
+  if (!pullRequestScopeLifecycleMatchesSource(source, envelope)) {
     throw invalid("PR 范围生命周期工作键不一致");
   }
-  const active = input.event.eventType === "pull_request.created";
+  const active = ["pull_request.created", "pull_request.role_handoff"].includes(input.event.eventType);
   const authorityChanged = source.scope.active !== active;
   const appended = appendPullRequestWorkSource(source, envelope, {
-    activate: true,
+    activate,
     authorityEpochChanged: authorityChanged,
+    attemptAtActivation,
   });
   if (!appended.changed) return appended;
   const appendedRevision = appended.source.revisions.at(-1);
@@ -746,7 +815,8 @@ export function applyPullRequestScopeLifecycle(value, envelope) {
     appended.disposition !== "accepted";
   const appliedAuthorityChange =
     authorityChanged &&
-    (appended.disposition === "accepted" || rejectedRevocation);
+    (appended.disposition === "accepted" || rejectedRevocation ||
+      (appended.disposition === "bound_existing_event" && acceptedCreatedLifecycleJoin(source, input.event.eventId)));
   const revisions = rejectedRevocation
     ? [
         ...appended.source.revisions.slice(0, -1),
@@ -790,6 +860,25 @@ function normalizeIdentity(value) {
 }
 
 function normalizeRevision(value, expectedRevision) {
+  let headAncestryProof;
+  if (Object.hasOwn(value, "headAncestryProof")) {
+    headAncestryProof = normalizeHeadAncestryReceipt(value.headAncestryProof);
+    const { headAncestryProof: omitted, ...revision } = value;
+    value = revision;
+    if (headAncestryEvent(headAncestryProof).eventId !== value.eventId ||
+        headAncestryEvent(headAncestryProof).contentDigest !== value.eventDigest ||
+        headAncestryProof.event.payload.headRefOid !== value.headRefOid ||
+        headAncestryProof.sourceInputRevision + 1 !== expectedRevision || value.disposition !== "accepted" ||
+        headAncestryProof.ancestorHeadRefOid !== value.causalHeadRefOid) throw invalid("PR ancestry revision binding is invalid");
+  }
+  let incomingReview;
+  if (Object.hasOwn(value, "incomingReview")) {
+    exact(value.incomingReview, ["eventId", "receivedAt"], "PR incoming Review");
+    incomingReview = { eventId: text(value.incomingReview.eventId, "incomingReview.eventId", 192),
+      receivedAt: timestamp(value.incomingReview.receivedAt, "incomingReview.receivedAt") };
+    const { incomingReview: omitted, ...revision } = value;
+    value = revision;
+  }
   const hasScopeRevocation = hasExactLedgerKeys(
     value,
     SCOPE_REVOCATION_REVISION_KEYS,
@@ -840,6 +929,8 @@ function normalizeRevision(value, expectedRevision) {
       ? value.authorityEpochCutover
       : undefined,
     ...(hasScopeRevocation ? { scopeRevocationApplied: true } : {}),
+    ...(incomingReview ? { incomingReview } : {}),
+    ...(headAncestryProof ? { headAncestryProof } : {}),
     disposition,
   };
 }
@@ -884,6 +975,9 @@ function validateRevisionEpochHistory(revisions, expectedHeadRevision) {
       }
       continue;
     }
+    if (revision.headAncestryProof !== undefined &&
+        (revision.headAncestryProof.ancestorHeadRefOid !== previousAcceptedHead ||
+         revision.headAncestryProof.authorityEpoch !== previousHeadRevision)) throw invalid("PR ancestry predecessor is invalid");
     if (revision.authorityEpochCutover) cutoverCount += 1;
     const expectedRevision = previousHeadRevision === 0
       ? 1
@@ -899,7 +993,7 @@ function validateRevisionEpochHistory(revisions, expectedHeadRevision) {
       (revision.authorityEpochChanged &&
         previousHeadRevision > 0 &&
         (revision.causalHeadRefOid === null ||
-          (revision.headRefOid !== revision.causalHeadRefOid &&
+          (revision.headAncestryProof === undefined && revision.headRefOid !== revision.causalHeadRefOid &&
             revision.previousHeadRefOid !== revision.causalHeadRefOid))) ||
       (!revision.authorityEpochChanged &&
         previousHeadRevision > 0 &&
@@ -934,7 +1028,10 @@ function applyLegacyAuthorityCutover(revisions) {
 }
 
 function normalizeBinding(value, revisionsByEvent, previousSequence) {
-  exact(value, BINDING_KEYS, "PR assignment binding");
+  const scopeLifecycle = hasExactLedgerKeys(value, SCOPE_LIFECYCLE_BINDING_KEYS);
+  if (scopeLifecycle) {
+    if (value.scopeLifecycle !== true) throw invalid("PR lifecycle binding 证明无效");
+  } else exact(value, BINDING_KEYS, "PR assignment binding");
   const sourceSequence = positiveInteger(
     value.sourceSequence,
     "binding.sourceSequence",
@@ -959,6 +1056,7 @@ function normalizeBinding(value, revisionsByEvent, previousSequence) {
     ),
     eventId,
     inputRevision,
+    ...(scopeLifecycle ? { scopeLifecycle: true } : {}),
   };
 }
 
@@ -996,6 +1094,9 @@ function normalizeEventPointer(
     current.occurredAt !== event.occurredAt ||
     current.headRefOid !== event.payload.headRefOid ||
     current.headRefOid !== revision.headRefOid
+    || (revision.incomingReview !== undefined &&
+      (revision.incomingReview.eventId !== event.payload.reviewRequestEventId ||
+       Date.parse(revision.incomingReview.receivedAt) !== Date.parse(event.payload.reviewReceivedAt)))
   ) {
     throw invalid("PR current input 绑定无效");
   }
@@ -1003,8 +1104,15 @@ function normalizeEventPointer(
 }
 
 export function normalizePullRequestWorkSource(value) {
+  let headAncestryReceipt;
+  if (Object.hasOwn(value, "headAncestryReceipt")) {
+    headAncestryReceipt = normalizeHeadAncestryReceipt(value.headAncestryReceipt);
+    const { headAncestryReceipt: omitted, ...source } = value;
+    value = source;
+  }
   const legacySource = hasExactLedgerKeys(value, LEGACY_SOURCE_KEYS);
-  if (!legacySource) exact(value, SOURCE_KEYS, "PR source");
+  const hasBudget = hasExactLedgerKeys(value, BUDGET_SOURCE_KEYS);
+  if (!legacySource && !hasBudget) exact(value, SOURCE_KEYS, "PR source");
   if (value.schemaVersion !== 1 || value.kind !== "pull_request") {
     throw invalid("PR source 版本或类型无效");
   }
@@ -1033,11 +1141,12 @@ export function normalizePullRequestWorkSource(value) {
     "pendingRevision",
   );
   const rawRevisions = plainArray(value.revisions, "revisions");
-  const hasIncompleteAuthorityHistory = rawRevisions.some(
-    (revision) => !hasExactLedgerKeys(revision, AUTHORITY_REVISION_KEYS) &&
-      !hasExactLedgerKeys(revision, REVISION_KEYS) &&
-      !hasExactLedgerKeys(revision, SCOPE_REVOCATION_REVISION_KEYS),
-  );
+  const hasIncompleteAuthorityHistory = rawRevisions.some((revision) => {
+    const { incomingReview, headAncestryProof, ...authority } = revision;
+    return !hasExactLedgerKeys(authority, AUTHORITY_REVISION_KEYS) &&
+      !hasExactLedgerKeys(authority, REVISION_KEYS) &&
+      !hasExactLedgerKeys(authority, SCOPE_REVOCATION_REVISION_KEYS);
+  });
   const revisions = rawRevisions.map(
     (revision, index) => normalizeRevision(revision, index + 1),
   );
@@ -1082,6 +1191,7 @@ export function normalizePullRequestWorkSource(value) {
   });
   if (
     bindings.length === 0 ||
+    (scope.kind !== "automatic" && bindings.some(binding => binding.scopeLifecycle === true)) ||
     new Set(bindings.map(({ assignmentId }) => assignmentId)).size !==
       bindings.length
   ) {
@@ -1100,6 +1210,7 @@ export function normalizePullRequestWorkSource(value) {
     pendingRevision,
     current: null,
     pending: null,
+    ...(headAncestryReceipt ? { headAncestryReceipt } : {}),
     revisions,
     bindings,
   };
@@ -1136,15 +1247,19 @@ export function normalizePullRequestWorkSource(value) {
   );
   const currentLifecycleMatches =
     scope.lastLifecycleEventId === source.current.eventId &&
-    ["pull_request.created", "pull_request.left_scope"].includes(
+    ["pull_request.created", "pull_request.left_scope", "pull_request.role_handoff"].includes(
       source.current.event.eventType,
     ) &&
     scope.active ===
-      (source.current.event.eventType === "pull_request.created");
+      (["pull_request.created", "pull_request.role_handoff"].includes(source.current.event.eventType));
   const historicalLifecycleMatches =
     lastLifecycleRevision?.disposition === "accepted" &&
     lastLifecycleRevision.authorityEpochChanged === true &&
     lastLifecycleRevision.revision < source.activeRevision;
+  const pendingAncestryLifecycleMatches = source.scope.active === true && source.pending !== null &&
+    source.pending.eventId === source.scope.lastLifecycleEventId && source.pending.event.eventType === "pull_request.created" &&
+    revisions.some(revision => revision.headAncestryProof !== undefined && revision.revision < source.pendingRevision &&
+      revision.headRefOid === source.pending.headRefOid);
   const rejectedRevocationMatches =
     scope.active === false &&
     lastLifecycleRevision?.scopeRevocationApplied === true &&
@@ -1153,6 +1268,7 @@ export function normalizePullRequestWorkSource(value) {
     scope.lastLifecycleEventId !== null &&
     !currentLifecycleMatches &&
     !historicalLifecycleMatches &&
+    !pendingAncestryLifecycleMatches &&
     !rejectedRevocationMatches
   ) {
     throw invalid("PR scope 生命周期绑定无效");
@@ -1172,13 +1288,166 @@ export function normalizePullRequestWorkSource(value) {
   ) {
     throw invalid("PR pending input 没有分派来源");
   }
+  if (hasBudget) source.decisionBudget = normalizePullRequestDecisionBudget(value.decisionBudget, source);
+  for (const receipt of [headAncestryReceipt, ...revisions.map(revision => revision.headAncestryProof)].filter(Boolean)) {
+    if (identity.targetRoleId !== "developer" || scope.kind !== "automatic" || receipt.sourceWorkKey !== source.workKey ||
+        receipt.rootItemId !== `work-item-${ledgerDigest({ kind: "source_root", workKey })}` ||
+        receipt.event.source.provider !== identity.provider || receipt.event.source.scopeId !== identity.scopeId ||
+        receipt.event.subject.repository !== identity.repository || receipt.event.subject.number !== identity.pullRequestNumber ||
+        !revisions.some(revision => revision.disposition === "accepted" && revision.inputDigest === receipt.sourceInputDigest &&
+          revision.headRefOid === receipt.ancestorHeadRefOid && revision.headRevision === receipt.authorityEpoch)) {
+      throw invalid("PR ancestry source identity is invalid");
+    }
+  }
   return source;
+}
+
+function normalizePullRequestDecisionBudget(value, source) {
+  exact(value, DECISION_BUDGET_KEYS, "PR decision budget");
+  const budget = { headRefOid: head(value.headRefOid, "decisionBudget.headRefOid"),
+    activationRevision: positiveInteger(value.activationRevision, "decisionBudget.activationRevision"),
+    previousActiveRevision: optionalPositiveInteger(value.previousActiveRevision, "decisionBudget.previousActiveRevision"),
+    attemptOffset: value.attemptOffset };
+  const activated = source.revisions[budget.activationRevision - 1];
+  const previous = budget.previousActiveRevision === null ? null : source.revisions[budget.previousActiveRevision - 1];
+  if (!Number.isSafeInteger(budget.attemptOffset) || budget.attemptOffset < 0 ||
+      budget.headRefOid !== source.current.headRefOid || budget.activationRevision > source.activeRevision ||
+      activated?.disposition !== "accepted" || activated.headRefOid !== budget.headRefOid ||
+      (previous === null ? budget.activationRevision !== 1 || budget.attemptOffset !== 0 :
+        previous?.disposition !== "accepted" || previous.revision >= budget.activationRevision || previous.headRefOid === budget.headRefOid)) {
+    throw invalid("PR decision budget activation 绑定无效");
+  }
+  return budget;
+}
+
+function applyPullRequestDecisionBudgetAtActivation(previousSource, nextSource, attemptAtActivation) {
+  if (previousSource.current.headRefOid === nextSource.current.headRefOid) return nextSource;
+  if (!Number.isSafeInteger(attemptAtActivation) || attemptAtActivation < 0) {
+    throw invalid("实际 PR Head 激活缺少可信领取计数");
+  }
+  return { ...nextSource, decisionBudget: {
+    headRefOid: nextSource.current.headRefOid,
+    activationRevision: nextSource.activeRevision,
+    previousActiveRevision: previousSource.activeRevision,
+    attemptOffset: attemptAtActivation,
+  } };
+}
+
+export function persistedPullRequestDecisionAttemptBudget(item) {
+  const budget = item?.source?.decisionBudget;
+  if (item?.kind !== "source_root" || item.source?.kind !== "pull_request" || !budget) return null;
+  return Object.freeze({ attempt: item.attempt - budget.attemptOffset, offset: budget.attemptOffset, decisionBudget: budget });
 }
 
 export function currentWorkItemEvent(item) {
   return item?.source?.kind === "pull_request"
     ? item.source.current.event
     : item?.event;
+}
+
+// Keep the lifetime claim counter intact; only a proven accepted Head change
+// opens a new decision budget. Metadata-only and authority updates do not.
+export function pullRequestDecisionAttemptBudget(item, timeline, { initialActiveRevision = null } = {}) {
+  const source = item?.source;
+  if (item?.kind !== "source_root" || source?.kind !== "pull_request" ||
+      !Array.isArray(timeline)) return null;
+  const headRefOid = source.current.headRefOid;
+  const accepted = source.revisions.filter((revision) =>
+    revision.disposition === "accepted" && revision.revision <= source.activeRevision);
+  if (!accepted.some(revision => revision.headRefOid !== headRefOid)) return null;
+  const ordered = timeline.filter((entry) => entry.itemId === item.itemId)
+    .toSorted((left, right) => left.sequence - right.sequence);
+  let actualActive = initialActiveRevision === null ? null :
+    accepted.find(revision => revision.revision === initialActiveRevision) ?? null;
+  if (initialActiveRevision !== null && actualActive === null) return null;
+  let activation = null;
+  let previous = null;
+  for (const entry of ordered) {
+    if (!["pr_source_created", "pr_source_revised", "pr_source_activated"].includes(entry.type) ||
+        entry.details?.workKey !== source.workKey) continue;
+    const activeRevision = entry.details.activeRevision ?? (entry.type === "pr_source_created" ? entry.details.inputRevision : null);
+    const active = accepted.find(revision => revision.revision === activeRevision &&
+      revision.headRefOid === (entry.details.currentHeadRefOid ?? entry.details.headRefOid) &&
+      revision.headRefOid === entry.details.headRefOid &&
+      (entry.details.headRevision === undefined || revision.headRevision === entry.details.headRevision));
+    if (!active) continue;
+    if (actualActive !== null && active.headRefOid !== actualActive.headRefOid) {
+      previous = actualActive;
+      activation = entry;
+    }
+    actualActive = active;
+  }
+  if (!activation || actualActive?.headRefOid !== headRefOid || !previous || previous.headRefOid === headRefOid) return null;
+  if (activation.details.previousActiveRevision !== undefined && activation.details.previousActiveRevision !== previous.revision) return null;
+  let offset = activation.details.decisionAttemptOffset;
+  if (offset === undefined) {
+    const priorClaim = ordered.findLast((entry) => entry.sequence < activation.sequence && entry.type === "claimed");
+    const claimSource = accepted.find((revision) => revision.inputDigest === priorClaim?.details?.inputDigest);
+    const intervening = ordered.filter((entry) => entry.sequence > priorClaim?.sequence && entry.sequence < activation.sequence);
+    // Legacy activations did not record the counter. Recover it only from a
+    // retained old-Head claim followed by side-effect-free wait bookkeeping.
+    if (!priorClaim || claimSource?.headRefOid !== previous.headRefOid ||
+        intervening.some((entry) => ![
+          "intent_staged", "intent_claimed", "intent_bound", "intent_acknowledged",
+          "condition_satisfied", "intent_superseded", "pr_source_revised",
+        ].includes(entry.type) ||
+          (entry.type === "intent_staged" && entry.details?.intentType !== "wait_condition") ||
+          (entry.type === "intent_acknowledged" && (entry.details?.outcome !== "delivered" ||
+            entry.details.nextStatus !== "waiting_condition")))) return null;
+    offset = priorClaim.details.attempt;
+  } else if (activation.details.previousHeadRefOid !== previous.headRefOid) return null;
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > item.attempt) return null;
+  const decisionBudget = { headRefOid, activationRevision: activation.details.activeRevision,
+    previousActiveRevision: previous.revision, attemptOffset: offset };
+  if (source.decisionBudget && !isDeepStrictEqual(source.decisionBudget, decisionBudget)) return null;
+  return Object.freeze({ attempt: item.attempt - offset, offset, activation, decisionBudget,
+    events: ordered.filter((entry) => entry.sequence > activation.sequence) });
+}
+
+export function sealLegacyPullRequestDecisionBudget(item, timeline) {
+  if (item.source?.decisionBudget) return item.source;
+  const proof = pullRequestDecisionAttemptBudget(item, timeline);
+  return proof === null ? item.source : { ...item.source, decisionBudget: proof.decisionBudget };
+}
+
+export function isPullRequestDecisionBudgetRecoveryCandidate(item) {
+  return item.kind === "source_root" && item.source?.kind === "pull_request" &&
+      item.source.decisionBudget === undefined &&
+      item.status === "blocked" && item.statusReason === "decision_attempts_exhausted" &&
+      item.activeIntentId === null && item.decisionContext === null && item.sourceQuarantine === null &&
+      item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+      item.source.pendingRevision === null && item.source.scope.active === true;
+}
+
+export function canRecoverPullRequestDecisionBudget(item, budget, maxAttempts) {
+  if (!budget || !Array.isArray(budget.events) || !budget.activation || budget.offset < 1 || budget.attempt >= maxAttempts ||
+      !isPullRequestDecisionBudgetRecoveryCandidate(item)) return false;
+  const latest = budget.events.findLast((entry) => entry.type !== "pr_source_revised");
+  if (latest?.type !== "transitioned" ||
+      latest.details?.fromStatus !== "working" || latest.details.toStatus !== "blocked" ||
+      latest.details.reason !== "decision_attempts_exhausted") return false;
+  const sourceTail = budget.events.filter((entry) => entry.sequence > latest.sequence);
+  if ((sourceTail.at(-1) ?? latest).at !== item.updatedAt || sourceTail.some((entry) =>
+    entry.type !== "pr_source_revised" || entry.details?.workKey !== item.source.workKey ||
+    !["accepted", "bound_existing_event"].includes(entry.details.disposition) ||
+    entry.details.pendingRevision !== null || entry.details.headRefOid !== item.source.current.headRefOid ||
+    !item.source.revisions.some((revision) => revision.disposition === "accepted" &&
+      revision.revision === entry.details.activeRevision && revision.revision <= item.source.activeRevision &&
+      revision.headRevision === entry.details.headRevision && revision.headRefOid === item.source.current.headRefOid)
+  ) || (sourceTail.length > 0 && sourceTail.at(-1).details.activeRevision !== item.source.activeRevision)) return false;
+  const claims = budget.events.filter((entry) => entry.type === "claimed");
+  if (claims.at(-1)?.details?.attempt !== item.attempt || claims.some((entry) =>
+    !item.source.revisions.some((revision) => revision.disposition === "accepted" &&
+      revision.revision <= item.source.activeRevision && revision.headRefOid === item.source.current.headRefOid &&
+      revision.inputDigest === entry.details?.inputDigest))) return false;
+  return budget.events.every((entry) =>
+    ["claimed", "retry_scheduled", "pr_source_revised"].includes(entry.type) ||
+    (entry.type === "transitioned" && (
+      (entry.details?.fromStatus === "working" && entry.details.toStatus === "blocked" &&
+        entry.details.reason === "decision_attempts_exhausted") ||
+      (entry.details?.fromStatus === "blocked" && entry.details.toStatus === "queued" &&
+        entry.details.reason === "pr_head_decision_budget_recovered")
+    )));
 }
 
 export function currentWorkItemInputBinding(item) {
@@ -1202,6 +1471,19 @@ export function currentWorkItemInputBinding(item) {
   return inherited === null || inherited === undefined
     ? null
     : Object.freeze(normalizePullRequestInputBinding(inherited));
+}
+
+// A retained result describes the input that originally produced it. Historical
+// identity can settle that result; it never grants execution on the current input.
+export function matchesHistoricalPullRequestInputBinding(item, binding) {
+  const source = item?.source;
+  if (source?.kind !== "pull_request" || binding?.kind !== "pull_request" || binding.rootItemId !== item.itemId ||
+      binding.workKey !== source.workKey || !Number.isSafeInteger(binding.inputRevision) || binding.inputRevision < 1 ||
+      binding.inputRevision >= source.activeRevision) return false;
+  const revision = source.revisions[binding.inputRevision - 1];
+  return revision?.disposition === "accepted" && revision.revision === binding.inputRevision &&
+    ["headRevision", "headRefOid", "eventId", "eventDigest", "inputDigest"].every(key => revision[key] === binding[key]) &&
+    source.bindings.some(entry => entry.inputRevision === binding.inputRevision && entry.eventId === binding.eventId);
 }
 
 export function currentWorkItemExecutionBinding(item) {
@@ -1250,6 +1532,21 @@ function samePullRequestSourceSubject(left, right) {
   );
 }
 
+export function pendingInternalReviewMatchesDiscovery(root, event) {
+  if (root?.source?.scope?.kind !== "internal_review" || root.source.scope.active !== true ||
+      root.sourceQuarantine !== null || root.source.pendingRevision !== null ||
+      ["completed", "cancelled", "superseded"].includes(root.status) ||
+      root.statusReason === "pr_source_cross_root_cutover_retired" ||
+      event?.source?.provider !== "github" || ["closed", "merged"].includes(event.payload.state) ||
+      root.source.identity.subjectId !== event.subject.id ||
+      root.source.identity.repository !== event.subject.repository ||
+      root.source.identity.pullRequestNumber !== event.subject.number) return false;
+  const current = root.source.current.event;
+  return current.eventType === "pull_request.internal_review_requested" &&
+    current.payload.gitTargetAvailable === true && event.payload.gitTargetAvailable === true &&
+    samePullRequestGitTarget(current.payload.gitTarget, event.payload.gitTarget);
+}
+
 function pointerForRevision(source, revision) {
   if (revision === source.activeRevision) return source.current;
   if (revision === source.pendingRevision) return source.pending;
@@ -1296,6 +1593,7 @@ function subjectSourceObservations(item) {
       return {
         item,
         source,
+        binding,
         sourceSequence: binding.sourceSequence,
         revision,
         pointer,
@@ -1305,7 +1603,24 @@ function subjectSourceObservations(item) {
   };
 }
 
-function evaluatePullRequestSubjectAuthority(state, root) {
+function samePullRequestLifecycleObservation(left, right) {
+  const leftMarked = left.binding.scopeLifecycle === true;
+  const rightMarked = right.binding.scopeLifecycle === true;
+  const trustedBindingProof = (leftMarked && rightMarked) ||
+    (leftMarked && !rightMarked && right.source.identity.targetRoleId === "pr-engineer") ||
+    (rightMarked && !leftMarked && left.source.identity.targetRoleId === "pr-engineer");
+  return left.source.scope.kind === "automatic" && right.source.scope.kind === "automatic" &&
+    trustedBindingProof &&
+    left.source.identity.targetRoleId !== right.source.identity.targetRoleId &&
+    ["provider", "scopeId", "subjectId", "repository", "pullRequestNumber"]
+      .every(key => left.source.identity[key] === right.source.identity[key]) &&
+    ["assignmentId", "assignmentDigest", "eventId"]
+      .every(key => left.binding[key] === right.binding[key]) &&
+    ["eventDigest", "occurredAt", "headRefOid", "previousHeadRefOid"]
+      .every(key => left.revision[key] === right.revision[key]);
+}
+
+function evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory = true, preserveInternalReview = true) {
   if (
     root?.source?.kind !== "pull_request" ||
     !Array.isArray(state?.items)
@@ -1318,16 +1633,13 @@ function evaluatePullRequestSubjectAuthority(state, root) {
   const observations = candidates
     .flatMap(({ observations: entries }) => entries)
     .sort((left, right) => left.sourceSequence - right.sourceSequence);
-  if (
-    observations.length === 0 ||
-    observations.some(
-      (observation, index) =>
-        index > 0 &&
-        observation.sourceSequence ===
-          observations[index - 1].sourceSequence,
-    )
-  ) {
-    return null;
+  if (observations.length === 0) return null;
+  const observationsBySequence = new Map();
+  for (const observation of observations) {
+    const sameSequence = observationsBySequence.get(observation.sourceSequence) ?? [];
+    if (sameSequence.some(previous => !samePullRequestLifecycleObservation(previous, observation))) return null;
+    sameSequence.push(observation);
+    observationsBySequence.set(observation.sourceSequence, sameSequence);
   }
   const markerRequired = candidates.some(({ source }) =>
     [source.current, source.pending]
@@ -1337,9 +1649,12 @@ function evaluatePullRequestSubjectAuthority(state, root) {
   let predecessor = null;
   let canonical = null;
   const validAuthorities = new Map();
-  const selectLatestValidAuthority = () => [...validAuthorities.values()]
-    .sort((left, right) => right.sourceSequence - left.sourceSequence)[0] ??
-    null;
+  const selectLatestValidAuthority = () => {
+    const ordered = [...validAuthorities.values()].sort((left, right) => right.sourceSequence - left.sourceSequence);
+    const latest = ordered[0] ?? null;
+    if (!preserveInternalReview || latest?.source.scope.kind !== "automatic") return latest;
+    return ordered.find(entry => pendingInternalReviewMatchesDiscovery(entry.item, latest.pointer.event)) ?? latest;
+  };
   let trustedOccurredAtWatermark = Number.NEGATIVE_INFINITY;
   let trustedEvent = null;
   let trustedObservation = null;
@@ -1359,13 +1674,36 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       validAuthorities.delete(observation.item.itemId);
       canonical = selectLatestValidAuthority();
       authorityFenced = canonical === null;
+      // Leaving scope revokes execution authority, not an already accepted
+      // causal bridge used by a later, independently active provenance.
+      if (
+        preserveInactiveHistory &&
+        !authorityNegative &&
+        observation.revision.disposition === "accepted" &&
+        observation.occurredAtMs >= trustedOccurredAtWatermark &&
+        (predecessor === null ||
+          observation.revision.headRefOid === predecessor.revision.headRefOid ||
+          observation.revision.previousHeadRefOid === predecessor.revision.headRefOid ||
+          observation.revision.headAncestryProof?.ancestorHeadRefOid === predecessor.revision.headRefOid)
+      ) {
+        predecessor = observation;
+        if (
+          observation.pointer !== null &&
+          (markerRequired ? gitTargetState === "available" : gitTargetState === "legacy")
+        ) {
+          trustedOccurredAtWatermark = Math.max(
+            trustedOccurredAtWatermark,
+            observation.occurredAtMs,
+          );
+        }
+      }
       continue;
     }
     if (authorityNegative) {
       const independentOwnerAuthority = [...validAuthorities.values()].some(
         (candidate) =>
           candidate.item.itemId !== observation.item.itemId &&
-          candidate.source.scope.kind === "owner_requested",
+          ["owner_requested", "internal_review"].includes(candidate.source.scope.kind),
       );
       if (independentOwnerAuthority) {
         validAuthorities.delete(observation.item.itemId);
@@ -1387,20 +1725,21 @@ function evaluatePullRequestSubjectAuthority(state, root) {
         observation.pointer.event,
       );
     if (
-      observation.source.scope.kind !== "owner_requested" &&
+      !["owner_requested", "internal_review"].includes(observation.source.scope.kind) &&
       observation.occurredAtMs < trustedOccurredAtWatermark &&
       !exactFenceRecovery
     ) {
       continue;
     }
     const ownerRequestedAnchor =
-      observation.source.scope.kind === "owner_requested" &&
-      observation.pointer?.event.eventType ===
-        "pull_request.owner_requested";
+      (observation.source.scope.kind === "owner_requested" &&
+       observation.pointer?.event.eventType === "pull_request.owner_requested") ||
+      (observation.source.scope.kind === "internal_review" &&
+       observation.pointer?.event.eventType === "pull_request.internal_review_requested");
     const causal = ownerRequestedAnchor || predecessor === null ||
       observation.revision.headRefOid === predecessor.revision.headRefOid ||
-      observation.revision.previousHeadRefOid ===
-        predecessor.revision.headRefOid;
+      observation.revision.previousHeadRefOid === predecessor.revision.headRefOid ||
+      observation.revision.headAncestryProof?.ancestorHeadRefOid === predecessor.revision.headRefOid;
     if (!causal) {
       validAuthorities.clear();
       canonical = null;
@@ -1436,9 +1775,11 @@ function evaluatePullRequestSubjectAuthority(state, root) {
       observation.pointer !== null &&
       targetAuthorityCurrent;
     if (executable) {
+      const retainInternalReview = preserveInternalReview && observation.source.scope.kind === "automatic" &&
+        pendingInternalReviewMatchesDiscovery(canonical?.item, observation.pointer.event);
       if (
         canonical !== null &&
-        canonical.item.itemId !== observation.item.itemId
+        canonical.item.itemId !== observation.item.itemId && !retainInternalReview
       ) {
         validAuthorities.clear();
       }
@@ -1455,9 +1796,9 @@ function evaluatePullRequestSubjectAuthority(state, root) {
   };
 }
 
-function canonicalPullRequestSourceRoot(state, root) {
+function canonicalPullRequestSourceRoot(state, root, preserveInactiveHistory = true, preserveInternalReview = true) {
   try {
-    return evaluatePullRequestSubjectAuthority(state, root)?.canonical?.item ??
+    return evaluatePullRequestSubjectAuthority(state, root, preserveInactiveHistory, preserveInternalReview)?.canonical?.item ??
       null;
   } catch {
     return null;
@@ -1489,7 +1830,7 @@ export function pullRequestTrustedPredecessorHead(state, root) {
   return pullRequestTrustedPredecessor(state, root)?.headRefOid ?? null;
 }
 
-export function pullRequestHeadAdmission(state, item) {
+function headAdmission(state, item, preserveInactiveHistory, canonicalRootFor = canonicalPullRequestSourceRoot) {
   const binding = currentWorkItemInputBinding(item);
   if (binding === null) {
     return Object.freeze({ applies: false, current: true, pending: false });
@@ -1504,7 +1845,7 @@ export function pullRequestHeadAdmission(state, item) {
   const currentEvent = root?.source?.kind === "pull_request"
     ? currentWorkItemEvent(root)
     : null;
-  const canonicalRoot = canonicalPullRequestSourceRoot(state, root);
+  const canonicalRoot = canonicalRootFor(state, root, preserveInactiveHistory);
   const crossRootCutoverPending = state.items.some(
     (candidate) =>
       samePullRequestSourceSubject(candidate, root) &&
@@ -1552,6 +1893,38 @@ export function pullRequestHeadAdmission(state, item) {
     headRevision: binding.headRevision,
     currentHeadRevision: current?.headRevision ?? null,
   });
+}
+
+export function pullRequestHeadAdmission(state, item) {
+  return headAdmission(state, item, true);
+}
+
+// Share subject evaluation only within one synchronous snapshot read. No cache
+// survives a ledger mutation, including changes to another root for the PR.
+export function pullRequestHeadAdmissions(state, items, { preserveInactiveHistory = true, preserveInternalReview = true } = {}) {
+  const canonicalRoots = new Map();
+  const canonicalRootFor = (snapshot, root, preserve) => {
+    if (root?.source?.kind !== "pull_request") return null;
+    const identity = root.source.identity;
+    const key = JSON.stringify([identity.subjectId, identity.repository, identity.pullRequestNumber]);
+    if (!canonicalRoots.has(key)) {
+      canonicalRoots.set(key, canonicalPullRequestSourceRoot(snapshot, root, preserve, preserveInternalReview));
+    }
+    return canonicalRoots.get(key);
+  };
+  return items.map(item => headAdmission(state, item, preserveInactiveHistory, canonicalRootFor));
+}
+
+// Only persisted schema 11/12 projection validation uses the former policies.
+// Execution and all newly persisted authority continue using the current one.
+export function pullRequestHeadAdmissionForSchema11Migration(state, item) {
+  return headAdmission(state, item, false, (snapshot, root, preserve) =>
+    canonicalPullRequestSourceRoot(snapshot, root, preserve, false));
+}
+
+export function pullRequestHeadAdmissionForSchema12Migration(state, item) {
+  return headAdmission(state, item, true, (snapshot, root, preserve) =>
+    canonicalPullRequestSourceRoot(snapshot, root, preserve, false));
 }
 
 export function verifyPullRequestExecutionBinding(state, value) {
@@ -1615,19 +1988,19 @@ export function verifyPullRequestExecutionBinding(state, value) {
   return Object.freeze(binding);
 }
 
-export function activatePendingPullRequestWorkSource(value) {
+export function activatePendingPullRequestWorkSource(value, { attemptAtActivation } = {}) {
   const source = normalizePullRequestWorkSource(value);
   if (source.pendingRevision === null) {
     return { source, changed: false };
   }
   return {
-    source: normalizePullRequestWorkSource({
+    source: normalizePullRequestWorkSource(applyPullRequestDecisionBudgetAtActivation(source, {
       ...source,
       activeRevision: source.pendingRevision,
       pendingRevision: null,
       current: source.pending,
       pending: null,
-    }),
+    }, attemptAtActivation)),
     changed: true,
   };
 }
@@ -1645,6 +2018,12 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
     return isDeepStrictEqual(previousScope, nextScope);
   }
   const advances = nextScope.revision - previousScope.revision;
+  if (advances === 1 && nextScope.active === true &&
+      acceptedCreatedLifecycleJoin(previousSource, nextScope.lastLifecycleEventId) &&
+      nextSource.authorityEpoch === previousSource.authorityEpoch &&
+      nextSource.bindings.slice(previousSource.bindings.length).some(binding =>
+        binding.scopeLifecycle === true && binding.eventId === nextScope.lastLifecycleEventId &&
+        binding.inputRevision === previousSource.activeRevision)) return true;
   const appendedRevisions = nextSource.revisions.slice(
     previousSource.revisions.length,
   );
@@ -1671,13 +2050,13 @@ function validPullRequestScopeTransition(previousSource, nextSource) {
     (nextSource.current.eventId === nextScope.lastLifecycleEventId ||
       lastLifecycleRevision?.scopeRevocationApplied === true) &&
     (lastLifecycleRevision?.scopeRevocationApplied === true ||
-      ["pull_request.created", "pull_request.left_scope"].includes(
+      ["pull_request.created", "pull_request.left_scope", "pull_request.role_handoff"].includes(
         nextSource.current.event.eventType,
       ))
   );
 }
 
-export function validatePullRequestSourceTransition(previousItems, nextItems) {
+export function validatePullRequestSourceTransition(previousItems, nextItems, previousTimeline = [], nextTimeline = []) {
   const nextById = new Map(nextItems.map((item) => [item.itemId, item]));
   for (const previous of previousItems) {
     if (previous.source?.kind !== "pull_request") continue;
@@ -1687,8 +2066,35 @@ export function validatePullRequestSourceTransition(previousItems, nextItems) {
     }
     const previousSource = normalizePullRequestWorkSource(previous.source);
     const nextSource = normalizePullRequestWorkSource(next.source);
+    const beforeBudget = previousSource.decisionBudget;
+    const afterBudget = nextSource.decisionBudget;
+    const headChanged = previousSource.current.headRefOid !== nextSource.current.headRefOid;
+    let validBudget = isDeepStrictEqual(beforeBudget, afterBudget);
+    if (headChanged) {
+      // One intake can activate a Head and then advance its metadata. The
+      // committed active pointer anchors the proof even after old timeline trim.
+      const proof = pullRequestDecisionAttemptBudget(next,
+        nextTimeline.filter(entry => entry.sequence > (previousTimeline.at(-1)?.sequence ?? 0)),
+        { initialActiveRevision: previousSource.activeRevision });
+      validBudget = afterBudget !== undefined &&
+        proof !== null && isDeepStrictEqual(afterBudget, proof.decisionBudget) &&
+        afterBudget.activationRevision > previousSource.activeRevision &&
+        afterBudget.activationRevision <= nextSource.activeRevision &&
+        afterBudget.previousActiveRevision === previousSource.activeRevision &&
+        afterBudget.attemptOffset === previous.attempt &&
+        nextSource.revisions.slice(afterBudget.activationRevision - 1, nextSource.activeRevision)
+          .every((revision) => revision.disposition !== "accepted" ||
+            revision.headRefOid === afterBudget.headRefOid);
+    } else if (beforeBudget === undefined && afterBudget !== undefined) {
+      const proof = pullRequestDecisionAttemptBudget(previous, previousTimeline);
+      validBudget = next.status === "working" && next.revision === previous.revision + 1 &&
+        next.attempt === previous.attempt + 1 && next.activeIntentId === null &&
+        ["queued", "retry_wait", "working"].includes(previous.status) && proof !== null &&
+        isDeepStrictEqual(afterBudget, proof.decisionBudget);
+    }
     if (
       previousSource.workKey !== nextSource.workKey ||
+      !validBudget ||
       nextSource.inputRevision < previousSource.inputRevision ||
       nextSource.activeRevision < previousSource.activeRevision ||
       nextSource.headRevision < previousSource.headRevision ||

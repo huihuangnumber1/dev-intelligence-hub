@@ -2,6 +2,7 @@ import {
   DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
   prioritize,
 } from "./prioritizer.js";
+import { isPersonalPullRequest } from './pr-responsibility.js';
 
 const DAY_MS = 86_400_000;
 
@@ -50,7 +51,8 @@ function automaticWorkEligible(item, issueCutoff) {
 
 export function buildDashboard(snapshot, previousSnapshot = null, options = {}) {
   const issueCutoff = issueActiveWindowCutoff(snapshot.refreshedAt, options);
-  const prioritized = prioritize(snapshot.items, snapshot.refreshedAt, options)
+  const personalItems = snapshot.items.filter(item => item.kind !== 'pull_request' || isPersonalPullRequest(item));
+  const prioritized = prioritize(personalItems, snapshot.refreshedAt, options)
     .map((item) => {
       const eligible = automaticWorkEligible(item, issueCutoff);
       return {
@@ -62,6 +64,8 @@ export function buildDashboard(snapshot, previousSnapshot = null, options = {}) 
     });
   const completedIds = new Set(snapshot.items.map((item) => item.id));
   const recentlyCompleted = (previousSnapshot?.items || [])
+    .filter(item => item.kind !== 'pull_request' || isPersonalPullRequest(item))
+    .filter(item => item.kind !== 'pull_request' || ['closed', 'merged'].includes(item.state?.toLowerCase()))
     .filter((item) => !completedIds.has(item.id))
     .slice(0, 8);
 
@@ -126,6 +130,7 @@ export function buildDashboard(snapshot, previousSnapshot = null, options = {}) 
           "mention",
           "todo",
           "conversation",
+          "mail",
         ].includes(item.kind),
       ),
       versions: newestVersionsFirst(snapshot.versions || []),

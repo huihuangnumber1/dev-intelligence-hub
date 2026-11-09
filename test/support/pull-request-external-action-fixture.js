@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { createChangePackage } from "../../src/domain/change-package-contract.js";
-import { createConflictCodeExecutionSource } from "../../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../../src/domain/code-execution-source.js";
 import { createConflictPreparationBinding } from "../../src/domain/conflict-preparation-binding.js";
 import { normalizeConfirmationPlan } from "../../src/domain/confirmation-contract.js";
 import {
@@ -50,6 +50,7 @@ export function pullRequestExternalActionBinding(overrides = {}) {
 
 export function externalActionControlledCommit(
   binding = pullRequestExternalActionBinding(),
+  { reviewRepair = false } = {},
 ) {
   const paths = ["src/conflicted.js"];
   const preparationBinding = createConflictPreparationBinding({
@@ -69,7 +70,7 @@ export function externalActionControlledCommit(
       materialization: "full-tree",
     },
   });
-  const source = createConflictCodeExecutionSource({
+  const source = reviewRepair ? createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src"] }) : createConflictCodeExecutionSource({
     inputBinding: binding,
     preparationBinding,
   });
@@ -128,7 +129,7 @@ export function externalActionControlledCommit(
       objectFormat: "sha1",
       oid: externalActionOid("6"),
       treeOid: finalTreeOid,
-      parents: [binding.gitTarget.headRefOid, binding.gitTarget.baseRefOid],
+      parents: reviewRepair ? [binding.gitTarget.headRefOid] : [binding.gitTarget.headRefOid, binding.gitTarget.baseRefOid],
       author: { ...identity },
       committer: { ...identity },
       messageDigest,

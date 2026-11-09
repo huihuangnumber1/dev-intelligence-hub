@@ -21,7 +21,7 @@ export function normalizeReviewHandoffHistory(value) {
       typeof person.login !== "string" || !GITHUB_LOGIN.test(person.login) ||
       typeof person.product !== "string" || !/^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/.test(person.product))) return null;
   if (selection.workType === "testing" && person === null) return null;
-  if (!["pending", "retrying", "completed"].includes(value.status) ||
+  if (!["pending", "retrying", "completed", "stale"].includes(value.status) ||
       !Number.isSafeInteger(value.attempts) || value.attempts < 0 ||
       typeof value.requestId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.requestId) ||
       typeof value.acceptedRequestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{6,127}$/.test(value.acceptedRequestId)) return null;
@@ -31,11 +31,13 @@ export function normalizeReviewHandoffHistory(value) {
     if (value.diagnosticCode !== null || [value.workItemId, value.roleId].some((id) =>
       typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/.test(id))) return null;
   } else if (value.workItemId !== null || value.roleId !== null) return null;
+  if (value.assignedLogin !== undefined && (value.status !== "completed" || !GITHUB_LOGIN.test(value.assignedLogin))) return null;
   return {
     selection: { workType: selection.workType, responsiblePerson: person === null ? null : { login: person.login, product: person.product } },
     requestId: value.requestId, acceptedRequestId: value.acceptedRequestId,
     status: value.status, attempts: value.attempts, diagnosticCode: value.diagnosticCode,
     workItemId: value.workItemId, roleId: value.roleId,
+    ...(value.assignedLogin ? { assignedLogin: value.assignedLogin } : {}),
   };
 }
 

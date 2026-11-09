@@ -8,7 +8,7 @@ import {
   updateCodeJobLifecycle,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   CodeJobChangePackageEventError,
@@ -78,6 +78,7 @@ function completedJob({
   inputBindingVersion = null,
   grantSchemaVersion = 2,
   conflictPaths = ["src/app.js"],
+  reviewRepair = false,
 } = {}) {
   const inputBinding = grantSchemaVersion === 3
     ? pullRequestInputBinding(2)
@@ -85,7 +86,8 @@ function completedJob({
     ? null
     : pullRequestInputBinding(inputBindingVersion);
   const executionSource = grantSchemaVersion === 3
-    ? conflictExecutionSource(inputBinding, conflictPaths)
+    ? reviewRepair ? createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: conflictPaths })
+      : conflictExecutionSource(inputBinding, conflictPaths)
     : null;
   const grant = createCodeJobGrant({
     ...(grantSchemaVersion === 3
@@ -328,6 +330,14 @@ test("schema v3 conflict jobs produce time-bound v3 events without changing ordi
   assert.equal(ordinaryEvent.schemaVersion, 1);
   assert.equal(Object.hasOwn(ordinaryEvent, "executionSource"), false);
   assert.deepEqual(normalizeCodeJobChangePackageEvent(conflictEvent), conflictEvent);
+});
+
+test("schema v3 review repair completion preserves the exact original PR source through restart recovery", () => {
+  const job = completedJob({ grantSchemaVersion: 3, reviewRepair: true });
+  const event = createCodeJobChangePackageEvent({ sequence: 1, previousDigest: null, job });
+  assert.equal(event.executionSource.kind, "review_repair");
+  assert.deepEqual(normalizeCodeJobChangePackageEvent(event), event);
+  assert.deepEqual(reconstructCodeJobChangePackageEventForRecovery({ sequence: 1, previousDigest: null, job }, { expectedEventDigest: event.eventDigest }), event);
 });
 
 test("legacy conflict events remain readable but recovery never retimes them", () => {

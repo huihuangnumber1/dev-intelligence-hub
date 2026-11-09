@@ -4,6 +4,7 @@ import test from "node:test";
 import { GitHubAdapter } from "../src/adapters/github-adapter.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { projectPullRequestReadFactsContext } from "../src/domain/pull-request-read-facts.js";
 
 const BASE_OID = "a".repeat(40);
 const HEAD_OID = "b".repeat(40);
@@ -59,11 +60,41 @@ function graphTargetResponse(overrides = {}) {
     url: "https://github.com/acme/repo/pull/42",
     baseRefName: "main",
     baseRefOid: BASE_OID,
+    baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: BASE_OID } },
     headRefName: "fix/conflict",
     headRefOid: HEAD_OID,
+    headRef: { name: "fix/conflict", repository: { nameWithOwner: "contributor/repo" }, target: { oid: HEAD_OID } },
     headRepository: { nameWithOwner: "contributor/repo" },
     ...overrides,
   };
+}
+
+function currentTargetResponse(target = viewTargetResponse()) {
+  const headRepository = target.headRepository?.nameWithOwner ||
+    `${target.headRepositoryOwner?.login}/${target.headRepository?.name}`;
+  return { data: { repository: { nameWithOwner: "acme/repo", pullRequest: {
+    ...graphTargetResponse(),
+    number: target.number,
+    url: target.url,
+    state: target.state,
+    author: { login: "author" },
+    changedFiles: 1,
+    baseRefName: target.baseRefName,
+    baseRefOid: target.baseRefOid,
+    baseRef: Object.hasOwn(target, "baseRef") ? target.baseRef : { name: target.baseRefName, repository: { nameWithOwner: "acme/repo" }, target: { oid: target.baseRefOid } },
+    headRefName: target.headRefName,
+    headRefOid: target.headRefOid,
+    headRepository: { nameWithOwner: headRepository },
+    headRef: Object.hasOwn(target, "headRef") ? target.headRef : { name: target.headRefName, repository: { nameWithOwner: `${target.headRepositoryOwner?.login}/${target.headRepository?.name}` }, target: { oid: target.headRefOid } },
+  } } } };
+}
+
+function isCurrentTargetCall(args) {
+  return args.some((value) => value.startsWith("query=") && value.includes("MyDashboardCurrentPullRequestTarget"));
+}
+
+function isFactsCall(args) {
+  return args.some((value) => value.startsWith("query=") && value.includes("MyDashboardPullRequestFacts("));
 }
 
 function viewTargetResponse(overrides = {}) {
@@ -206,7 +237,13 @@ function fakeRun({
   let accountReads = 0;
   const run = async (_command, args, options) => {
     calls.push({ args, options });
-    if (args[0] === "api" && args[1] === "graphql") return graph;
+    if (isCurrentTargetCall(args)) {
+      targetReads += 1;
+      const target = targetReads === 1 && initialTarget ? initialTarget :
+        targetReads === 2 && finalTarget ? finalTarget : viewTargetResponse();
+      return currentTargetResponse(target);
+    }
+    if (isFactsCall(args)) return graph;
     if (args[0] === "api") {
       accountReads += 1;
       return {
@@ -214,19 +251,12 @@ function fakeRun({
           accountReads === 2 && finalAccount ? finalAccount : "runtime-user",
       };
     }
-    if (args[0] === "pr" && args[1] === "view") {
-      targetReads += 1;
-      if (targetReads === 1 && initialTarget) return initialTarget;
-      return targetReads === 2 && finalTarget
-        ? finalTarget
-        : viewTargetResponse();
-    }
     throw new Error(`Unexpected command: ${args.join(" ")}`);
   };
   return { calls, run };
 }
 
-test("minimal CLI owner identity is accepted at both target reads", async () => {
+test("current Ref owner identity is accepted at both target reads", async () => {
   const owner = { login: "contributor" };
   const fake = fakeRun({
     initialTarget: viewTargetResponse({ headRepositoryOwner: owner }),
@@ -238,12 +268,12 @@ test("minimal CLI owner identity is accepted at both target reads", async () => 
 
   assert.equal(facts.reviewDecision, "CHANGES_REQUESTED");
   assert.equal(
-    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length,
     2,
   );
 });
 
-test("current gh CLI head repository identity is accepted at both target reads", async () => {
+test("current Ref repository identity is accepted at both target reads", async () => {
   const headRepository = {
     id: "R_kgDOExample",
     name: "repo",
@@ -259,12 +289,12 @@ test("current gh CLI head repository identity is accepted at both target reads",
 
   assert.equal(facts.reviewDecision, "CHANGES_REQUESTED");
   assert.equal(
-    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length,
     2,
   );
 });
 
-test("contradictory gh CLI head repository identity is rejected", async () => {
+test("contradictory current Ref repository identity is rejected", async () => {
   const fake = fakeRun({
     initialTarget: viewTargetResponse({
       headRepository: {
@@ -282,7 +312,7 @@ test("contradictory gh CLI head repository identity is rejected", async () => {
   );
   assert.equal(
     fake.calls.filter(
-      ({ args }) => args[0] === "api" && args[1] === "graphql",
+      ({ args }) => isFactsCall(args),
     ).length,
     0,
   );
@@ -315,7 +345,7 @@ test("the bounded GraphQL read returns detailed facts without changing summaries
   assert.equal(facts.observedAt, "2026-08-08T01:02:00.000Z");
   assert.equal(Object.isFrozen(facts), true);
 
-  const graphCall = fake.calls.find(({ args }) => args[1] === "graphql");
+  const graphCall = fake.calls.find(({ args }) => isFactsCall(args));
   assert.ok(graphCall.args.includes("commentCount=20"));
   assert.ok(graphCall.args.includes("reviewCount=20"));
   assert.ok(graphCall.args.includes("threadCount=20"));
@@ -331,7 +361,7 @@ test("the bounded GraphQL read returns detailed facts without changing summaries
   );
   assert.equal(graphCall.options.timeoutMs, 60_000);
   assert.equal(
-    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length,
     2,
   );
   assert.equal(
@@ -340,7 +370,69 @@ test("the bounded GraphQL read returns detailed facts without changing summaries
   );
 });
 
-test("insecure check links are omitted without discarding check facts", async () => {
+test("historical PR base scalars cannot replace the current base Ref in any facts read", async () => {
+  const liveBase = {
+    name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: BASE_OID },
+  };
+  const historicalTarget = viewTargetResponse({ baseRefOid: "d".repeat(40), baseRef: liveBase });
+  const fake = fakeRun({
+    initialTarget: historicalTarget,
+    finalTarget: historicalTarget,
+    graph: graphResponse({ baseRefOid: "d".repeat(40), baseRef: liveBase }),
+  });
+
+  const facts = await new GitHubAdapter({ run: fake.run }).loadPullRequestFacts(readRequest());
+
+  assert.equal(facts.reviewDecision, "CHANGES_REQUESTED");
+  assert.equal(fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length, 2);
+  assert.equal(fake.calls.filter(({ args }) => isFactsCall(args)).length, 1);
+  assert.equal(fake.calls.filter(({ args }) => args[0] === "pr").length, 0);
+});
+
+test("a live base that moved before the read fails before downloading detailed facts", async () => {
+  const fake = fakeRun({ initialTarget: viewTargetResponse({
+    baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "d".repeat(40) } },
+  }) });
+
+  await assert.rejects(new GitHubAdapter({ run: fake.run }).loadPullRequestFacts(readRequest()),
+    (error) => error.code === "PR_FACTS_STALE");
+  assert.equal(fake.calls.filter(({ args }) => isFactsCall(args)).length, 0);
+});
+
+test("deleted and invalid live Refs cannot fall back to historical scalars for facts", async (t) => {
+  const cases = [
+    ["deleted base", { baseRef: null }],
+    ["deleted head", { headRef: null }],
+    ["invalid base oid", { baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "not-a-commit" } } }],
+    ["wrong base repository", { baseRef: { name: "main", repository: { nameWithOwner: "other/repo" }, target: { oid: BASE_OID } } }],
+    ["head Ref and PR disagree", { headRef: { name: "fix/conflict", repository: { nameWithOwner: "contributor/repo" }, target: { oid: "d".repeat(40) } } }],
+  ];
+  for (const [name, overrides] of cases) {
+    await t.test(name, async () => {
+      const fake = fakeRun({ initialTarget: viewTargetResponse(overrides) });
+      await assert.rejects(new GitHubAdapter({ run: fake.run }).loadPullRequestFacts(readRequest()),
+        (error) => error.code === "GITHUB_PULL_REQUEST_FACTS_INVALID");
+      assert.equal(fake.calls.filter(({ args }) => isFactsCall(args)).length, 0);
+    });
+  }
+});
+
+test("invalid live Refs within detailed facts are rejected before final target validation", async (t) => {
+  for (const [name, overrides] of [
+    ["deleted base", { baseRef: null }],
+    ["deleted head", { headRef: null }],
+    ["invalid base oid", { baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "not-a-commit" } } }],
+  ]) {
+    await t.test(name, async () => {
+      const fake = fakeRun({ graph: graphResponse(overrides) });
+      await assert.rejects(new GitHubAdapter({ run: fake.run }).loadPullRequestFacts(readRequest()),
+        (error) => error.code === "GITHUB_PULL_REQUEST_FACTS_INVALID");
+      assert.equal(fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length, 1);
+    });
+  }
+});
+
+test("HTTP Jenkins links survive fact projection as data for the configured diagnostic reader", async () => {
   const graph = graphResponse({
     commits: {
       nodes: [
@@ -363,7 +455,7 @@ test("insecure check links are omitted without discarding check facts", async ()
   assert.equal(facts.checks.length, 1);
   assert.equal(facts.checks[0].name, "license");
   assert.equal(facts.checks[0].status, "PENDING");
-  assert.equal(facts.checks[0].url, "");
+  assert.equal(facts.checks[0].url, "http://ci.example.test/build/1");
 });
 
 test("unknown GitHub enums and nullable facts are explicit and fail-safe", async () => {
@@ -429,6 +521,37 @@ test("unknown GitHub enums and nullable facts are explicit and fail-safe", async
   assert.equal(facts.checks[0].requirement, "optional");
 });
 
+test("default reads retain long discussion bodies and prove unchanged material without enlarging model context", async () => {
+  const body = '原始评审说明'.repeat(2_400), reviewBody = 'r'.repeat(32_000);
+  const graph = graphResponse({ comments: page([comment({ body })]), reviews: page([review({ body: reviewBody })]) });
+  let now = '2026-08-08T01:02:00.000Z';
+  const adapter = new GitHubAdapter({ run: fakeRun({ graph }).run, clock: () => now });
+  const first = await adapter.loadPullRequestFacts(readRequest());
+  assert.equal(first.comments[0].body === body, true);
+  assert.equal(first.comments[0].bodyTruncated, false);
+  assert.equal(first.reviews[0].body === reviewBody, true);
+  assert.equal(first.reviews[0].bodyTruncated, false);
+  const original = projectPullRequestReadFactsContext(first);
+  assert.match(original.materialDigest, /^[a-f0-9]{64}$/);
+  assert.ok(Buffer.byteLength(JSON.stringify(original)) <= 64 * 1024);
+  now = '2026-08-08T01:03:00.000Z';
+  const refreshed = projectPullRequestReadFactsContext(await adapter.loadPullRequestFacts(readRequest()));
+  assert.notEqual(original.contentDigest, refreshed.contentDigest);
+  assert.equal(original.materialDigest, refreshed.materialDigest);
+  graph.data.repository.pullRequest.comments.nodes[0].body = body.slice(0, -1) + '改';
+  const changed = projectPullRequestReadFactsContext(await adapter.loadPullRequestFacts(readRequest()));
+  assert.deepEqual(changed.comments, refreshed.comments);
+  assert.notEqual(changed.materialDigest, refreshed.materialDigest, 'a hidden tail edit must invalidate the material proof');
+});
+
+test("bodies above the bounded source limit still disclose truncation and cannot prove complete material", async () => {
+  const graph = graphResponse({ comments: page([comment({ body: 'x'.repeat(70_000) })]) });
+  const facts = await new GitHubAdapter({ run: fakeRun({ graph }).run }).loadPullRequestFacts(readRequest());
+  assert.equal(facts.comments[0].bodyTruncated, true);
+  assert.ok(Buffer.byteLength(facts.comments[0].body) <= 64 * 1024);
+  assert.equal(Object.hasOwn(projectPullRequestReadFactsContext(facts), 'materialDigest'), false);
+});
+
 test("server pagination, body limits, and the total byte budget remain visible", async () => {
   const comments = Array.from({ length: 12 }, (_, index) =>
     comment({
@@ -473,7 +596,7 @@ test("a response exceeding its declared single-page limit is rejected", async ()
 
 test("facts returned for another atomic target are discarded before final validation", async () => {
   const fake = fakeRun({
-    graph: graphResponse({ baseRefOid: "d".repeat(40) }),
+    graph: graphResponse({ baseRef: { name: "main", repository: { nameWithOwner: "acme/repo" }, target: { oid: "d".repeat(40) } } }),
   });
   const adapter = new GitHubAdapter({ run: fake.run });
 
@@ -482,7 +605,7 @@ test("facts returned for another atomic target are discarded before final valida
     (error) => error.code === "PR_FACTS_STALE",
   );
   assert.equal(
-    fake.calls.filter(({ args }) => args[0] === "pr").length,
+    fake.calls.filter(({ args }) => isCurrentTargetCall(args)).length,
     1,
   );
 });
@@ -501,10 +624,21 @@ test("a terminal PR is rejected before the detailed facts read", async () => {
   );
   assert.equal(
     fake.calls.filter(
-      ({ args }) => args[0] === "api" && args[1] === "graphql",
+      ({ args }) => isFactsCall(args),
     ).length,
     0,
   );
+});
+
+test("closed and merged PRs remain terminal when their live Refs have been deleted", async (t) => {
+  for (const state of ["CLOSED", "MERGED"]) {
+    await t.test(state, async () => {
+      const fake = fakeRun({ initialTarget: viewTargetResponse({ state, baseRef: null, headRef: null }) });
+      await assert.rejects(new GitHubAdapter({ run: fake.run }).loadPullRequestFacts(readRequest()),
+        (error) => error.code === "PR_FACTS_TERMINAL" && error.terminalState === state);
+      assert.equal(fake.calls.filter(({ args }) => isFactsCall(args)).length, 0);
+    });
+  }
 });
 
 test("a PR that closes during the bounded read is reported as terminal", async () => {
@@ -521,7 +655,7 @@ test("a PR that closes during the bounded read is reported as terminal", async (
   );
   assert.equal(
     fake.calls.filter(
-      ({ args }) => args[0] === "api" && args[1] === "graphql",
+      ({ args }) => isFactsCall(args),
     ).length,
     1,
   );

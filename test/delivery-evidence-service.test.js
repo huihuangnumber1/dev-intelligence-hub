@@ -897,3 +897,28 @@ test("authority failures propagate and abort observed during exact read cannot b
   );
   assert.equal(packageSignal, packageController.signal);
 });
+
+
+test("adopted publication results require the persistent adoption verifier for catalog and acceptance", async () => {
+  const fixture = createFixture();
+  const { contentDigest: _oldDigest, ...old } = fixture.proposals.get("review-proposal-42");
+  const adopted = normalizeBoundWorkProposal({ ...old, payload: { ...old.payload,
+    publicationReuse: { candidateId: "review-publication-candidate-" + "a".repeat(64), materialDigest: "b".repeat(64), coverageDigest: "d".repeat(64) } } });
+  fixture.proposals.set(adopted.proposalId, adopted);
+  const result = reviewResult(adopted, 4);
+  fixture.results.clear(); fixture.results.set(result.resultId, result);
+  const evidence = { kind: "review-report", referenceId: result.resultId, contentDigest: result.contentDigest };
+  const request = verificationRequest(fixture.targets.review, "review", evidence);
+  assert.equal(await fixture.service.verify(request), false, "a succeeded result alone is not an adoption receipt");
+  assert.deepEqual(await fixture.service.listForTask(catalogRequest(fixture.targets.review, ["review-report"])), []);
+  const calls = [];
+  const service = new DeliveryEvidenceService({ ...fixture.ports, publicationAdoptionVerifier: {
+    async verifyProposal(input) { calls.push(input); return true; },
+  } });
+  assert.deepEqual(await service.verify(request), evidence);
+  assert.equal((await service.listForTask(catalogRequest(fixture.targets.review, ["review-report"]))).length, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].proposal.contentDigest, adopted.contentDigest);
+  assert.equal(calls[0].result.resultId, result.resultId);
+  assert.equal(calls[0].authority.contractDigest, fixture.targets.review.contractDigest);
+});

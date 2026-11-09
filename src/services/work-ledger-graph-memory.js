@@ -17,6 +17,9 @@ import {
   currentWorkItemEvent,
   currentWorkItemInputBinding,
   pullRequestHeadAdmission,
+  pullRequestHeadAdmissions,
+  pullRequestHeadAdmissionForSchema11Migration,
+  pullRequestHeadAdmissionForSchema12Migration,
 } from "./work-ledger-pr-source.js";
 import {
   cloneLedgerValue,
@@ -132,7 +135,10 @@ function safeText(value, maximumBytes, error) {
   return value;
 }
 
-function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
+function sourceAuthorityFor(state, item, {
+  forceNonCitable = false,
+  headAdmission = pullRequestHeadAdmission,
+} = {}) {
   const sourceBinding = currentWorkItemInputBinding(item);
   if (sourceBinding === null) return createWorkGraphSourceAuthority();
   const event = currentWorkItemEvent(item);
@@ -151,7 +157,7 @@ function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
       ...sourceBinding,
     });
   }
-  const admission = pullRequestHeadAdmission(state, item);
+  const admission = headAdmission(state, item);
   return createWorkGraphSourceAuthority({
     executionBinding,
     provenance: {
@@ -167,10 +173,19 @@ function sourceAuthorityFor(state, item, { forceNonCitable = false } = {}) {
 }
 
 export function workGraphMemoryAuthorityStateDigest(state) {
+  return authorityStateDigestForAdmission(state, pullRequestHeadAdmission);
+}
+
+function authorityStateDigestForAdmission(state, headAdmission) {
   const items = Array.isArray(state?.items) ? state.items : [];
+  const admissions = pullRequestHeadAdmissions(state, items, {
+    preserveInactiveHistory: headAdmission !== pullRequestHeadAdmissionForSchema11Migration,
+    preserveInternalReview: headAdmission === pullRequestHeadAdmission,
+  });
+  const admissionByItem = new Map(items.map((item, index) => [item, admissions[index]]));
   return ledgerDigest(
     items.flatMap((item) => {
-      const authority = sourceAuthorityFor(state, item);
+      const authority = sourceAuthorityFor(state, item, { headAdmission: (_state, candidate) => admissionByItem.get(candidate) });
       return authority.applies
         ? [{
             taskId: item.itemId,
@@ -564,18 +579,28 @@ export function migrateWorkGraphMemoryProjection(items, ledgerRevision, limits) 
   };
 }
 
+function batchedSourceAuthorityReader(state) {
+  const admissions = pullRequestHeadAdmissions(state, state.items);
+  const admissionByItem = new Map(state.items.map((item, index) => [item, admissions[index]]));
+  return item => sourceAuthorityFor(state, item, {
+    headAdmission: (_state, candidate) => admissionByItem.get(candidate),
+  });
+}
+
 function authorityInvalidations(previousState, candidateState) {
+  const previousAuthorityFor = batchedSourceAuthorityReader(previousState);
+  const candidateAuthorityFor = batchedSourceAuthorityReader(candidateState);
   const candidateById = new Map(
     candidateState.items.map((item) => [item.itemId, item]),
   );
   const result = [];
   for (const item of previousState.items) {
-    const previousAuthority = sourceAuthorityFor(previousState, item);
+    const previousAuthority = previousAuthorityFor(item);
     if (!previousAuthority.applies) continue;
     const candidate = candidateById.get(item.itemId);
     const nextAuthority = candidate === undefined
       ? null
-      : sourceAuthorityFor(candidateState, candidate);
+      : candidateAuthorityFor(candidate);
     const bindingChanged =
       nextAuthority === null ||
       nextAuthority.bindingDigest !== previousAuthority.bindingDigest;
@@ -779,13 +804,15 @@ export function reconcileMigratedWorkGraphMemoryAuthority(
   };
 }
 
-export function normalizeWorkGraphMemoryProjection(
+function normalizeProjection(
   suppliedValue,
   stateRevision,
   items,
   limits,
+  headAdmission,
 ) {
   const error = corrupted();
+  const expectedAuthorityStateDigest = authorityStateDigestForAdmission({ items }, headAdmission);
   const migratingAuthority = hasExactLedgerKeys(
     suppliedValue,
     PRE_AUTHORITY_PROJECTION_KEYS,
@@ -793,7 +820,7 @@ export function normalizeWorkGraphMemoryProjection(
   let value = migratingAuthority
     ? {
         ...cloneLedgerValue(suppliedValue),
-        authorityStateDigest: workGraphMemoryAuthorityStateDigest({ items }),
+        authorityStateDigest: expectedAuthorityStateDigest,
       }
     : suppliedValue;
   const prAuthorityItem = items.find(
@@ -802,7 +829,7 @@ export function normalizeWorkGraphMemoryProjection(
   if (migratingAuthority && prAuthorityItem !== undefined) {
     const migrationAllowance = Math.max(
       1,
-      items.filter((item) => sourceAuthorityFor({ items }, item).applies).length,
+      items.filter((item) => currentWorkItemInputBinding(item) !== null).length,
     );
     value = eventForAuthorityObservation({
       projection: value,
@@ -819,7 +846,7 @@ export function normalizeWorkGraphMemoryProjection(
     });
     value = {
       ...value,
-      authorityStateDigest: workGraphMemoryAuthorityStateDigest({ items }),
+      authorityStateDigest: expectedAuthorityStateDigest,
     };
   }
   if (!hasExactLedgerKeys(value, PROJECTION_KEYS)) throw error;
@@ -858,7 +885,7 @@ export function normalizeWorkGraphMemoryProjection(
     (cursor === 0) !== (checkpointDigest === null) ||
     (cursor === 0) !== (lastAcknowledgement === null) ||
     sourceHistoryDigest !== workGraphMemorySourceHistoryDigest(items) ||
-    authorityStateDigest !== workGraphMemoryAuthorityStateDigest({ items }) ||
+    authorityStateDigest !== expectedAuthorityStateDigest ||
     (lastAcknowledgement !== null &&
       (lastAcknowledgement.event.sequence !== cursor ||
         lastAcknowledgement.event.eventDigest !== checkpointDigest))
@@ -902,10 +929,12 @@ export function normalizeWorkGraphMemoryProjection(
   const itemById = new Map(items.map((item) => [item.itemId, item]));
   const migrationAllowance = Math.max(
     1,
-    items.filter((item) => sourceAuthorityFor({ items }, item).applies).length,
+    items.filter((item) => currentWorkItemInputBinding(item) !== null).length,
   );
+  const policyObservationAllowance = headAdmission === pullRequestHeadAdmission &&
+    pending.at(-1)?.kind === "authority_observed" ? 1 : 0;
   if (
-    pending.length > limits.graphMemoryOutboxLimit + migrationAllowance
+    pending.length > limits.graphMemoryOutboxLimit + migrationAllowance + policyObservationAllowance
   ) {
     throw error;
   }
@@ -930,6 +959,39 @@ export function normalizeWorkGraphMemoryProjection(
     lastAcknowledgement,
     pending,
   };
+}
+
+export function normalizeWorkGraphMemoryProjection(value, stateRevision, items, limits) {
+  return normalizeProjection(value, stateRevision, items, limits, pullRequestHeadAdmission);
+}
+
+export function migrateSchema11WorkGraphMemoryAuthority(value, state, limits) {
+  return migratePreviousWorkGraphMemoryAuthority(value, state, limits, pullRequestHeadAdmissionForSchema11Migration);
+}
+
+export function migrateSchema12WorkGraphMemoryAuthority(value, state, limits) {
+  return migratePreviousWorkGraphMemoryAuthority(value, state, limits, pullRequestHeadAdmissionForSchema12Migration);
+}
+
+function migratePreviousWorkGraphMemoryAuthority(value, state, limits, previousAdmission) {
+  try {
+    return normalizeWorkGraphMemoryProjection(value, state.revision, state.items, limits);
+  } catch {
+    // A policy change is eligible only after every old projection invariant,
+    // including its sealed high watermark and event chain, has been verified.
+    const previous = normalizeProjection(value, state.revision, state.items, limits,
+      previousAdmission);
+    return normalizeWorkGraphMemoryProjection(
+      reconcileMigratedWorkGraphMemoryAuthority(previous, state, {
+        ...limits,
+        // A previous authority-migration tail can already occupy its complete
+        // allowance. Reserve one additional sealed policy-baseline observation.
+        graphMemoryOutboxLimit: Math.min(MAX_WORK_GRAPH_MEMORY_EVENTS,
+          limits.graphMemoryOutboxLimit + 1),
+      }),
+      state.revision, state.items, limits,
+    );
+  }
 }
 
 export function normalizeWorkGraphMemoryBatchOptions(value = {}) {

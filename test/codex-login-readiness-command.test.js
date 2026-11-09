@@ -125,6 +125,7 @@ test("readiness command rejects malformed, oversized, redirected, and secret-bea
     { body: "null" },
     { body: "[]" },
     { body: exact.replace("{", `{"private":"${privateCanary}",`) },
+    { body: exact.replace("{", `{"credentialMode":"${privateCanary}",`) },
     { body: exact.replace('"schemaVersion":1', '"schemaVersion":2') },
     { body: exact.replace('"available"', '"unknown"') },
     { body: exact.replace('"cliAvailable":true', '"cliAvailable":false') },
@@ -150,6 +151,23 @@ test("readiness command rejects malformed, oversized, redirected, and secret-bea
     assert.equal(`${result.stdout}${result.stderr}`.includes(privateCanary), false);
   }
   assert.equal(requests, cases.length);
+});
+
+test("readiness command accepts the sanitized native login route", async (t) => {
+  const origin = await listen(t, (_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      schemaVersion: 1,
+      state: "available",
+      cliAvailable: true,
+      fileLoginAvailable: true,
+      credentialMode: "codex-native-login",
+    }));
+  });
+  const result = await runReadiness(["--origin", origin]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "CODEX_LOGIN_READINESS_OK state=available\n");
+  assert.equal(result.stderr, "");
 });
 
 test("readiness command accepts no authority-bearing origin or extra option", async () => {

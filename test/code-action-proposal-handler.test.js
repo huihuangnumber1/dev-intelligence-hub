@@ -17,6 +17,7 @@ import {
   createCodeActionProposalRunnerService,
 } from "../src/services/code-action-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
+import { CodeJobGrantFactory } from "../src/services/code-job-grant-factory.js";
 
 const CREATED_AT = "2026-08-02T03:00:01.000Z";
 const HEAD_REF_OID = "1".repeat(40);
@@ -115,8 +116,8 @@ function grantFor(value = proposal()) {
     evidence: value.payload.evidence,
     summary: value.payload.summary,
     reason: value.payload.reason,
-    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
-    writablePaths: ["src"],
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[value.payload.operation]],
+    writablePaths: value.payload.operation === "modify" ? ["src"] : [],
     requiredProfiles: [
       { id: "node-tests", configDigest: "b".repeat(64) },
     ],
@@ -306,6 +307,59 @@ function handler(producer, reader, grant = grantFor(), overrides = {}) {
   };
 }
 
+for (const changedCreation of ['unavailable', 'different-current-grant']) test(`an approved handoff follows its original job when new creation is ${changedCreation}`, async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  let changed = false, creates = 0, verifies = 0;
+  const instance = handler(producer, reader, grant, { grantFactory: {
+    async create() {
+      creates++;
+      if (changed && changedCreation === 'unavailable') throw Object.assign(new Error('creation no longer matches'), { code: 'INVALID_CODE_JOB_AUTHORITY' });
+      const { grantDigest, ...input } = grant;
+      return authority(changed ? createCodeJobGrant({ ...input, brainDigest: '8'.repeat(64) }) : grant).factory.create(proposal());
+    },
+    async verify(value) { verifies++; assert.deepEqual(value, grant); return structuredClone(value); },
+  } });
+  const first = await instance.value.handle(handlerInput());
+  changed = true;
+  const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(next.status, 'running');
+  assert.equal(creates, 1, 'polling an approved job does not create another grant');
+  assert.equal(verifies, 0, 'observation does not reauthorize an already handed-off job');
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+});
+
+for (const code of ['INVALID_CODE_JOB_AUTHORITY', 'CONTROLLED_GIT_TIMEOUT']) test(`an approved handoff follows executor state despite observer verification error ${code}`, async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant, { grantFactory: { ...authority(grant).factory,
+    async verify() { throw Object.assign(new Error('verification unavailable or revoked'), { code }); } } });
+  const first = await instance.value.handle(handlerInput()), reads = reader.getCalls.length;
+  const next = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(next.status, 'running');
+  assert.equal(reader.getCalls.length, reads + 1);
+  reader.value = queuedJob(grant, {
+    status: 'fenced', revision: 5,
+    terminalResult: { kind: 'fenced', recordedAt: CREATED_AT },
+    memoryProjection: { recordId: `memory-${'d'.repeat(64)}`, projectedAt: CREATED_AT },
+  });
+  const fenced = await instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef }));
+  assert.equal(fenced.status, 'unknown');
+  assert.ok(fenced.evidence.includes('code-job-status:fenced'));
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+});
+
+for (const variant of ['changed-sealed-grant', 'changed-job-grant', 'forged-receipt']) test(`approved grant continuation rejects ${variant}`, async () => {
+  const grant = grantFor(), producer = new FakeConfirmationProducer('completed'), reader = new FakeCodeJobReader(queuedJob(grant));
+  const instance = handler(producer, reader, grant);
+  const first = await instance.value.handle(handlerInput());
+  if (variant === 'forged-receipt') producer.overrides = { receipt: { id: `code-job-${'7'.repeat(55)}`, createdAt: CREATED_AT } };
+  if (variant === 'changed-sealed-grant') producer.plan.action.grant.brainDigest = '7'.repeat(64);
+  if (variant === 'changed-job-grant') reader.value.brainDigest = '7'.repeat(64);
+  await assert.rejects(instance.value.handle(handlerInput({ status: 'running', downstreamRef: first.downstreamRef })));
+  assert.equal(producer.enqueueCalls.length, 1);
+});
+
 test("a proposal is enqueued once and waits on the exact code confirmation", async () => {
   const grant = grantFor();
   const producer = new FakeConfirmationProducer();
@@ -407,6 +461,36 @@ test("a terminal code job waits for verified memory before completing its propos
     "code-job-status:completed",
     `memory:memory-${"d".repeat(64)}`,
   ]);
+});
+
+test("failed verification retains its safe outcome when the proposal settles", async (t) => {
+  const labels = {
+    CODE_JOB_VERIFICATION_FAILED: "本地验证未通过；请查看测试记录，尚不能认定为产品代码缺陷",
+    CODE_JOB_VERIFICATION_TIMEOUT: "本地验证超时；请检查测试耗时和执行环境",
+    CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE: "本地验证环境不可用；请检查执行器及依赖",
+    CODE_JOB_VERIFICATION_UNKNOWN: "本地验证结果无法判断；请查看执行记录",
+  };
+  for (const [code, summary] of Object.entries(labels)) {
+    await t.test(code, async () => {
+      const { contentDigest: _digest, ...base } = proposal();
+      const value = normalizeBoundWorkProposal({ ...base, payload: { ...base.payload, operation: "verify" } });
+      const grant = grantFor(value);
+      const producer = new FakeConfirmationProducer();
+      const reader = new FakeCodeJobReader(queuedJob(grant));
+      const instance = handler(producer, reader, grant);
+      const waiting = await instance.value.handle(handlerInput({ proposal: value }));
+      producer.status = "completed";
+      reader.value = queuedJob(grant, {
+        status: "failed", revision: 5, verificationOutcome: code,
+        terminalResult: { kind: "failed", recordedAt: CREATED_AT },
+        memoryProjection: { recordId: `memory-${"d".repeat(64)}`, projectedAt: CREATED_AT },
+      });
+      const result = await instance.value.handle(handlerInput({ proposal: value, status: "running", downstreamRef: waiting.downstreamRef }));
+      assert.equal(result.status, "failed");
+      assert.equal(result.summary, summary);
+      assert.ok(result.evidence.includes(`verification-outcome:${code}`));
+    });
+  }
 });
 
 test("a cancelling job stays active and a projected cancellation becomes rejected", async () => {
@@ -780,7 +864,7 @@ test("a lost proposal advance still finds and revokes its stable confirmation sl
   assert.equal(reader.getCalls.length, 0);
 });
 
-test("an already completed old confirmation is isolated without claiming revocation", async () => {
+test("an already completed handoff follows the original job without a grant verification port", async () => {
   const firstGrant = grantFor();
   const { grantDigest: _grantDigest, ...firstGrantContent } = firstGrant;
   const secondGrant = createCodeJobGrant({
@@ -812,11 +896,9 @@ test("an already completed old confirmation is isolated without claiming revocat
     }),
   );
 
-  assert.equal(transition.status, "stale");
-  assert.match(transition.summary, /隔离/);
-  assert.doesNotMatch(transition.summary, /已撤销/);
+  assert.equal(transition.status, "running");
   assert.equal(producer.invalidateCalls.length, 0);
-  assert.equal(reader.getCalls.length, 0);
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(firstGrant)]);
 });
 
 test("rejected, stale, and failed confirmations never start a code job", async (t) => {
@@ -907,7 +989,7 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     },
     {
       confirmation: {},
-      job: queuedJob(grant, { updatedAt: "2026-08-02T03:00:02.000Z" }),
+      job: queuedJob(grant, { updatedAt: "2026-08-02T02:59:59.000Z" }),
     },
     {
       confirmation: {},
@@ -934,7 +1016,7 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
     { confirmation: {}, job: null },
   ];
 
-  for (const { confirmation, job } of cases) {
+  for (const [index, { confirmation, job }] of cases.entries()) {
     const producer = new FakeConfirmationProducer("completed", confirmation);
     const reader = new FakeCodeJobReader(job);
     const instance = handler(producer, reader, grant);
@@ -945,8 +1027,22 @@ test("receipt, confirmation, and job binding mismatches fail closed", async () =
           "INVALID_CODE_ACTION_CONFIRMATION",
           "INVALID_CODE_JOB_RESULT",
         ].includes(error?.code),
+      `binding mismatch case ${index + 1}`,
     );
   }
+});
+
+test("resumed queued jobs retain receipt authority when their update timestamp advances", async () => {
+  const grant = grantFor();
+  const producer = new FakeConfirmationProducer("completed");
+  const reader = new FakeCodeJobReader(queuedJob(grant, {
+    revision: 3,
+    updatedAt: "2026-08-02T03:00:02.000Z",
+  }));
+  const instance = handler(producer, reader, grant);
+  const transition = await instance.value.handle(handlerInput());
+  assert.equal(transition.status, "running");
+  assert.deepEqual(reader.getCalls, [codeJobIdForGrant(grant)]);
 });
 
 test("runner factory stays disabled by default and rejects incomplete authority", () => {
@@ -983,7 +1079,121 @@ class Guard {
   async close() {}
 }
 
-test("the real proposal runner stops at running while the local job is queued", async () => {
+test("temporary real grant verification failures retry without making the proposal or pending confirmation stale", async (t) => {
+  const value = proposal();
+  const store = new MemoryStore();
+  let now = Date.parse("2026-08-02T03:00:00.000Z");
+  let unavailableCode = "WORK_LEDGER_NOT_READY";
+  const grantFactory = new CodeJobGrantFactory({
+    executorAuthority: {
+      workspaces: [{
+        id: "acme-workspace",
+        capabilities: ["git_head_snapshot"],
+        writablePaths: ["src"],
+        requiredProfiles: [{ id: "node-tests", configDigest: "b".repeat(64) }],
+        authorityDigest: "9".repeat(64),
+      }],
+    },
+    policyVersion: 7,
+    workspaceByRepository: { "acme/repo": "acme-workspace" },
+    codeActionRoles: ["developer"],
+    codeOperationsByRole: { developer: ["modify"] },
+    taskBrainByRole: {
+      developer: {
+        provider: "ollama", model: "qwen3.5:9b",
+        remoteData: { requirements: false, code: false, memory: false },
+      },
+    },
+    brainProviders: { ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11434" } },
+    inputAuthorityVerifier: {
+      async verify(binding) {
+        if (unavailableCode !== null) {
+          throw Object.assign(new Error("authority verification is temporarily unavailable"), { code: unavailableCode });
+        }
+        return structuredClone(binding);
+      },
+    },
+  });
+  const runtime = await createWorkProposalRuntime({
+    store,
+    clock: () => new Date(now),
+    idFactory: () => "code-proposal-operational-lease",
+    runnerScopes: [{
+      runnerId: "code-runner",
+      allowedKinds: ["code_action_proposal"],
+      allowedRoleIds: ["developer"],
+    }],
+    createGuard: () => new Guard(),
+  });
+  t.after(() => runtime.close());
+  const producer = new FakeConfirmationProducer();
+  producer.get = async (id) => {
+    producer.getCalls.push(id);
+    if (producer.plan === null) {
+      throw Object.assign(new Error("confirmation not created"), { code: "CONFIRMATION_NOT_FOUND" });
+    }
+    return confirmationItem(producer.plan, producer.status, producer.overrides);
+  };
+  const reader = new FakeCodeJobReader(null);
+  const service = createCodeActionProposalRunnerService({
+    enabled: true,
+    runner: runtime.runners["code-runner"],
+    confirmationProducer: producer,
+    codeJobReader: reader,
+    grantFactory,
+    clock: () => new Date(now),
+    pollIntervalMs: 1_000,
+    leaseDurationMs: 30_000,
+  });
+  const { contentDigest: _contentDigest, ...input } = value;
+  await runtime.producer.create(input);
+
+  const failed = await service.runCycle({ limit: 1 });
+  assert.equal(failed.outcomes[0].status, "waiting_retry");
+  assert.equal(store.value.proposals[0].lastError.reason, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  assert.equal(store.value.proposals[0].nextAttemptAt, "2026-08-02T03:00:30.000Z");
+  assert.equal(store.value.proposals[0].downstreamRef, null);
+  assert.equal(store.value.results.length, 0);
+  assert.equal(producer.enqueueCalls.length, 0);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+
+  unavailableCode = null;
+  now += 30_000;
+  await service.runCycle({ limit: 1 });
+  const confirmationId = codeJobConfirmationIdForProposal(value);
+  assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.plan.id, confirmationId);
+  assert.equal(producer.enqueueCalls.length, 1);
+
+  unavailableCode = "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE";
+  now += 1_000;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "waiting_retry");
+  assert.equal(store.value.proposals[0].lastError.reason, "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.status, "pending");
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(store.value.results.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+
+  const retryAt = Date.parse(store.value.proposals[0].nextAttemptAt);
+  now = retryAt - 1;
+  assert.equal((await service.runCycle({ limit: 1 })).claimed, 0);
+  unavailableCode = null;
+  now = retryAt;
+  await service.runCycle({ limit: 1 });
+  assert.equal(store.value.proposals[0].status, "waiting_confirmation");
+  assert.equal(store.value.proposals[0].downstreamRef, confirmationId);
+  assert.equal(producer.enqueueCalls.length, 1);
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(store.value.results.length, 0);
+  assert.deepEqual(reader.getCalls, []);
+});
+
+test("the real proposal runner continues the approved original grant when creation rules change", async () => {
   const value = proposal();
   const grant = grantFor(value);
   const store = new MemoryStore();
@@ -1004,6 +1214,14 @@ test("the real proposal runner stops at running while the local job is queued", 
   const producer = new FakeConfirmationProducer();
   const reader = new FakeCodeJobReader(queuedJob(grant));
   const trusted = authority(grant);
+  let verifies = 0;
+  let creationChanged = false;
+  const create = trusted.factory.create;
+  trusted.factory.create = async value => {
+    if (creationChanged) throw Object.assign(new Error('new creation is unavailable'), { code: 'INVALID_CODE_JOB_AUTHORITY' });
+    return create(value);
+  };
+  trusted.factory.verify = async value => { verifies++; assert.deepEqual(value, grant); return value; };
   const service = createCodeActionProposalRunnerService({
     enabled: true,
     runner: runtime.runners["code-runner"],
@@ -1022,6 +1240,7 @@ test("the real proposal runner stops at running while the local job is queued", 
   assert.equal(store.value.results.length, 0);
 
   producer.status = "completed";
+  creationChanged = true;
   now += 1_000;
   await service.runCycle({ limit: 1 });
   assert.equal(store.value.proposals[0].status, "running");
@@ -1032,5 +1251,7 @@ test("the real proposal runner stops at running while the local job is queued", 
   await service.runCycle({ limit: 1 });
   assert.equal(store.value.proposals[0].status, "running");
   assert.equal(store.value.results.length, 0);
+  assert.equal(trusted.calls.length, 1);
+  assert.equal(verifies, 0);
   await runtime.close();
 });

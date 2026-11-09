@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 import {
   createCodeJobGrant,
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import {
@@ -255,6 +256,131 @@ function factory(overrides = {}) {
   });
 }
 
+function verificationFailure(code, cause) {
+  return Object.assign(new Error(code, cause === undefined ? undefined : { cause }), { code });
+}
+
+for (const asynchronous of [false, true]) {
+  for (const operation of ["create", "verify"]) {
+    test(`${operation} preserves retryable verifier failures without revoking authority (${asynchronous ? "async" : "sync"})`, async () => {
+      const source = conflictProposal();
+      const validPreparation = { verify: value => structuredClone(value) };
+      const { grant } = factory({ conflictPreparationVerifier: validPreparation }).create(source);
+      for (const [port, failure] of [
+        ["inputAuthorityVerifier", verificationFailure("WORK_LEDGER_NOT_READY")],
+        ["inputAuthorityVerifier", verificationFailure("OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE", new Error("facts unavailable"))],
+        ...["EACCES", "EPERM", "EBUSY", "EIO", "ENOSPC", "EMFILE", "ENFILE"].map(code =>
+          ["inputAuthorityVerifier", verificationFailure(code)]),
+        ["conflictPreparationVerifier", verificationFailure("CONTROLLED_GIT_TIMEOUT", new Error("git timed out"))],
+        ...["PROCESS_TIMEOUT", "PROCESS_ABORTED"].map(code => ["conflictPreparationVerifier",
+          verificationFailure("CONTROLLED_GIT_PREFLIGHT_FAILED", verificationFailure("GIT_MIRROR_PREFLIGHT_FAILED", verificationFailure(code)))]),
+      ]) {
+        let unavailable = true, preparationCalls = 0;
+        const reject = value => {
+          if (unavailable) throw failure;
+          return structuredClone(value);
+        };
+        const grants = factory({
+          conflictPreparationVerifier: { verify(value) { preparationCalls++; return structuredClone(value); } },
+          [port]: { verify: asynchronous ? async value => reject(value) : reject },
+        });
+        const invoke = () => operation === "create" ? grants.create(source) : grants.verify(grant);
+        await assert.rejects(async () => invoke(), error =>
+          error.code === "CODE_JOB_AUTHORITY_VERIFICATION_UNAVAILABLE" && error.cause === failure, `${port}:${failure.code}`);
+        if (port === "inputAuthorityVerifier") assert.equal(preparationCalls, 0);
+        unavailable = false;
+        const recovered = await invoke();
+        assert.deepEqual(operation === "create" ? recovered.grant : recovered, grant);
+      }
+    });
+  }
+}
+
+test("ambiguous preflight, integrity failures and uncertain process stop never become retryable authority checks", async () => {
+  const validPreparation = { verify: value => structuredClone(value) };
+  const source = conflictProposal();
+  const { grant } = factory({ conflictPreparationVerifier: validPreparation }).create(source);
+  const stoppedFailure = verificationFailure("PROCESS_STOP_FAILED");
+  const reflectionFailure = new Error("malformed verifier error");
+  Object.setPrototypeOf(reflectionFailure, new Proxy(Error.prototype, {
+    getPrototypeOf() { throw verificationFailure("EIO"); },
+  }));
+  let inheritedCodeReads = 0;
+  const inheritedStop = new Error("inherited stop failure");
+  Object.setPrototypeOf(inheritedStop, Object.create(Error.prototype, {
+    code: { get() { inheritedCodeReads++; return "PROCESS_STOP_FAILED"; } },
+  }));
+  const failures = [
+    new Error("unknown verifier failure"),
+    reflectionFailure,
+    verificationFailure("CONTROLLED_GIT_PREFLIGHT_FAILED"),
+    verificationFailure("CONTROLLED_GIT_PROCESS_FAILED"),
+    verificationFailure("CONTROLLED_GIT_PREPARATION_TAMPERED"),
+    verificationFailure("CONTROLLED_GIT_PREPARATION_BINDING_MISMATCH"),
+    verificationFailure("CONTROLLED_GIT_EXECUTABLE_CHANGED"),
+    verificationFailure("CONTROLLED_GIT_BOUNDARY_CHANGED"),
+    verificationFailure("CONTROLLED_GIT_PREFLIGHT_FAILED", verificationFailure("GIT_MIRROR_UNTRUSTED_CONFIG")),
+    verificationFailure("CONTROLLED_GIT_PREFLIGHT_FAILED", verificationFailure("GIT_MIRROR_PREFLIGHT_FAILED", stoppedFailure)),
+    verificationFailure("CONTROLLED_GIT_TIMEOUT", stoppedFailure),
+    verificationFailure("CONTROLLED_GIT_TIMEOUT", verificationFailure("WRAPPER", stoppedFailure)),
+    verificationFailure("CONTROLLED_GIT_TIMEOUT", inheritedStop),
+  ];
+  for (const asynchronous of [false, true]) {
+    for (const failure of failures) {
+      const reject = () => { throw failure; };
+      const grants = factory({ conflictPreparationVerifier: { verify: asynchronous ? async () => reject() : reject } });
+      await assert.rejects(async () => grants.create(source), { code: "INVALID_CODE_JOB_AUTHORITY" });
+      await assert.rejects(async () => grants.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    }
+    for (const failure of [new Error("unknown input failure"), reflectionFailure, verificationFailure("WORK_LEDGER_PR_EXECUTION_BINDING_STALE"),
+      verificationFailure("OWNER_REVIEW_ASSIGNMENT_REVOKED"), verificationFailure("OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE", stoppedFailure),
+      verificationFailure("OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE", inheritedStop),
+      verificationFailure("EIO", stoppedFailure), verificationFailure("ENOENT")]) {
+      const reject = () => { throw failure; };
+      const grants = factory({ inputAuthorityVerifier: { verify: asynchronous ? async () => reject() : reject },
+        conflictPreparationVerifier: validPreparation });
+      await assert.rejects(async () => grants.create(source), { code: "INVALID_CODE_JOB_AUTHORITY" });
+      await assert.rejects(async () => grants.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    }
+  }
+  assert.equal(inheritedCodeReads, 0);
+});
+
+test("ordinary modify grants verify with mixed-case configured paths and still reject changed permissions", async () => {
+  const workspace = {
+    id: "acme-workspace", capabilities: ["git_head_snapshot"],
+    writablePaths: ["Obsolete", "PULL_REQUEST_TEMPLATE.md", "Projects", "src"],
+    excludePaths: [], requiredProfiles: [{ id: "node-tests", configDigest: "a".repeat(64) }], authorityDigest: "d".repeat(64),
+  };
+  const original = structuredClone(workspace);
+  const grantFactory = factory({ executorAuthority: { workspaces: [workspace] } });
+  const { grant } = await grantFactory.create(proposal());
+  assert.deepEqual(await grantFactory.verify(grant), grant);
+  assert.deepEqual(workspace, original);
+  const changedFactory = factory({ executorAuthority: { workspaces: [{ ...workspace, writablePaths: ["src"] }] } });
+  await assert.rejects(async () => changedFactory.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} grant uses live Head authority and exact configured paths without conflict evidence`, async () => {
+  const { contentDigest: _contentDigest, ...current } = proposal();
+  const sourceFor = paths => sourceKind === 'ci_repair' ? ciRepairSource(current.binding.inputBinding, paths)
+    : createReviewRepairCodeExecutionSource({ inputBinding: current.binding.inputBinding, writablePaths: paths });
+  const bound = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
+    executionSource: sourceFor(['src', 'test']),
+  } });
+  const grantFactory = factory();
+  const { grant } = await grantFactory.create(bound);
+  assert.equal(grant.schemaVersion, 3);
+  assert.equal(grant.executionSource.kind, sourceKind);
+  assert.deepEqual(grant.writablePaths, ["src", "test"]);
+  assert.deepEqual(await grantFactory.verify(grant), grant);
+  await assert.rejects(async () => factory({ inputAuthorityVerifier: { verify: (binding) => ({ ...binding, inputRevision: 2 }) } }).create(bound));
+  const changed = normalizeBoundWorkProposal({ ...current, binding: { ...current.binding,
+    executionSource: sourceFor(['src']),
+  } });
+  assert.throws(() => grantFactory.create(changed), /写范围/);
+});
+
 function localBrain({
   provider = "ollama",
   model = "qwen3.5:9b",
@@ -335,6 +461,38 @@ test("task brain digests are domain-separated from historical routine brains", (
       brainProviders,
     }),
   );
+});
+
+test("default-denied DingTalk preserves pre-extension task grants and current grant identities", () => {
+  const current = factory().create(proposal()).grant;
+  assert.equal(current.brainDigest, "eb7fdaf4962af507bb79f538da3982575d9d4764e33cd613063165fe03b619e6");
+  const { grantDigest, ...fields } = current;
+  const historical = createCodeJobGrant({ ...fields,
+    brainDigest: "e3a6dd7132fc7e63c65dacb4be0e9cb2e728088b3c1abe192b77709777f6dcf7" });
+  assert.deepEqual(factory().verify(historical), historical, "accept the historical encoding without rewriting it");
+  assert.deepEqual(factory().verify(current), current);
+  for (const changes of [
+    { model: "different-model" }, { reasoningEffort: "high" },
+    { remoteData: { requirements: true, code: false, memory: false } },
+    { remoteData: { requirements: false, code: false, memory: false, dingtalk: true } },
+  ]) {
+    const changed = { ...localBrain(), ...changes };
+    assert.throws(() => factory({ taskBrainByRole: brainsByRole(changed) }).verify(historical),
+      { code: "INVALID_CODE_JOB_AUTHORITY" });
+  }
+  assert.throws(() => factory({ brainProviders: {
+    ollama: { kind: "ollama", baseUrl: "http://127.0.0.1:11435" },
+  } }).verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
+test("default-denied DingTalk preserves verify-only historical routine grants", () => {
+  const { grantDigest, brainBindingSchema, ...fields } = factory().create(proposal()).grant;
+  const historical = createCodeJobGrant({ ...fields,
+    brainDigest: "3935ce513e9ae4eb666bad711f0696ecf1237c8e556b7c05f9ab55246d2a62dd" });
+  const recovery = factory({ taskBrainByRole: undefined, legacyBrainByRole: brainsByRole() });
+  assert.deepEqual(recovery.verify(historical), historical);
+  assert.throws(() => factory().verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+  assert.throws(() => recovery.create(proposal()), { code: "INVALID_CODE_JOB_AUTHORITY" });
 });
 
 test("historical brain bindings require an explicit verify-only factory", () => {

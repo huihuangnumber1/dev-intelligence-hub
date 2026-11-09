@@ -23,6 +23,7 @@ function identityFixture({
   headRefOid = HEAD_OID,
   inputRevision = 4,
   ownerRequested = false,
+  internalReview = false,
 } = {}) {
   const gitTarget = {
     schemaVersion: 1,
@@ -37,11 +38,11 @@ function identityFixture({
   };
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
-    eventType: ownerRequested
+    eventType: internalReview ? "pull_request.internal_review_requested" : ownerRequested
       ? "pull_request.owner_requested"
       : "pull_request.observed",
     occurredAt: "2026-08-08T01:00:00.000Z",
-    source: ownerRequested
+    source: internalReview ? { provider: "internal-review-repair", scopeId: "internal-review:12345678-1234-4123-8123-123456789abc" } : ownerRequested
       ? {
           provider: "local-owner",
           scopeId: "owner-request:12345678-1234-4123-8123-123456789abc",
@@ -56,6 +57,10 @@ function identityFixture({
       headRefOid,
       gitTargetAvailable: true,
       gitTarget,
+      ...(internalReview ? { workType: "pull_request", state: "open", internalReview: {
+        kind: "own_pr_repair", headRefOid, feedbackDigest: SHA256,
+        publicationConfirmationId: "owner-publication-1", controlledCommitEvidenceId: "controlled-commit-1",
+      } } : {}),
     },
   });
   const sourceBinding = {
@@ -183,6 +188,47 @@ test("read facts form a frozen JSON-roundtrippable persistence contract", () => 
   assert.equal(Object.isFrozen(facts.reviewThreads[0].comments[0]), true);
 });
 
+test("complete material proof survives observation refresh and covers hidden context tails", () => {
+  const facts = factsFixture();
+  const longComments = facts.comments.map((comment) => ({ ...comment, body: "x".repeat(3_000) }));
+  const original = createPullRequestReadFacts(factInput(facts, { comments: longComments }));
+  const refreshed = createPullRequestReadFacts(factInput(original, { observedAt: "2026-08-08T01:20:00.000Z" }));
+  const oldContext = projectPullRequestReadFactsContext(original);
+  const freshContext = projectPullRequestReadFactsContext(refreshed);
+  assert.notEqual(original.contentDigest, refreshed.contentDigest);
+  assert.equal(oldContext.materialDigest, freshContext.materialDigest);
+  assert.match(oldContext.materialDigest, /^[a-f0-9]{64}$/u);
+  assert.equal(oldContext.contextTruncated, true);
+
+  const changed = createPullRequestReadFacts(factInput(refreshed, {
+    comments: longComments.map((comment) => ({ ...comment, body: `${comment.body.slice(0, -1)}y` })),
+  }));
+  const changedContext = projectPullRequestReadFactsContext(changed);
+  assert.deepEqual(freshContext.comments, changedContext.comments);
+  assert.notEqual(freshContext.materialDigest, changedContext.materialDigest);
+  assert.equal(Object.hasOwn(original, "materialDigest"), false);
+  assert.deepEqual(normalizePullRequestReadFacts(JSON.parse(JSON.stringify(original))), original);
+});
+
+test("incomplete source facts never issue a material proof", async (t) => {
+  const base = factsFixture();
+  const cases = Object.keys(base.truncation).map((name) => ({ name: `source ${name}`,
+    input: { truncation: { ...base.truncation, [name]: true } } }));
+  cases.push(
+    { name: "comment body", input: { comments: base.comments.map((entry) => ({ ...entry, bodyTruncated: true })) } },
+    { name: "review body", input: { reviews: base.reviews.map((entry) => ({ ...entry, bodyTruncated: true })) } },
+    { name: "thread comments", input: { reviewThreads: base.reviewThreads.map((entry) => ({ ...entry, commentsTruncated: true })) } },
+    { name: "thread body", input: { reviewThreads: base.reviewThreads.map((entry) => ({ ...entry,
+      comments: entry.comments.map((comment) => ({ ...comment, bodyTruncated: true })) })) } },
+  );
+  for (const { name, input } of cases) {
+    await t.test(name, () => {
+      const context = projectPullRequestReadFactsContext(createPullRequestReadFacts(factInput(base, input)));
+      assert.equal(Object.hasOwn(context, "materialDigest"), false);
+    });
+  }
+});
+
 test("the identity binds the exact Head and outer event/source provenance", () => {
   const first = identityFixture({ scopeId: "scope:first" });
   const otherSource = identityFixture({ scopeId: "scope:second" });
@@ -232,6 +278,17 @@ test("an owner-requested PR reads facts from its bound GitHub account", () => {
     }),
     true,
   );
+});
+
+test("a typed internal repair review reads facts from its exact GitHub account and Head", () => {
+  const requested = identityFixture({ internalReview: true });
+  assert.deepEqual(requested.identity.source, { provider: "github", scopeId: "github-account:runtime-user" });
+  assert.equal(pullRequestReadFactsMatchExecution(factsFixture(requested.identity), {
+    executionBinding: requested.executionBinding, event: requested.event,
+  }), true);
+  const stale = identityFixture({ internalReview: true, headRefOid: "d".repeat(40) });
+  assert.equal(samePullRequestReadIdentity(requested.identity, stale.identity), false);
+  assert.throws(() => createPullRequestReadIdentity({ executionBinding: requested.executionBinding, event: stale.event }));
 });
 
 test("an execution binding cannot be paired with another event provenance", () => {
@@ -351,6 +408,17 @@ test("nullable thread and lifecycle facts remain explicit", () => {
   assert.equal(nullable.checks[0].completedAt, null);
 });
 
+test("HTTP CI details links remain visible while unsafe check URLs and HTTP discussion URLs are rejected", () => {
+  const facts = factsFixture(), url = 'http://10.6.23.95:8080/job/OCT-QuickTest/1744/';
+  const withJenkins = createPullRequestReadFacts(factInput(facts, { checks: [{ ...facts.checks[0], url }] }));
+  assert.equal(withJenkins.checks[0].url, url);
+  assert.equal(projectPullRequestReadFactsContext(withJenkins).checks[0].url, url);
+  for (const unsafe of ['javascript:alert(1)', 'file:///C:/private', 'https://user:password@ci.example/job/1/']) {
+    assert.throws(() => createPullRequestReadFacts(factInput(facts, { checks: [{ ...facts.checks[0], url: unsafe }] })));
+  }
+  assert.throws(() => createPullRequestReadFacts(factInput(facts, { comments: [{ ...facts.comments[0], url: 'http://github.com/acme/repo/issues/1' }] })));
+});
+
 test("a bounded summary projects digests and urgent facts without thread bodies", () => {
   const facts = factsFixture();
   const withUrgency = createPullRequestReadFacts(
@@ -417,6 +485,7 @@ test("a bounded task context prioritizes actionable threads and checks", () => {
   assert.equal(context.comments.at(-1).bodyTruncated, true);
   assert.equal(context.reviewThreads[0].latestComment.body, "This can race.");
   assert.equal(context.checks[0].name, "required-failure");
+  assert.equal(context.checks[0].url, facts.checks[0].url, "roles retain the original CI details link");
   assert.equal(context.checks.length, 20);
   assert.equal(context.contextTruncated, true);
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 64 * 1024);

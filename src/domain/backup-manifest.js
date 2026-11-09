@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
+import { isCanonicalBackupPath } from "./backup-path.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_STORE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
-const WINDOWS_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
-const WINDOWS_INVALID_PATH_CHARACTER = /[<>:"|?*]/;
-const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const FILE_KINDS = new Set(["mutable", "immutable"]);
-const MAX_STORES = 256;
 const MAX_FILES = 100_000;
+// Root StateStore archives each occupy a durable file. They share the existing
+// file-count ceiling and the combined 16 MiB manifest budget.
+const MAX_STORES = MAX_FILES;
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
@@ -107,35 +107,7 @@ function safeInteger(value, maximum, name) {
 }
 
 function canonicalPath(value) {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value.length > 1_024 ||
-    Buffer.byteLength(value, "utf8") > 4_096 ||
-    value !== value.normalize("NFC") ||
-    INVALID_CONTROL.test(value) ||
-    WINDOWS_INVALID_PATH_CHARACTER.test(value) ||
-    value.includes("\\") ||
-    value.startsWith("/") ||
-    /^[A-Za-z]:/.test(value)
-  ) {
-    invalid("备份文件路径无效");
-  }
-  const segments = value.split("/");
-  if (
-    segments.some(
-      (segment) =>
-        segment.length === 0 ||
-        segment === "." ||
-        segment === ".." ||
-        segment.startsWith(".") ||
-        segment.endsWith(".") ||
-        segment.endsWith(" ") ||
-        WINDOWS_DEVICE.test(segment),
-    )
-  ) {
-    invalid("备份文件路径无效");
-  }
+  if (!isCanonicalBackupPath(value)) invalid("备份文件路径无效");
   return value;
 }
 

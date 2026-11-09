@@ -1,10 +1,12 @@
 import {
   createChangePackage,
   normalizeChangePackageManifest,
+  hasChangePackageChanges,
 } from "../domain/change-package-contract.js";
 import { normalizeChangePackageControlledCommitReceipt } from "../domain/change-package-controlled-commit.js";
 import { normalizeCodeJobChangePackageEvent } from "../domain/code-job-change-package-event.js";
 import { digestValue } from "../domain/code-executor-contract.js";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -288,7 +290,7 @@ function normalizeControlledCommitReceipt(value, event, manifest) {
   return receipt;
 }
 
-function cycleResult({ observed, created, acknowledged, cursor, highWatermark }) {
+function cycleResult({ observed, created, acknowledged, cursor, highWatermark, unchanged = 0 }) {
   return Object.freeze({
     observed,
     created,
@@ -296,6 +298,7 @@ function cycleResult({ observed, created, acknowledged, cursor, highWatermark })
     cursor,
     highWatermark,
     pending: highWatermark - cursor,
+    ...(unchanged > 0 ? { unchanged } : {}),
   });
 }
 
@@ -362,6 +365,7 @@ export class CodeJobChangePackageDispatcher {
     let highWatermark = batch.highWatermark;
     let created = 0;
     let acknowledged = 0;
+    let unchanged = 0;
     for (const event of batch.items) {
       if (event.schemaVersion === 2) {
         throw protocolError(
@@ -378,7 +382,9 @@ export class CodeJobChangePackageDispatcher {
       );
       created += 1;
       let controlledCommit;
-      if (event.schemaVersion === 3) {
+      const noChanges = event.schemaVersion === 3 && isHeadRepairExecutionSource(event.executionSource) &&
+        !hasChangePackageChanges(manifest) && manifest.workspace.sourceRevision === manifest.workspace.workspaceRevision;
+      if (event.schemaVersion === 3 && !noChanges) {
         if (this.#deliverControlledCommit === null) {
           throw protocolError(
             "CODE_JOB_CONTROLLED_COMMIT_DELIVERY_UNAVAILABLE",
@@ -407,6 +413,7 @@ export class CodeJobChangePackageDispatcher {
           sourceRecordDigest: event.job.recordDigest,
           packageId: manifest.packageId,
           packageDigest: manifest.packageDigest,
+          ...(noChanges ? { noChanges: true } : {}),
           ...(controlledCommit === undefined
             ? {}
             : { controlledCommit }),
@@ -417,6 +424,7 @@ export class CodeJobChangePackageDispatcher {
       cursor = acknowledgement.cursor;
       highWatermark = acknowledgement.highWatermark;
       acknowledged += 1;
+      if (noChanges) unchanged += 1;
     }
     return cycleResult({
       observed: batch.items.length,
@@ -424,6 +432,7 @@ export class CodeJobChangePackageDispatcher {
       acknowledged,
       cursor,
       highWatermark,
+      unchanged,
     });
   }
 }

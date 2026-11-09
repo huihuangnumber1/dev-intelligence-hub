@@ -218,6 +218,8 @@ test("real loopback HTTP reaches production routing, feed, ledger, graph, and re
   assert.equal(created.status, 201);
   assert.equal(created.body.deduplicated, false);
   assert.equal(created.body.phase, "intaken");
+  assert.equal(created.body.progress.status, "queued");
+  assert.equal(created.body.progress.itemId, created.body.workItemId);
   assert.deepEqual(created.body.assignment.target, {
     type: "role",
     id: "orchestrator",
@@ -237,6 +239,9 @@ test("real loopback HTTP reaches production routing, feed, ledger, graph, and re
   assert.equal(items.body.items.length, 1);
   assert.equal(graph.body.totalTaskCount, 1);
   assert.equal(requests.body.items.length, 1);
+  assert.equal(requests.body.items[0].progress.status, "queued");
+  assert.equal(requests.body.items[0].progress.itemId, created.body.workItemId);
+  assert.deepEqual(requests.body.items[0].progress.currentTarget, { type: "role", id: "orchestrator" });
   assert.equal(assignments.body.items[0].target.id, "orchestrator");
   assert.equal(items.body.items[0].itemId, created.body.workItemId);
   assert.equal(graph.body.graph.tasks[0].taskId, created.body.workItemId);
@@ -341,6 +346,22 @@ test("manual Issue requirements crosses HTTP intake and replays one durable task
     body: { ...input, priority: "urgent" },
   });
   assert.equal(conflict.status, 409);
+  const sourceUrl = "https://github.com/ExampleOrg/ProductApp/issues/13303";
+  const history = await request(server, {
+    pathname: `/api/work/requests?sourceUrl=${encodeURIComponent(sourceUrl)}`,
+  });
+  assert.equal(history.status, 200);
+  assert.deepEqual(history.body.items.map(({ requestId }) => requestId), [input.requestId]);
+  assert.equal(history.body.items[0].workItemId, created.body.workItemId);
+  for (const query of [
+    `sourceUrl=${encodeURIComponent(sourceUrl.replace("issues", "pull"))}`,
+    `sourceUrl=${encodeURIComponent(sourceUrl.replace("13303", "133030"))}`,
+  ]) {
+    assert.deepEqual((await request(server, { pathname: `/api/work/requests?${query}` })).body.items, []);
+  }
+  for (const query of ["sourceUrl=invalid", `sourceUrl=${encodeURIComponent(sourceUrl)}&sourceUrl=invalid`]) {
+    assert.equal((await request(server, { pathname: `/api/work/requests?${query}` })).status, 400);
+  }
   assert.equal((await request(server, {
     pathname: "/api/work/items?limit=10",
   })).body.items.length, 1);

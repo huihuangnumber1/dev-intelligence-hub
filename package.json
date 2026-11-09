@@ -31,6 +31,8 @@
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
     "docs/PROJECT_STATUS.md",
+    "docs/TESTING.md",
+    "docs/USER_GUIDE.zh-CN.md",
     "npm-shrinkwrap.json",
     "public/",
     "scripts/",

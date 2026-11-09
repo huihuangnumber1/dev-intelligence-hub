@@ -5,6 +5,10 @@ import {
   readFile,
   readdir,
   rm,
+  appendFile,
+  link,
+  stat,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +16,50 @@ import path from "node:path";
 import test from "node:test";
 
 import { CodexCliSessionStore } from "../src/adapters/codex-cli-session-store.js";
+
+test("capture verification preserves missing or changed history and accepts an archived prefix", async (t) => {
+  const parent = await temporaryDirectory(t, "codex-session-verify-");
+  const root = path.join(parent, "store");
+  const home = path.join(parent, "home");
+  await mkdir(path.join(home, "sessions"), { recursive: true });
+  const rollout = path.join(home, "sessions", "rollout-thread-1.jsonl");
+  await writeFile(rollout, "original history\n");
+  const store = new CodexCliSessionStore({ root });
+  const input = { sessionKey: "github:issue:owner/repo#1", sessionId: "thread-1", codexHome: home };
+  assert.equal(await store.verifyCapture(input), null);
+  await store.capture(input);
+  assert.deepEqual(await store.verifyCapture(input), { profileBytes: Buffer.byteLength("original history\n") });
+  const [entry] = await readdir(root);
+  const saved = path.join(root, entry, "profile", "sessions", path.basename(rollout));
+  await appendFile(saved, "later turn\n");
+  assert.ok(await store.verifyCapture(input));
+  await writeFile(saved, "different history\n");
+  assert.equal(await store.verifyCapture(input), null);
+  assert.equal(await readFile(rollout, "utf8"), "original history\n");
+  await rm(saved);
+  assert.equal(await store.verifyCapture(input), null);
+});
+
+test("capture verification rejects linked files and storage overflow without removing history", async (t) => {
+  const parent = await temporaryDirectory(t, "codex-session-verify-bound-");
+  const root = path.join(parent, "store");
+  const home = path.join(parent, "home");
+  await mkdir(path.join(home, "sessions"), { recursive: true });
+  const rollout = path.join(home, "sessions", "rollout-thread-1.jsonl");
+  await writeFile(rollout, "original history");
+  const store = new CodexCliSessionStore({ root });
+  const input = { sessionKey: "github:issue:owner/repo#1", sessionId: "thread-1", codexHome: home };
+  await store.capture(input);
+  const alias = path.join(parent, "alias.jsonl");
+  await link(rollout, alias);
+  await assert.rejects(store.verifyCapture(input), /linked file/u);
+  await rm(alias);
+  await truncate(rollout, 512 * 1024 * 1024 + 1);
+  await assert.rejects(store.verifyCapture(input), /storage limit/u);
+  assert.equal((await stat(rollout)).size, 512 * 1024 * 1024 + 1);
+  await truncate(rollout, Buffer.byteLength("original history"));
+  assert.equal(await readFile(rollout, "utf8"), "original history");
+});
 
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));

@@ -1,21 +1,28 @@
-const STRUCTURED_PROVIDER_FAILURE_PREFIX = "STRUCTURED_PROVIDER_";
-const SHARED_OPERATOR_PAUSE_CODES = new Set([
-  "BRAIN_CREDENTIAL_UNAVAILABLE",
-  "BRAIN_PROVIDER_NOT_CONFIGURED",
-  "REMOTE_DATA_NOT_AUTHORIZED",
-]);
-
-function attention(code, summary, remediation) {
-  return Object.freeze({ code, summary, remediation });
+function attention(code, summary, remediation, retryLabel = "已配置，重试") {
+  return Object.freeze({ code, summary, remediation, retryLabel });
 }
 
 const OWNER_ATTENTION_BY_CODE = new Map([
+  ...["STRUCTURED_PROVIDER_PROCESS_FAILED", "STRUCTURED_PROVIDER_PROCESS_EXITED"].map(code => [
+    code,
+    attention(code, "岗位 CLI 执行中断", "任务将等待后重试。请根据执行记录检查 CLI 的退出阶段。", "自动重试中"),
+  ]),
+  [
+    "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+    attention(
+      "STRUCTURED_PROVIDER_MODEL_CAPACITY",
+      "所选模型暂时满载",
+      "系统将保留任务进度并稍后自动重试，无需确认或重新分配任务",
+      "自动重试中",
+    ),
+  ],
   [
     "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
     attention(
       "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED",
       "岗位 CLI 会话进度未能安全归档",
-      "保留隔离目录中的会话历史，不要删除；确认 CLI 已结束后检查会话存储并恢复该任务的原会话",
+      "这是系统会话保存或恢复故障，请先由维护人员修复；保留隔离目录中的会话历史，不要删除。修复前可选择“稍后再看”，重试只会重新排队，不会修复会话",
+      "修复后重试",
     ),
   ],
   [
@@ -87,12 +94,4 @@ const OWNER_ATTENTION_BY_CODE = new Map([
 export function brainFailureOwnerAttention(code) {
   if (typeof code !== "string") return null;
   return OWNER_ATTENTION_BY_CODE.get(code) ?? null;
-}
-
-export function requiresBrainOperatorPause(code) {
-  return (
-    SHARED_OPERATOR_PAUSE_CODES.has(code) ||
-    (typeof code === "string" &&
-      code.startsWith(STRUCTURED_PROVIDER_FAILURE_PREFIX))
-  );
 }

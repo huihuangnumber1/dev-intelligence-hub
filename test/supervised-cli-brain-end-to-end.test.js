@@ -513,7 +513,6 @@ test("a production-composed orchestrator decision persists in ledger and memory 
   const harness = await createCliHarness(t, "supervised-cli-composition-process");
   const stateRoot = path.join(root, "state");
   const session = Object.freeze({
-    sessionKey: "github:issue:fixture/repository#42",
     sessionId: "fixture-session",
   });
   let now = Date.parse("2026-08-09T01:00:00.000Z");
@@ -564,10 +563,12 @@ test("a production-composed orchestrator decision persists in ledger and memory 
     assert.equal(harness.invocations[0].args.includes("--ephemeral"), false);
     assert.equal(harness.invocations[0].args.includes("--json"), true);
     assert.equal(harness.invocations[0].args.includes("resume"), false);
-    assert.deepEqual(harness.codexSessionStore.view(), {
-      sessions: [session],
-      stages: [session.sessionKey],
-      captures: [session],
+    const sessionView = harness.codexSessionStore.view();
+    assert.match(sessionView.stages[0], /^auth-v2:[a-f0-9]{64}$/u);
+    assert.deepEqual(sessionView, {
+      sessions: [{ ...session, sessionKey: sessionView.stages[0] }],
+      stages: [sessionView.stages[0]],
+      captures: [{ ...session, sessionKey: sessionView.stages[0] }],
     });
     await application.memoryProjector.runCycle();
     const memory = await application.memorySearch.search({
@@ -591,10 +592,12 @@ test("a production-composed orchestrator decision persists in ledger and memory 
     });
     assert.equal(memory.items.some(({ source }) => source.kind === "work-item"), true);
     assert.equal(harness.invocations.length, invocationsBeforeRestart);
-    assert.deepEqual(harness.codexSessionStore.view(), {
-      sessions: [session],
-      stages: [session.sessionKey],
-      captures: [session],
+    const sessionView = harness.codexSessionStore.view();
+    assert.match(sessionView.stages[0], /^auth-v2:[a-f0-9]{64}$/u);
+    assert.deepEqual(sessionView, {
+      sessions: [{ ...session, sessionKey: sessionView.stages[0] }],
+      stages: [sessionView.stages[0]],
+      captures: [{ ...session, sessionKey: sessionView.stages[0] }],
     });
   } finally {
     await application.close();

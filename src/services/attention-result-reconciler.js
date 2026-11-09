@@ -50,9 +50,11 @@ export class AttentionResultReconciler {
   #readOutbox;
   #getSummary;
   #applyAttentionBatch;
+  #archiveRetired;
+  #retryMaintenance;
   #inFlight = null;
 
-  constructor({ attentionConsumer, ledger } = {}) {
+  constructor({ attentionConsumer, attentionMaintenance = null, ledger } = {}) {
     this.#readOutbox = bindPort(
       attentionConsumer,
       ["readOutbox"],
@@ -65,6 +67,11 @@ export class AttentionResultReconciler {
     );
     this.#getSummary = ledgerPort.getSummary;
     this.#applyAttentionBatch = ledgerPort.applyAttentionBatch;
+    this.#retryMaintenance = typeof attentionMaintenance?.retrySystemQuestions === "function"
+      ? attentionMaintenance.retrySystemQuestions.bind(attentionMaintenance) : null;
+    this.#archiveRetired = attentionMaintenance === null ? null : bindPort(
+      attentionMaintenance, ["archiveRetired"], "attentionMaintenance",
+    ).archiveRetired;
   }
 
   runCycle(options = {}) {
@@ -85,6 +92,9 @@ export class AttentionResultReconciler {
       limit,
     });
     // The inbox read is fully released before acquiring the ledger writer.
-    return this.#applyAttentionBatch(batch);
+    const result = await this.#applyAttentionBatch(batch);
+    await this.#retryMaintenance?.({ limit });
+    await this.#archiveRetired?.();
+    return result;
   }
 }

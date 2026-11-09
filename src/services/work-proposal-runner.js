@@ -1,4 +1,5 @@
 import {
+  MAX_WORK_PROPOSAL_LEASE_DURATION_MS,
   WORK_PROPOSAL_STATUSES,
   assertWorkProposalExactKeys,
   boundedWorkProposalText,
@@ -245,7 +246,7 @@ export class WorkProposalRunnerService {
     this.#leaseDurationMs = positiveInteger(
       leaseDurationMs,
       "leaseDurationMs",
-      300_000,
+      MAX_WORK_PROPOSAL_LEASE_DURATION_MS,
     );
     if (this.#leaseDurationMs < 1_000) {
       throw new TypeError("leaseDurationMs is invalid");

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizePullRequestGitTarget } from "./git-tool-contract.js";
+import { normalizeInternalReviewMetadata } from "./internal-repair-review.js";
 
 const SCHEMA_VERSION = 1;
 const SUBJECT_KINDS = Object.freeze(["pull_request", "issue"]);
@@ -19,6 +20,8 @@ const EVENT_TYPES = new Set(
 );
 EVENT_TYPES.add("owner_request.created");
 EVENT_TYPES.add("pull_request.owner_requested");
+EVENT_TYPES.add("pull_request.internal_review_requested");
+EVENT_TYPES.add("pull_request.role_handoff");
 EVENT_TYPES.add("issue.owner_requested");
 const BASE_KEYS = Object.freeze([
   "schemaVersion",
@@ -60,6 +63,9 @@ const INVALID_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const IDENTIFIER_CONTROL = /\p{Cc}/u;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const PAYLOAD_FIELDS = new Set([
+  "headAncestryProof",
+  "reviewPurpose",
+  "roleHandoffProof",
   "actionState",
   "acceptanceCriteria",
   "assignee",
@@ -79,6 +85,7 @@ const PAYLOAD_FIELDS = new Set([
   "gitTarget",
   "gitTargetAvailable",
   "headRefOid",
+  "internalReview",
   "inactiveDays",
   "isDraft",
   "issueType",
@@ -88,6 +95,7 @@ const PAYLOAD_FIELDS = new Set([
   "milestone",
   "myReviewCommitOid",
   "myReviewState",
+  "myLatestPublishedReviewAt",
   "nextAction",
   "nextActor",
   "number",
@@ -100,6 +108,16 @@ const PAYLOAD_FIELDS = new Set([
   "requiresConfirmation",
   "reviewDecision",
   "reviewFactsAvailable",
+  "reviewFeedbackAvailable",
+  "reviewFeedbackDigest",
+  "reviewFeedbackCount",
+  "reviewFeedbackAt",
+  "incomingReviewFactsAvailable",
+  "reviewRecipient",
+  "reviewReceivedAt",
+  "reviewReceivedFrom",
+  "reviewReceivedVia",
+  "reviewRequestEventId",
   "riskLevel",
   "riskScore",
   "state",
@@ -118,6 +136,9 @@ const FILE_FACT_FIELDS = new Set([
   "status",
 ]);
 const STRING_PAYLOAD_FIELDS = new Set([
+  "headAncestryProof",
+  "reviewPurpose",
+  "roleHandoffProof",
   "actionState",
   "assignee",
   "assignmentSource",
@@ -133,6 +154,7 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "milestone",
   "myReviewCommitOid",
   "myReviewState",
+  "myLatestPublishedReviewAt",
   "nextAction",
   "nextActor",
   "previousHeadRefOid",
@@ -141,6 +163,13 @@ const STRING_PAYLOAD_FIELDS = new Set([
   "priority",
   "relation",
   "reviewDecision",
+  "reviewRecipient",
+  "reviewFeedbackDigest",
+  "reviewFeedbackAt",
+  "reviewReceivedAt",
+  "reviewReceivedFrom",
+  "reviewReceivedVia",
+  "reviewRequestEventId",
   "riskLevel",
   "state",
   "summary",
@@ -155,9 +184,12 @@ const BOOLEAN_PAYLOAD_FIELDS = new Set([
   "isDraft",
   "requiresConfirmation",
   "reviewFactsAvailable",
+  "reviewFeedbackAvailable",
+  "incomingReviewFactsAvailable",
 ]);
 const NUMBER_PAYLOAD_FIELDS = new Set([
   "commentsCount",
+  "reviewFeedbackCount",
   "confidence",
   "inactiveDays",
   "number",
@@ -591,6 +623,23 @@ function assertOwnerPullRequestSemantics(content) {
   }
 }
 
+function assertInternalReviewSemantics(content) {
+  if (content.eventType !== "pull_request.internal_review_requested") {
+    if (Object.hasOwn(content.payload, "internalReview")) throw invalid("internal review event type");
+    return;
+  }
+  const target = content.payload.gitTarget;
+  let metadata;
+  try { metadata = normalizeInternalReviewMetadata(content.payload.internalReview); }
+  catch { throw invalid("internal review metadata"); }
+  if (content.source.provider !== "internal-review-repair" ||
+      !/^internal-review:[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(content.source.scopeId) ||
+      content.payload.workType !== "pull_request" || content.payload.state !== "open" ||
+      content.payload.gitTargetAvailable !== true || target?.provider !== "github" ||
+      target.baseRepository !== content.subject.repository || target.headRefOid !== content.payload.headRefOid ||
+      metadata.headRefOid !== target.headRefOid) throw invalid("internal review semantics");
+}
+
 function normalizeContent(value) {
   assertExactKeys(value, BASE_KEYS, "event");
   if (value.schemaVersion !== SCHEMA_VERSION) {
@@ -611,6 +660,7 @@ function normalizeContent(value) {
   };
   assertOwnerRequestSemantics(content);
   assertOwnerPullRequestSemantics(content);
+  assertInternalReviewSemantics(content);
   const hasGitTarget = Object.hasOwn(content.payload, "gitTarget");
   const hasGitTargetAvailability = Object.hasOwn(
     content.payload,

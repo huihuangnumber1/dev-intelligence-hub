@@ -1,6 +1,11 @@
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { digestValue } from "../domain/code-executor-contract.js";
+import { normalizeCodeJobCompletionReport } from "../domain/code-job-contract.js";
 import { normalizeWorkspacePath } from "../domain/code-execution-policy.js";
-import { requiresBrainOperatorPause } from "./brain-failure-policy.js";
+import { codeExecutionSourceAllowsWrite } from "../domain/code-execution-source.js";
+import { projectTestSummary } from "../domain/test-result-summary.js";
+import { requiresBrainOperatorPause } from "../domain/brain-failure-recovery.js";
+import { hasCompleteCodeRead, isCodeReadContext } from "../lib/code-read-context.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -11,6 +16,7 @@ const EXECUTOR_TERMINAL_ACTIONS = new Set([
 ]);
 const AUTHORITY_ERROR_CODES = new Set(["INVALID_CODE_JOB_AUTHORITY"]);
 const FENCING_EXECUTOR_CODES = new Set([
+  "CODE_REVIEW_REPAIR_CONTEXT_STALE",
   "CODE_JOB_AUTHORITY_PROTOCOL_ERROR",
   "CODE_JOB_ADMISSION_MISSING",
   "CODE_JOB_AUDIT_RESULT_INVALID",
@@ -38,6 +44,9 @@ const DETERMINISTIC_FAILURE_CODES = new Set([
   "CODE_BRAIN_CONTEXT_UNFIT",
 ]);
 const OPERATOR_PAUSE_CODES = new Set([
+  "CODE_ARTIFACT_READ_INCOMPLETE",
+  "CODE_ARTIFACT_READ_INVALID",
+  "CODE_REVIEW_REPAIR_CONTEXT_NOT_CONFIGURED",
   "CODE_BRAIN_ACTION_NOT_PERMITTED",
   "CODE_BRAIN_CHECKS_ALREADY_PASSED",
   "CODE_BRAIN_COMPLETION_NOT_READY",
@@ -49,6 +58,13 @@ const OPERATOR_PAUSE_CODES = new Set([
   "CODE_BRAIN_WRITE_NOT_PERMITTED",
 ]);
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const VERIFICATION_ENVIRONMENT_ERRORS = new Set([
+  "SANDBOX_UNAVAILABLE",
+  "SANDBOX_START_FAILED",
+  "SANDBOX_IMAGE_UNAVAILABLE",
+  "SANDBOX_PROFILE_NOT_FOUND",
+  "INVALID_SANDBOX_CONFIG",
+]);
 
 export class CodeJobWorkerError extends Error {
   constructor(code, message, options = {}) {
@@ -75,7 +91,7 @@ export function normalizeCycleOptions(value = {}) {
     typeof value !== "object" ||
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    Object.keys(value).some((key) => !["limit", "roleId"].includes(key))
+    Object.keys(value).some((key) => !["limit", "roleId", "signal"].includes(key))
   ) {
     throw new TypeError("code job worker options are invalid");
   }
@@ -89,6 +105,7 @@ export function normalizeCycleOptions(value = {}) {
   return {
     limit: positiveInteger(value.limit ?? 10, "code job worker limit", 100),
     roleId,
+    signal: normalizeAbortSignal(value.signal ?? null),
   };
 }
 
@@ -191,11 +208,21 @@ function compactManifestEntry(entry, kind) {
   return result;
 }
 
+function unstartedWindowsProfile(result) {
+  const error = result?.error, details = error?.details;
+  return error?.code === "SANDBOX_ABORTED" && details?.origin === "windows_fixed_prelaunch" &&
+    details.notExecuted === true && details.cleanupPending === false && Object.keys(details).length === 3 &&
+    result.exitCode == null && result.timedOut !== true && !result.stdout && !result.stderr &&
+    result.testSummary == null && result.runtimeIdentity == null;
+}
+
 function compactExecutorResult(action, result) {
   const error = result?.error
     ? {
         code: safeErrorCode(result.error, "ACTION_FAILED"),
         message: cleanText(result.error.message, 2_048),
+        ...(action.type === "run_profile" && unstartedWindowsProfile(result)
+          ? { details: { origin: "windows_fixed_prelaunch", notExecuted: true, cleanupPending: false } } : {}),
       }
     : null;
   if (action.type === "list_files") {
@@ -247,6 +274,7 @@ function compactExecutorResult(action, result) {
       timedOut: result?.timedOut === true,
       stdout: cleanText(result?.stdout, 16 * 1_024),
       stderr: cleanText(result?.stderr, 16 * 1_024),
+      ...projectTestSummary(result?.testSummary),
       error,
     };
   }
@@ -325,6 +353,8 @@ export function modelObservation(observation) {
       path: action.path,
       bytes: result.bytes ?? 0,
       error: result.error ?? null,
+      ...(observation.detail.origin === 'host_pre_execution_rejection' && observation.detail.notExecuted === true
+        ? { notExecuted: true } : {}),
     };
   } else if (action.type === "run_profile") {
     detail = {
@@ -333,6 +363,7 @@ export function modelObservation(observation) {
       timedOut: result.timedOut === true,
       stdout: cleanText(result.stdout, 8 * 1_024),
       stderr: cleanText(result.stderr, 8 * 1_024),
+      ...projectTestSummary(result.testSummary),
       error: result.error ?? null,
     };
   } else {
@@ -394,14 +425,71 @@ export function successfulProfiles(job, session) {
   return result;
 }
 
+export function verificationFailure(job) {
+  const latestProfiles = new Set();
+  let action;
+  const observation = job.execution.observations.findLast((entry) => {
+    if (entry.actionType !== "run_profile" ||
+        entry.workspaceRevision !== job.execution.workspaceRevision) return false;
+    const candidate = trustedObservationAction(entry);
+    // An unstarted attempt cannot pass the profile or hide an earlier failure.
+    if (entry.status === "failed" && candidate.expectedWorkspaceRevision === entry.workspaceRevision &&
+        job.grant.requiredProfiles.some(({ id }) => id === candidate.profileId) && unstartedWindowsProfile(entry.detail?.result)) return false;
+    if (latestProfiles.has(candidate.profileId)) return false;
+    latestProfiles.add(candidate.profileId);
+    if (entry.status !== "failed") return false;
+    // Code changes can repair failed assertions, but cannot repair the host's
+    // sandbox or fixed profile configuration by asking the model again.
+    if (job.grant.operation !== "verify" &&
+        !VERIFICATION_ENVIRONMENT_ERRORS.has(safeErrorCode(entry.detail?.result?.error, "ACTION_FAILED"))) return false;
+    action = candidate;
+    return true;
+  });
+  if (!observation) return null;
+  if (
+    action.expectedWorkspaceRevision !== observation.workspaceRevision ||
+    !job.grant.requiredProfiles.some(({ id }) => id === action.profileId)
+  ) {
+    throw workerError(
+      "CODE_JOB_EXECUTOR_RESULT_INVALID",
+      "Failed verification observation does not match its sealed profile and workspace",
+    );
+  }
+  const result = observation.detail?.result ?? {};
+  const errorCode = safeErrorCode(result.error, "ACTION_FAILED");
+  const reference = `测试配置 ${cleanText(action.profileId, 128)}（动作 ${action.actionId}，工作区 ${observation.workspaceRevision}）`;
+  if (result.timedOut === true || errorCode === "SANDBOX_TIMEOUT") {
+    return {
+      code: "CODE_JOB_VERIFICATION_TIMEOUT",
+      message: `${reference}执行超时。请检查执行日志、运行耗时和超时配置后重新发起验证。`,
+    };
+  }
+  if (VERIFICATION_ENVIRONMENT_ERRORS.has(errorCode)) {
+    return {
+      code: "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+      message: `${reference}的测试环境不可用（${errorCode}）。请恢复沙箱、镜像或测试配置后重新发起验证。`,
+    };
+  }
+  const verificationFailed = errorCode === "TESTS_FAILED" ||
+    (Number.isSafeInteger(result.exitCode) && result.exitCode !== 0);
+  return {
+    code: verificationFailed ? "CODE_JOB_VERIFICATION_FAILED" : "CODE_JOB_VERIFICATION_UNKNOWN",
+    message: `${reference}验证未通过（${errorCode}${Number.isSafeInteger(result.exitCode) ? `，退出码 ${result.exitCode}` : ""}），失败原因尚未确认。请检查测试日志、依赖和运行环境，处理后重新发起验证。`,
+  };
+}
+
+export function incompleteReadMessage(path) {
+  return `无法覆盖 ${cleanText(path, 1_024)}：当前模型上下文未包含该文件的完整读取结果，请完整读取文件或调整任务范围后重试`;
+}
+
 function incompleteReadError(path) {
   return workerError(
     "CODE_BRAIN_INCOMPLETE_READ",
-    `无法覆盖 ${cleanText(path, 1_024)}：当前模型上下文未包含该文件的完整读取结果，请完整读取文件或调整任务范围后重试`,
+    incompleteReadMessage(path),
   );
 }
 
-function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
+function expectedWriteSha(job, path, workspaceRevision, visibleObservations, codeReadContext) {
   for (let index = job.execution.observations.length - 1; index >= 0; index -= 1) {
     const observation = job.execution.observations[index];
     if (
@@ -414,6 +502,14 @@ function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
     const action = trustedObservationAction(observation);
     if (action.path !== path) continue;
     const result = observation.detail?.result;
+    if (isCodeReadContext(codeReadContext)) {
+      if (action.expectedWorkspaceRevision === workspaceRevision && isSha256(result?.sha256) && hasCompleteCodeRead(codeReadContext, {
+        jobId: job.jobId, workspaceRevision, actionId: action.actionId, path, sha256: result.sha256,
+      })) return result.sha256;
+      // The directory may repack previews while adding the document manifest.
+      // Only actual native reads prove what that invocation could see.
+      throw incompleteReadError(path);
+    }
     const visible = visibleObservations.some((entry) => {
       if (entry.actionType !== "read_text" || entry.status !== "succeeded") return false;
       try {
@@ -436,9 +532,9 @@ function expectedWriteSha(job, path, workspaceRevision, visibleObservations) {
   return null;
 }
 
-export function assertPreparedWriteRead(job, session, action, visibleObservations) {
+export function assertPreparedWriteRead(job, session, action, visibleObservations, codeReadContext) {
   if (action.type !== "write_text" || action.expectedSha256 === null) return;
-  if (expectedWriteSha(job, action.path, session.workspaceRevision, visibleObservations) !== action.expectedSha256) {
+  if (expectedWriteSha(job, action.path, session.workspaceRevision, visibleObservations, codeReadContext) !== action.expectedSha256) {
     throw incompleteReadError(action.path);
   }
 }
@@ -453,7 +549,7 @@ function actionId(job, semanticAction) {
   return `action-${digest.slice(0, 55)}`;
 }
 
-export function bindTrustedAction(job, session, semanticAction, remainingProfiles, visibleObservations = []) {
+export function bindTrustedAction(job, session, semanticAction, remainingProfiles, visibleObservations = [], codeReadContext) {
   if (!job.grant.allowedActions.includes(semanticAction.type)) {
     throw workerError(
       "CODE_BRAIN_ACTION_NOT_PERMITTED",
@@ -484,7 +580,7 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
   if (semanticAction.type === "write_text") {
     const path = normalizeSemanticPath(semanticAction.path);
     const writable = job.grant.schemaVersion === 3
-      ? job.grant.writablePaths.includes(path)
+      ? codeExecutionSourceAllowsWrite(job.grant.executionSource, path)
       : job.grant.writablePaths.some(
           (candidate) => path === candidate || path.startsWith(`${candidate}/`),
         );
@@ -503,6 +599,7 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
         path,
         session.workspaceRevision,
         visibleObservations,
+        codeReadContext,
       ),
     };
   }
@@ -524,12 +621,21 @@ export function bindTrustedAction(job, session, semanticAction, remainingProfile
   return common;
 }
 
-export function terminalResult(job, action, detail, workspaceRevision) {
+export function completionReportForAction(action, semanticAction) {
+  return action.type === "complete" ? { completionReport: normalizeCodeJobCompletionReport({
+    actionId: action.actionId, actionDigest: digestValue(action), workspaceRevision: action.expectedWorkspaceRevision,
+    outcome: semanticAction.outcome, evidence: semanticAction.evidence,
+  }, action) } : {};
+}
+
+export function terminalResult(job, action, detail, workspaceRevision, completionReport) {
   const result = detail?.result ?? {};
+  const report = completionReport === undefined ? null : normalizeCodeJobCompletionReport(completionReport, action);
   return {
     schemaVersion: 1,
-    outcome: job.grant.summary,
+    outcome: report?.outcome ?? job.grant.summary,
     evidence: [...job.grant.evidence],
+    ...(report === null ? {} : { completionReport: report }),
     checks: job.grant.requiredProfiles.map(({ id }) => id),
     workspaceRevision,
     manifest: result,

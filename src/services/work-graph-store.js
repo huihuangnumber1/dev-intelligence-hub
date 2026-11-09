@@ -172,7 +172,7 @@ export class WorkGraphStore {
 
   reader() {
     return Object.freeze({
-      getSnapshot: () => this.#getSnapshot(),
+      getSnapshot: (options) => this.#getSnapshot(options),
     });
   }
 

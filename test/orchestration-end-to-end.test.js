@@ -3,6 +3,7 @@ import test from "node:test";
 import { isDeepStrictEqual } from "node:util";
 
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
+import { createOwnerWorkRequestEvent } from "../src/domain/owner-work-request.js";
 import { OrchestratorService } from "../src/services/orchestrator-service.js";
 import { ProactiveWorkLoop } from "../src/services/proactive-work-loop.js";
 import { RoleContextAssembler } from "../src/services/role-context-assembler.js";
@@ -303,8 +304,12 @@ function requirementDraft() {
 
 async function fixture({
   testingEvidence = [FAILED_TEST_EVIDENCE, PASSED_TEST_EVIDENCE],
+  ownerGoal = false,
 } = {}) {
-  const event = normalizeWorkflowEvent({
+  const event = ownerGoal ? createOwnerWorkRequestEvent({ schemaVersion: 1,
+    requestId: "11111111-1111-4111-8111-111111111111", workType: "general", priority: "high",
+    title: "Continue the owner goal", description: "Retain the goal while repairing its execution plan.", acceptanceCriteria: ["Verified delivery"],
+  }, NOW) : normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType: "issue.created",
     occurredAt: NOW,
@@ -441,6 +446,8 @@ async function fixture({
   });
   return {
     ledger,
+    contextAssembler,
+    orchestratorService,
     graphReader,
     loop,
     getTestingAttempts: () => testingAttempts,
@@ -449,6 +456,40 @@ async function fixture({
     getVerifiedEvidence: () => verifiedEvidence,
   };
 }
+
+test("real owner coordination refuses root cancellation and replaces a settled child while preserving the goal", async () => {
+  const f = await fixture({ ownerGoal: true });
+  await f.ledger.intake();
+  let [root] = (await f.ledger.listItems()).items;
+  const packet = () => f.contextAssembler.assemble({ roleId: "orchestrator", item: root, trigger: "scheduled" });
+  const execute = async intent => f.orchestratorService.execute({
+    worker: { roleId: "orchestrator", workerId: "employee-orchestrator" }, item: root,
+    contextPacket: await packet(), intent,
+  });
+  let current = await packet();
+  const rootSource = current.context.requirements.currentTask;
+  await assert.rejects(execute(orchestrationIntent(current.context,
+    actionBase(current.context, rootSource, "cancel", "Retire a failed plan"), "Retire a plan").intent),
+  error => error.code === "ORCHESTRATOR_AUTHORITY_DENIED");
+  await execute(decompose(current.context, { childKey: "first-plan", title: "First plan", capability: "development", dependsOn: [],
+    contract: acceptanceContract("implementation", "change-package", "Controlled repair") }).intent);
+  root = await f.ledger.readItemForReconciliation({ itemId: root.itemId });
+  let child = (await f.ledger.listItems()).items.find(item => item.graph.parentItemId === root.itemId);
+  await f.ledger.transition({ itemId: child.itemId, expectedRevision: child.revision, leaseId: null,
+    actorId: "work-ledger-system", toStatus: "blocked", reason: "plan_failed" });
+  current = await packet();
+  child = current.context.requirements.coordination.directChildren.find(item => item.taskId === child.itemId);
+  const beforeRoot = structuredClone(root);
+  await execute(orchestrationIntent(current.context, actionBase(current.context, child, "cancel", "Retire only the settled child"), "Replace child plan").intent);
+  assert.deepEqual(await f.ledger.readItemForReconciliation({ itemId: root.itemId }), beforeRoot);
+  current = await packet();
+  await execute(decompose(current.context, { childKey: "replacement-plan", title: "Replacement plan", capability: "development", dependsOn: [],
+    contract: acceptanceContract("implementation", "change-package", "Controlled repair") }).intent);
+  const items = (await f.ledger.listItems()).items;
+  assert.equal(items.find(item => item.itemId === root.itemId).status, "queued");
+  assert.equal(items.filter(item => item.graph.parentItemId === root.itemId && item.status === "cancelled").length, 1);
+  assert.equal(items.filter(item => item.graph.parentItemId === root.itemId && item.status === "queued").length, 1);
+});
 
 test("requirements, development, and testing iteratively complete one shared task tree", async () => {
   const {

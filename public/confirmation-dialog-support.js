@@ -12,6 +12,47 @@ const deferredConfirmationKinds = Object.freeze({
   review: Object.freeze({ binding: SHA1 }),
 });
 
+export function shouldCloseExternalConfirmation(previous, current, automaticReviewEnabled = false) {
+  if (!current || current.id !== previous?.id) return false;
+  if (["completed", "stale", "rejected", "executing"].includes(current.status)) return true;
+  if (current.status !== "pending") return false;
+  if (SHA256.test(current.approvalBindingDigest || "") &&
+      current.approvalBindingDigest !== previous.approvalBindingDigest) return true;
+  return automaticReviewEnabled === true && current.kind === "github.work-proposal-review" &&
+    current.display?.payload?.action?.type === "pull_request_review";
+}
+
+export function createExternalConfirmationReconciler({ readItem, getCurrent, onResolved }) {
+  return createConfirmationReconciler({ readItem, getCurrent, onResolved,
+    itemId: item => item.id,
+    shouldClose: (previous, current, captured) => shouldCloseExternalConfirmation(previous, current, captured.automaticReviewEnabled) });
+}
+
+export function createInternalConfirmationReconciler({ readItem, getCurrent, onResolved }) {
+  return createConfirmationReconciler({ readItem, getCurrent, onResolved,
+    itemId: item => item.requestId,
+    shouldClose: (previous, current) => Boolean(current && current.requestId === previous.requestId &&
+      ["answered", "rejected", "archived"].includes(current.status)) });
+}
+
+function createConfirmationReconciler({ readItem, getCurrent, onResolved, itemId, shouldClose }) {
+  let latestRead = 0;
+  return async function reconcile() {
+    const captured = getCurrent();
+    if (!captured || captured.submitting) return false;
+    const read = ++latestRead;
+    let item;
+    try { item = await readItem(itemId(captured.item)); }
+    catch { return false; }
+    const current = getCurrent();
+    if (read !== latestRead || !current || current.submitting ||
+        current.owner !== captured.owner || current.key !== captured.key ||
+        current.requestSequence !== captured.requestSequence) return false;
+    if (!shouldClose(captured.item, item, current)) return false;
+    return onResolved(captured.owner);
+  };
+}
+
 function isDeferredConfirmationKey(value) {
   if (typeof value !== "string") return false;
   const parts = value.split("\u0000");

@@ -1,7 +1,7 @@
 import { types as utilTypes } from "node:util";
 
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
-import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { normalizeAbortSignal, runStructuredProviderRequest } from "../lib/structured-provider-request.js";
 
 const DEFAULT_MODEL = "qwen3.5:9b";
 const DEFAULT_BASE_URL = "http://127.0.0.1:11434";
@@ -82,7 +82,7 @@ const OLLAMA_GENERATION_SCHEMA = {
 
 const RESULT_FIELDS = Object.freeze(Object.keys(RESULT_SCHEMA.properties));
 
-class InvalidEmployeeResultError extends Error {}
+export class InvalidEmployeeResultError extends Error {}
 class EmployeeTransportError extends Error {
   constructor() {
     super("Ollama employee transport request failed");
@@ -564,6 +564,26 @@ function parseResult(response, context) {
   return value;
 }
 
+function preparePrEmployeeContext(input, contextTokens) {
+  const selected = selectContext(input);
+  if (!["review", "owner", "triage"].includes(selected.workMode)) {
+    throw new Error("PR employee workMode must be review, owner, or triage");
+  }
+  return fitContext(selected, contextTokens);
+}
+
+export function preparePrEmployeeAnalysis(input, { contextTokens = DEFAULT_CONTEXT_TOKENS, isRetry = false } = {}) {
+  const context = preparePrEmployeeContext(input, contextTokens);
+  return { context, schema: RESULT_SCHEMA, messages: [
+    { role: "system", content: systemPrompt(context.workMode, isRetry) },
+    { role: "user", content: JSON.stringify(context) },
+  ] };
+}
+
+export function parsePrEmployeeResult(content, context) {
+  return parseResult({ message: { content } }, context);
+}
+
 export class OllamaPrEmployeeReviewer {
   constructor({
     fetch: fetchImpl = globalThis.fetch,
@@ -588,14 +608,38 @@ export class OllamaPrEmployeeReviewer {
     this.contextTokens = positiveNumber(contextTokens, DEFAULT_CONTEXT_TOKENS);
   }
 
+  async checkAvailability(options) {
+    const signal = analysisSignal(options);
+    const controller = new AbortController();
+    const unavailable = () => Object.assign(new Error("Ollama 服务或配置的模型不可用"), {
+      code: "STRUCTURED_PROVIDER_UNAVAILABLE",
+    });
+    try {
+      await runStructuredProviderRequest({
+        controller, signal, timeoutMs: Math.min(this.timeoutMs, 3_000),
+        cancellationError: () => signal.reason,
+        timeoutError: unavailable,
+        operation: async () => {
+          const response = await this.fetch(`${this.baseUrl}/api/tags`, {
+            redirect: "error", signal: controller.signal,
+          });
+          if (!response.ok) throw unavailable();
+          const body = await response.json();
+          if (!body.models?.some(entry => entry.name === this.model || entry.model === this.model)) {
+            throw unavailable();
+          }
+        },
+      });
+    } catch {
+      signal?.throwIfAborted();
+      throw unavailable();
+    }
+  }
+
   async analyze(input, options) {
     const signal = analysisSignal(options);
     signal?.throwIfAborted();
-    const selectedContext = selectContext(input);
-    if (!["review", "owner", "triage"].includes(selectedContext.workMode)) {
-      throw new Error("PR employee workMode must be review, owner, or triage");
-    }
-    const context = fitContext(selectedContext, this.contextTokens);
+    const context = preparePrEmployeeContext(input, this.contextTokens);
     let lastError = "unknown validation error";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       signal?.throwIfAborted();

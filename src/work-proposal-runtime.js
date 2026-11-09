@@ -210,6 +210,8 @@ export async function createWorkProposalRuntime({
           admit(() => proposals.getProposalForEvidence(value)),
         getResultForProposal: (value) =>
           admit(() => proposals.getResultForProposal(value)),
+        listReviewPublicationSources: (value) =>
+          admit(() => proposals.listReviewPublicationSources(value)),
         listEvidenceCandidates: (value) =>
           admit(() => proposals.listEvidenceCandidates(value)),
       }),

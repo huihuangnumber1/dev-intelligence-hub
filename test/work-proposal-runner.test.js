@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
+import { normalizeBoundWorkProposal, normalizeWorkProposalClaimRequest } from "../src/domain/work-proposal-contract.js";
 import { WorkProposalRunnerService } from "../src/services/work-proposal-runner.js";
 
 function proposal(number = 1) {
@@ -63,6 +63,24 @@ class FakeRunner {
     };
   }
 }
+
+test("a long configured review lease is accepted by the proposal runner and claim contract", async () => {
+  const runner = new FakeRunner([claim()]);
+  const originalClaim = runner.claim.bind(runner);
+  runner.claim = (input) => {
+    const normalized = normalizeWorkProposalClaimRequest({ runnerId: "github-runner", ...input });
+    assert.equal(normalized.leaseDurationMs, 18 * 60_000);
+    return originalClaim(input);
+  };
+  const service = new WorkProposalRunnerService({
+    runner,
+    handler: { async handle() { return { status: "succeeded", summary: "review completed", evidence: [] }; } },
+    leaseDurationMs: 18 * 60_000,
+    clock: () => new Date("2026-08-02T03:00:00.000Z"),
+  });
+  const result = await service.runCycle({ limit: 1 });
+  assert.equal(result.advanced, 1);
+});
 
 test("a bounded cycle claims, delegates without lease authority, and advances a batch", async () => {
   const runner = new FakeRunner([claim(1), claim(2)]);

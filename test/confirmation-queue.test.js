@@ -14,6 +14,7 @@ import {
   CONFIRMATION_HISTORY_MAX_ROLE_FACETS,
   ConfirmationExecutionError,
   ConfirmationQueue,
+  projectConfirmationMemoryState,
 } from "../src/services/confirmation-queue.js";
 import { configurationImpactDigest } from "../src/services/configuration-state.js";
 import {
@@ -329,6 +330,42 @@ async function readyQueue({
   return queue;
 }
 
+test("automatic Reviews stay available to the publisher while human selection advances past them", async () => {
+  const queue = await readyQueue();
+  for (let index = 0; index < 40; index += 1) {
+    await queue.enqueue(actionPlan({ id: `managed-review-${index}`, kind: "github.work-proposal-review" }));
+  }
+  await queue.enqueue(actionPlan({ id: "manual-review", kind: "github.pull-request-review" }));
+  const human = await queue.nextForHuman();
+  assert.equal(human.item.id, "manual-review");
+  assert.equal(human.pendingCount, 1);
+  assert.equal(human.systemManagedCount, 40);
+  assert.equal(human.automaticReviewEnabled, true);
+  const raw = await queue.next();
+  assert.equal(raw.item.id, "managed-review-0");
+  assert.equal(raw.pendingCount, 41);
+  assert.equal((await queue.nextForAction("github.work-proposal-review", "pull_request_review")).item.id, raw.item.id);
+  assert.equal((await queue.get(raw.item.id)).status, "pending");
+  assert.equal((await queue.approve(raw.item.id, approvalRequest(raw))).status, "completed");
+});
+
+test("human selection retains converted comments and failed automatic Reviews", async () => {
+  const actionExecutor = executor({ async execute() {
+    throw new ConfirmationExecutionError("TEMPORARY", "retry", { outcome: "absent", retryable: true });
+  } });
+  const queue = await readyQueue({ actionExecutor });
+  await queue.enqueue(actionPlan({ id: "failed-review", kind: "github.work-proposal-review" }));
+  const raw = await queue.next();
+  await queue.approve(raw.item.id, approvalRequest(raw));
+  const human = await queue.nextForHuman();
+  assert.equal(human.item.id, "failed-review");
+  assert.equal(human.item.status, "failed");
+  assert.equal(human.systemManagedCount, 0);
+  await queue.enqueue(actionPlan({ id: "converted-comment", kind: "github.work-proposal-review",
+    action: { type: "pull_request_comment", body: "self authored note" } }));
+  assert.equal((await queue.nextForHuman()).item.id, "converted-comment");
+});
+
 function approvalRequest(next, requestId = "request-approve-0001") {
   return {
     requestId,
@@ -347,6 +384,67 @@ function producerInvalidation(item, overrides = {}) {
     ...overrides,
   };
 }
+
+test("internal settlement reads durable full records without exposing them in user projections", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  const item = await queue.enqueue(actionPlan());
+  assert.equal("execution" in item, false);
+  const otherQueue = await readyQueue({ store });
+  await otherQueue.invalidate(item.id, producerInvalidation(item, {
+    reason: "authorization_changed",
+  }));
+  const snapshot = await queue.readSettlement({ confirmationId: item.id });
+  assert.equal(snapshot.queueRevision, store.value.revision);
+  assert.equal(snapshot.item.status, "stale");
+  assert.equal(snapshot.item.invalidation.reason, "authorization_changed");
+  for (const field of ["execution", "receipt", "failure"]) {
+    assert.equal(snapshot.item[field], null);
+  }
+  assert.deepEqual(snapshot.item.action, store.value.items[0].action);
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.item.action), true);
+  assert.equal(await queue.readSettlement({ confirmationId: "missing-item" }), null);
+  await assert.rejects(queue.readSettlement({ confirmationId: item.id, extra: true }),
+    (error) => error.code === "INVALID_CONFIRMATION_REQUEST");
+  store.failReadAt = store.readCount + 1;
+  await assert.rejects(queue.readSettlement({ confirmationId: item.id }), /disk read unavailable/);
+});
+
+test("internal settlement preserves evidence that an executed stale confirmation was started", async () => {
+  const queue = await readyQueue({ actionExecutor: executor({
+    async execute() { return { status: "stale" }; },
+  }) });
+  await queue.enqueue(actionPlan());
+  const next = await queue.next();
+  await queue.approve(next.item.id, approvalRequest(next));
+  const snapshot = await queue.readSettlement({ confirmationId: next.item.id });
+  assert.equal(snapshot.item.status, "stale");
+  assert.equal(snapshot.item.execution.outcome, "stale");
+  assert.equal(snapshot.item.invalidation, null);
+});
+
+test("batch settlement reads use one current durable snapshot and stay private and immutable", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  const item = await queue.enqueue(actionPlan());
+  const other = await readyQueue({ store });
+  await other.invalidate(item.id, producerInvalidation(item));
+  const beforeReads = store.readCount, beforeWrites = store.writeCount;
+  const snapshot = await queue.readSettlements({ confirmationIds: [item.id, "missing-item"] });
+  assert.equal(store.readCount - beforeReads, 1);
+  assert.equal(store.writeCount, beforeWrites);
+  assert.equal(snapshot.queueRevision, store.value.revision);
+  assert.equal(snapshot.items.length, 1);
+  assert.equal(snapshot.items[0].status, "stale");
+  assert.equal(snapshot.items[0].execution, null);
+  assert.equal(Object.isFrozen(snapshot.items[0].action), true);
+  for (const confirmationIds of [[item.id, item.id], ["bad/id"], new Array(1), new Array(1001)]) {
+    await assert.rejects(queue.readSettlements({ confirmationIds }), { code: "INVALID_CONFIRMATION_REQUEST" });
+  }
+  store.failReadAt = store.readCount + 1;
+  await assert.rejects(queue.readSettlements({ confirmationIds: [item.id] }), /disk read unavailable/);
+});
 
 test("the queue stays closed until durable recovery succeeds", async () => {
   const queue = new ConfirmationQueue({
@@ -988,6 +1086,88 @@ test("confirmation memory pages are sanitized, high-water bound, and restart sta
     }),
     (error) => error?.code === "CONFIRMATION_MEMORY_SOURCE_CHANGED",
   );
+});
+
+test("confirmation memory pages keep their durable snapshot private across reload completion", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(pullRequestExternalActionQueuePlan({ type: "comment", body: "Durable body" }));
+  const expected = projectConfirmationMemoryState(store.value);
+  let publicState = queue.state;
+  Object.defineProperty(queue, "state", {
+    configurable: true,
+    get: () => publicState,
+    set(value) {
+      publicState = value;
+      queueMicrotask(() => {
+        value.revision = 0;
+        value.items.length = 0;
+      });
+    },
+  });
+
+  const page = await queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null });
+  assert.equal(publicState.items.length, 0);
+  assert.equal(page.highWatermark, expected.highWatermark);
+  assert.deepEqual(page.items, expected.items);
+  assert.equal(Object.isFrozen(page.items[0].action), true);
+});
+
+test("confirmation memory pagination rereads durable changes and rejects corrupted content", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  for (const suffix of ["c", "a", "b"]) {
+    await queue.enqueue(pullRequestExternalActionQueuePlan(
+      { type: "comment", body: `Memory body ${suffix}` },
+      { proposalId: `proposal-memory-${suffix}` },
+    ));
+  }
+  const expected = projectConfirmationMemoryState(store.value);
+  const beforeReads = store.readCount;
+  const beforeWrites = store.writeCount;
+  const items = [];
+  let cursor = 0;
+  do {
+    const page = await queue.readMemoryPage({ cursor, limit: 1, highWatermark: expected.highWatermark });
+    items.push(...page.items);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  assert.deepEqual(items, expected.items);
+  assert.equal(store.readCount - beforeReads, 3);
+  assert.equal(store.writeCount, beforeWrites);
+  await assert.rejects(queue.readMemoryPage({ cursor: 4, limit: 1, highWatermark: null }), {
+    code: "INVALID_CONFIRMATION_MEMORY_QUERY",
+  });
+
+  const other = await readyQueue({ store });
+  await other.enqueue(pullRequestExternalActionQueuePlan(
+    { type: "comment", body: "Another writer" },
+    { proposalId: "proposal-memory-another-writer" },
+  ));
+  await assert.rejects(queue.readMemoryPage({ cursor: 0, limit: 1, highWatermark: expected.highWatermark }), {
+    code: "CONFIRMATION_MEMORY_SOURCE_CHANGED",
+  });
+  const current = await queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null });
+  assert.equal(current.items.length, 4);
+  assert.equal(current.highWatermark, store.value.revision);
+  store.value.items[0].approvalBindingDigest = "0".repeat(64);
+  await assert.rejects(queue.readMemoryPage({ cursor: 0, limit: 100, highWatermark: null }), {
+    code: "CONFIRMATION_STATE_CORRUPTED",
+  });
+});
+
+test("exported confirmation memory projection still validates frozen caller input", async () => {
+  const store = new MemoryStore();
+  const queue = await readyQueue({ store });
+  await queue.enqueue(pullRequestExternalActionQueuePlan({ type: "comment", body: "Strict exported reader" }));
+  const malformed = structuredClone(store.value);
+  malformed.items[0].approvalBindingDigest = "0".repeat(64);
+  Object.freeze(malformed.items[0]);
+  Object.freeze(malformed.items);
+  Object.freeze(malformed);
+  assert.throws(() => projectConfirmationMemoryState(malformed), {
+    code: "CONFIRMATION_STATE_CORRUPTED",
+  });
 });
 
 test("application result snapshots sort deterministically and reject invalid cursors", async () => {

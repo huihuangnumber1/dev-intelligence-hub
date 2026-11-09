@@ -33,6 +33,39 @@ const STATE_PRESENTATION = Object.freeze({
   }),
 });
 
+const NATIVE_STATE_PRESENTATION = Object.freeze({
+  available: {
+    tone: "available",
+    label: "原生登录可用",
+    summary: "CLI 可以使用服务账号的 Codex 登录和原生会话目录。",
+    guidance: "这表示执行能力已就绪，不代表任务已经开始；请在工作台账查看实际进度。",
+  },
+  file_login_unavailable: {
+    tone: "attention",
+    label: "原生登录不可用",
+    summary: "CLI 已就绪，但当前服务账号的 Codex 登录不可用。",
+    guidance: "请使用运行服务的同一账号和 CODEX_HOME 执行 codex login，再重新检查。",
+  },
+  unsafe_source: {
+    tone: "blocked",
+    label: "原生运行目录不可用",
+    summary: "系统无法安全使用原生执行所需的运行目录。",
+    guidance: "请检查运行目录的权限和路径，保留原有 Codex 会话历史。",
+  },
+  broker_blocked: {
+    tone: "blocked",
+    label: "执行状态待核验",
+    summary: "前一次 CLI 的退出或会话状态尚未确认，后续调用已暂停。",
+    guidance: "请检查受管进程和运行记录；确认退出后按运维手册恢复，保留原生会话目录。",
+  },
+  cli_unavailable: {
+    tone: "blocked",
+    label: "CLI 不可用",
+    summary: "系统无法安全启动支持原生执行的 Codex CLI。",
+    guidance: "请检查 Codex CLI 是否支持所需命令，并确保服务账号可以发现它。",
+  },
+});
+
 function shell({ body, tone = "pending", role = "status" }) {
   return `<section class="brain-provider-status-card status-${tone}" aria-labelledby="brain-provider-status-title">
     <div class="brain-provider-status-heading">
@@ -53,7 +86,7 @@ export function renderBrainProviderStatus({
 } = {}) {
   if (loading && state === null) {
     return shell({
-      body: "<p>正在检查 Codex CLI 与文件式登录能力…</p>",
+      body: "<p>正在检查 Codex CLI 与登录能力…</p>",
     });
   }
 
@@ -67,8 +100,10 @@ export function renderBrainProviderStatus({
     });
   }
 
-  const presentation = Object.hasOwn(STATE_PRESENTATION, state?.state)
-    ? STATE_PRESENTATION[state.state]
+  const nativeLogin = state?.credentialMode === "codex-native-login";
+  const presentations = nativeLogin ? NATIVE_STATE_PRESENTATION : STATE_PRESENTATION;
+  const presentation = Object.hasOwn(presentations, state?.state)
+    ? presentations[state.state]
     : null;
   if (!presentation) {
     return shell({
@@ -95,7 +130,7 @@ export function renderBrainProviderStatus({
       </div>
       <dl class="brain-provider-status-facts">
         <div><dt>CLI</dt><dd>${state.cliAvailable === true ? "可用" : "不可用"}</dd></div>
-        <div><dt>文件式登录</dt><dd>${state.fileLoginAvailable === true ? "可用" : "不可用"}</dd></div>
+        <div><dt>${nativeLogin ? "原生登录" : "文件式登录"}</dt><dd>${state.fileLoginAvailable === true ? "可用" : "不可用"}</dd></div>
       </dl>
       <p class="brain-provider-status-guidance">${presentation.guidance}</p>`,
   });

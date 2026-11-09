@@ -71,9 +71,56 @@ test("backup identity is stable across retry timestamps for the same checkpoint"
   assert.notEqual(second.contentDigest, first.contentDigest);
 });
 
+test("declared executor source and generated library paths round-trip", () => {
+  const value = input();
+  const paths = [
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/.clang-tidy",
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/Scripts/Test/.gitattributes",
+    "code-executor/workspaces/oct-software/attempt-30c09b252b4f648c638239b9/.github/workflows/check.yml",
+    `code-executor/workspaces/.test-library/${A}/test.mjs`,
+    `code-executor/windows-tests/${A}/data/workspace/.gitignore`,
+    `code-executor/windows-tests/${A}/data/workspace/Packages/test/AC/Temp/.cache/result.bin`,
+    `code-executor/windows-tests/${A}/data/resources/test-assets/.config/settings.json`,
+  ];
+  value.files = paths.map((path) => ({ path, kind: "mutable", bytes: 1, sha256: A }));
+
+  const manifest = createBackupManifest(value);
+
+  assert.deepEqual(manifest.files.map(({ path }) => path), [...paths].sort());
+  assert.deepEqual(normalizeBackupManifest(structuredClone(manifest)), manifest);
+});
+
+test("manifest store capacity follows the bounded durable file inventory", () => {
+  const value = input();
+  value.stores = Array.from({ length: 300 }, (_, index) => ({
+    name: `original-repair-feedback-record-${index.toString(16).padStart(64, "0")}`,
+    revision: 0,
+    digest: A,
+  }));
+  value.files = value.stores.map(({ name }) => ({
+    path: `${name}.json`, kind: "mutable", bytes: 1, sha256: A,
+  }));
+
+  const manifest = createBackupManifest(value);
+
+  assert.equal(manifest.checkpoint.stores.length, 300);
+  assert.equal(manifest.totals.fileCount, 300);
+  assert.deepEqual(normalizeBackupManifest(structuredClone(manifest)), manifest);
+  value.stores = Array(100_001).fill(value.stores[0]);
+  assert.throws(() => createBackupManifest(value), BackupManifestError);
+  value.stores = Array(100_000).fill({ name: "a".repeat(126), revision: 0, digest: A });
+  assert.throws(() => createBackupManifest(value), {
+    code: "INVALID_BACKUP_MANIFEST", message: "备份清单超出容量限制",
+  });
+  value.stores = input().stores;
+  value.files = Array(100_001).fill(value.files[0]);
+  assert.throws(() => createBackupManifest(value), BackupManifestError);
+});
+
 test("manifest validation rejects tampering and non-canonical derived fields", () => {
   const manifest = structuredClone(createBackupManifest(input()));
   const cases = [
+    (value) => { value.schemaVersion = 2; },
     (value) => { value.files[0].bytes += 1; },
     (value) => { value.files.reverse(); },
     (value) => { value.checkpoint.stores.reverse(); },
@@ -111,6 +158,23 @@ test("manifest creation rejects unsafe paths, collisions, and invalid checkpoint
     "state/star*.json",
     "state/less<name.json",
     "state/greater>name.json",
+    ".unknown.json",
+    "code-executor/.unknown/config.json",
+    "code-executor/artifacts/.gitignore",
+    "code-executor/workspaces/.unknown/test.mjs",
+    "code-executor/workspaces/oct-software/.unknown/.gitignore",
+    "code-executor/workspaces/oct-software/attempt-1/../.gitignore",
+    "code-executor/workspaces/oct-software/attempt-1/./.gitignore",
+    "code-executor/workspaces/oct-software/attempt-1/.gitignore:stream",
+    "code-executor/workspaces/oct-software/attempt-1/.cache/NUL.txt",
+    "code-executor/workspaces/oct-software/attempt-1/.cache/COM1",
+    "code-executor/workspaces/oct-software/attempt-1/.cache/control\u0001.txt",
+    `code-executor/workspaces/.test-library/${A}/unknown.mjs`,
+    "code-executor/workspaces/.test-library/not-a-fingerprint/test.mjs",
+    `code-executor/windows-tests/${A}/.unknown/file`,
+    `code-executor/windows-tests/${A}/data/control/.unknown`,
+    `code-executor/windows-tests/${A}/data/resources/.unknown/file`,
+    "code-executor/windows-tests/not-a-fingerprint/data/workspace/.gitignore",
   ];
   for (const path of unsafePaths) {
     const value = input();

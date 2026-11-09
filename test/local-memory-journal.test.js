@@ -1519,3 +1519,47 @@ test("query and batch boundaries reject unknown fields and sparse arrays", async
   assert.throws(() => journal.appendBatch({ records }), /records 无效/);
   assert.throws(() => journal.search({ cursor: "not-a-cursor" }), /cursor 无效/);
 });
+
+
+test("recovery retires orphaned unbound consultation history once without altering checkpoint or old records", async () => {
+  const store = memoryStore();
+  const { journal } = await fixture({ store });
+  const candidate = authorityProjectionRecord("consultation-request", {
+    applies: false, current: true, bindingDigest: null, inputBinding: null,
+  });
+  await journal.appendAuthorityProjection(authorityProjectionCommit([candidate]));
+  await journal.append(record(2));
+  const damaged = store.values.get(MEMORY_JOURNAL_KEY);
+  damaged.lifecycleAuthority.authorityProjection.entries = [];
+  const before = structuredClone(damaged);
+  store.values.set(MEMORY_JOURNAL_KEY, damaged);
+  const recovered = await fixture({ store });
+  const fixed = store.values.get(MEMORY_JOURNAL_KEY);
+  assert.deepEqual(fixed.records.slice(0, before.records.length), before.records);
+  assert.deepEqual(fixed.lifecycleAuthority, before.lifecycleAuthority);
+  assert.equal(fixed.records.length, before.records.length + 1);
+  assert.equal(fixed.revision, before.revision + 1);
+  assert.deepEqual(fixed.records.at(-1).evidence, [`supersedes:${before.records[0].recordId}`]);
+  assert.equal(JSON.parse(fixed.records.at(-1).content).authority.current, false);
+  assert.equal(recovered.journal.readRecords({ recordIds: [before.records[0].recordId] }).items[0].labels.lifecycle, "obsolete");
+  await fixture({ store });
+  assert.deepEqual(store.values.get(MEMORY_JOURNAL_KEY), fixed);
+  const corrupt = structuredClone(before);
+  corrupt.records[0].contentDigest = "f".repeat(64);
+  store.values.set(MEMORY_JOURNAL_KEY, corrupt);
+  const writes = store.writes.length;
+  await assert.rejects(fixture({ store }));
+  assert.equal(store.writes.length, writes);
+});
+
+test("authority projection cannot remove a current unbound consultation without an obsolete supersession", async () => {
+  const { store, journal } = await fixture();
+  const candidate = authorityProjectionRecord("consultation-request", {
+    applies: false, current: true, bindingDigest: null, inputBinding: null,
+  });
+  await journal.appendAuthorityProjection(authorityProjectionCommit([candidate]));
+  const writes = store.writes.length;
+  await assert.rejects(journal.appendAuthorityProjection(authorityProjectionCommit([], { revision: 2 })),
+    error => error.code === "MEMORY_LIFECYCLE_AUTHORITY_INVALID");
+  assert.equal(store.writes.length, writes);
+});

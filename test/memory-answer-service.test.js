@@ -511,6 +511,46 @@ test("remote authorization denies hidden code before any provider call", async (
   assert.equal(providerCalls.length, 0);
 });
 
+test("memory answers accept real router DingTalk descriptions without granting code access", async () => {
+  for (const code of [true, false]) {
+    const calls = [];
+    const router = new BrainRouter({ providers: [
+      { id: "remote", remote: true, async generate(input) {
+        calls.push(input);
+        return JSON.stringify({ schemaVersion: 1, status: "insufficient_evidence", claims: [] });
+      } },
+      { id: "local", remote: false, async generate() { assert.fail("No fallback expected"); } },
+    ] });
+    const service = new MemoryAnswerService({
+      contextRetriever: { async retrieve() { return packet(); } }, brainRouter: router,
+      configuredBrain: { provider: "remote", model: "smart",
+        remoteData: { requirements: false, code, memory: true, dingtalk: true } },
+      localBrain: brain(),
+    });
+    if (code) {
+      assert.equal((await service.answer(request())).status, "insufficient_evidence");
+      assert.equal(calls.length, 1);
+    } else {
+      await assert.rejects(service.answer(request()), { code: "REMOTE_DATA_NOT_AUTHORIZED" });
+      assert.equal(calls.length, 0);
+    }
+  }
+});
+
+test("memory brain descriptions reject unknown grants and non-boolean DingTalk grants", () => {
+  for (const extra of [{ dingtalk: "true" }, { files: true }]) {
+    const router = fakeRouter([], []);
+    const describe = router.describe;
+    router.describe = value => {
+      const description = describe(value);
+      description.remoteData = { ...description.remoteData, ...extra };
+      return description;
+    };
+    assert.throws(() => new MemoryAnswerService({ contextRetriever: { async retrieve() { return packet(); } },
+      brainRouter: router, configuredBrain: brain(), localBrain: brain() }), /remoteData is invalid/);
+  }
+});
+
 test("bounded concurrency rejects excess questions before retrieval or provider work", async () => {
   let releaseGenerate;
   let markGenerateStarted;

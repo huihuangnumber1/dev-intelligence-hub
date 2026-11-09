@@ -5,6 +5,7 @@ import {
 } from "../domain/work-intent-dispatch-binding.js";
 import {
   createWorkIntentRecord,
+  pendingWorkIntentRecord,
   normalizeLedgerWorkIntent,
   WORK_LEDGER_OUTBOX_DELIVERY_SEMANTICS,
 } from "./work-ledger-records.js";
@@ -39,6 +40,8 @@ import {
 import {
   registeredCrossRootPullRequestCutover,
 } from "./work-ledger-pr-cutover-commands.js";
+import { assertWorkLedgerGraphCompletable } from "./work-ledger-graph.js";
+import { createBrainRecoveryStamp, hostBrainRecoveryCode } from "./brain-recovery-intent.js";
 
 const PROPOSAL_INTENT_TYPES = new Set([
   "propose_github_review",
@@ -96,28 +99,6 @@ function assertIntentRevision(intent, expectedRevision) {
       409,
     );
   }
-}
-
-function pendingIntent(existing, item, intent, requestedBy, now) {
-  if (!existing) return createWorkIntentRecord(item, intent, requestedBy, now);
-  if (existing.status !== "failed") {
-    throw workLedgerError(
-      "WORK_LEDGER_INTENT_CONFLICT",
-      "相同工作意图已经进入 outbox",
-      409,
-    );
-  }
-  return {
-    ...existing,
-    status: "pending",
-    revision: existing.revision + 1,
-    dispatcherId: null,
-    dispatchLeaseId: null,
-    dispatchLeaseUntil: null,
-    dispatchBinding: null,
-    outcome: null,
-    updatedAt: now,
-  };
 }
 
 function normalizeRequestedBy(input, item, intent) {
@@ -239,6 +220,7 @@ export function planIntentStage({ state, input, clock }) {
     );
   }
   const requestedBy = normalizeRequestedBy(input, item, suppliedIntent);
+  if (suppliedIntent.type === "complete") assertWorkLedgerGraphCompletable(state, itemId);
   const intent = bindProposalDispatchIntent(
     state,
     item,
@@ -247,10 +229,11 @@ export function planIntentStage({ state, input, clock }) {
   );
   const actorId = requestedBy.workerId;
   const candidate = createWorkIntentRecord(item, intent, requestedBy, now);
+  candidate.brainRecovery = createBrainRecoveryStamp(candidate, hostBrainRecoveryCode(input.intent));
   const existing = state.outbox.find(
     ({ intentId }) => intentId === candidate.intentId,
   );
-  const outboxResult = pendingIntent(existing, item, intent, requestedBy, now);
+  const outboxResult = pendingWorkIntentRecord(existing, candidate, now);
   const itemResult = moveWorkItem(item, {
     status: "dispatch_pending",
     now,
@@ -675,6 +658,7 @@ export function planIntentAcknowledgement({ state, input, clock }) {
     : null;
   const legacyCutover = isWorkItemInLegacyPullRequestCutover(item);
   const nextStatus = legacyCutover ? "blocked" : input.nextStatus;
+  if (nextStatus === "completed") assertWorkLedgerGraphCompletable(state, item.itemId);
   const activeIntentId = !legacyCutover &&
       INTENT_WAITING_STATUSES.has(input.nextStatus)
     ? outbox.intentId

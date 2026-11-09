@@ -8,6 +8,7 @@ import { CodeJobApprovalExecutor } from "./services/code-job-approval-executor.j
 import { CodeJobChangePackageDispatcher } from "./services/code-job-change-package-dispatcher.js";
 import { CodeJobStore } from "./services/code-job-store.js";
 import { CodeJobWorkerService } from "./services/code-job-worker-service.js";
+import { AutomaticCodeJobPauseRecovery } from "./services/automatic-code-job-pause-recovery.js";
 
 const GUARD_NAME = "mydashboard-code-job-v1";
 
@@ -151,7 +152,7 @@ function normalizeWorkerLimits(value) {
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(
-      (key) => !["maxTurns", "observationLimit"].includes(key),
+      (key) => !["maxTurns", "observationLimit", "concurrency"].includes(key),
     )
   ) {
     throw new TypeError("workerLimits is invalid");
@@ -199,6 +200,10 @@ export async function createCodeJobRuntime({
   grantVerifier,
   executor,
   brainDirectory,
+  taskRuns,
+  automaticPauseRecovery,
+  reviewRepairContextReader,
+  conflictSourceReader,
   actionAdmissionGate,
   dataDirectory,
   operationQueue = new OperationQueue(),
@@ -301,6 +306,12 @@ export async function createCodeJobRuntime({
           jobStore: jobs,
           executor,
           brainDirectory,
+          taskRuns,
+          ...(typeof automaticPauseRecovery?.canReplanUnstartedWrite !== 'function' ? {} : {
+            unstartedWriteRecovery: { canRecover: job => automaticPauseRecovery.canReplanUnstartedWrite(job) },
+          }),
+          ...(reviewRepairContextReader === undefined ? {} : { reviewRepairContextReader }),
+          ...(conflictSourceReader == null ? {} : { conflictSourceReader }),
           grantVerifier,
           ...(actionAdmissionGate === undefined
             ? {}
@@ -311,11 +322,13 @@ export async function createCodeJobRuntime({
             ? {}
             : { changePackageDeliveryEnabled: true }),
         });
+    const pauseRecovery = worker === null || automaticPauseRecovery === undefined ? null :
+      new AutomaticCodeJobPauseRecovery({ jobs, taskRuns, eligibility: automaticPauseRecovery });
     const workerPort = worker === null
       ? null
       : bindPort(
           worker,
-          ["runCycle", "requestCancellation"],
+          ["runCycle", "requestCancellation", ...(typeof worker.runReady === 'function' ? ['runReady'] : [])],
           "code job worker",
         );
     const signalWorkerCancellation = (jobId) => {
@@ -379,11 +392,19 @@ export async function createCodeJobRuntime({
             runCycle: (value) =>
               admission.run(() => changePackageDispatcher.runCycle(value)),
           }),
+      ...(pauseRecovery === null ? {} : { pauseRecovery: frozenPort({
+        runCycle: value => admission.run(() => pauseRecovery.runCycle(value)),
+      }) }),
       worker: workerPort === null
         ? null
         : frozenPort({
             runCycle: (value) =>
               admission.run(() => workerPort.runCycle(value)),
+            ...(workerPort.runReady === undefined ? {} : { runReady(value, runOperation) {
+              if (typeof runOperation !== 'function') throw new TypeError('managed code execution requires an operation owner');
+              return admission.run(() => workerPort.runReady(value,
+                operation => runOperation(() => admission.run(operation))));
+            } }),
           }),
       close,
     });

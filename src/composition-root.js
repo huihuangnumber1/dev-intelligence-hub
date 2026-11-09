@@ -5,10 +5,24 @@ import {
 } from "./adapters/codex-login-credential-broker.js";
 import { DingTalkAdapter } from "./adapters/dingtalk-adapter.js";
 import { GitHubAdapter } from "./adapters/github-adapter.js";
+import { createProductionSupervisedCliBrainProvider } from "./adapters/supervised-cli-brain-provider.js";
+import { AutomaticReviewPublisher } from "./services/automatic-review-publisher.js";
+import { AutomaticOwnPrRepair } from "./services/automatic-own-pr-repair.js";
+import { AutomaticLocalCodeAuthorization } from "./services/automatic-local-code-authorization.js";
+import { AutomaticOwnPrHandoff } from "./services/automatic-own-pr-handoff.js";
+import { WorkContinuationScheduler } from "./services/work-continuation-scheduler.js";
+import { HistoricalControlledCommitReader } from "./services/historical-controlled-commit-reader.js";
+import { ReviewRepairContextReader, normalizeReviewRepairFeedbackContext } from "./services/review-repair-context-reader.js";
+import { CiRepairContextReader } from './services/ci-repair-context-reader.js';
+import { isHeadRepairExecutionSource } from './domain/code-execution-source.js';
+import { OriginalRepairFeedbackReader } from "./services/original-repair-feedback-reader.js";
+import { OwnPrRepairObjectSync, OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS } from "./adapters/own-pr-repair-object-sync.js";
 import { createGitHubPullRequestActionTransport } from "./adapters/github-pull-request-action-transport.js";
 import { createGhLoginCredentialSource } from "./adapters/gh-login-credential-source.js";
 import { OllamaBrain } from "./adapters/ollama-brain.js";
+import { RoutedDingTalkSummaryBrain } from "./adapters/routed-dingtalk-summary-brain.js";
 import { OllamaPrEmployeeReviewer } from "./adapters/ollama-pr-employee-reviewer.js";
+import { RoutedPrEmployeeReviewer } from "./adapters/routed-pr-employee-reviewer.js";
 import { TokenEnvCredentialSource } from "./adapters/token-env-credential-source.js";
 import { createAttentionInboxRuntime } from "./attention-inbox-runtime.js";
 import { createChangePackageRuntime } from "./change-package-runtime.js";
@@ -24,6 +38,7 @@ import { ActionAdmissionGate } from "./lib/action-admission-gate.js";
 import { loadConfigBootstrap, projectRoot } from "./lib/config.js";
 import { OperationQueue } from "./lib/operation-queue.js";
 import { PRODUCTION_PRIVATE_DIRECTORY_MANAGER } from "./lib/private-directory-manager.js";
+import { createJenkinsRuntime } from "./jenkins-runtime.js";
 import { ProcessExclusiveGuard } from "./lib/process-exclusive-guard.js";
 import {
   createProjectScopedGuardFactory,
@@ -42,6 +57,7 @@ import { ConfigurationActivationExecutor } from "./services/configuration-activa
 import { ConfigurationConfirmationRequester } from "./services/configuration-confirmation-requester.js";
 import { DeliveryEvidenceService } from "./services/delivery-evidence-service.js";
 import { createDailyWorkLedgerView } from "./services/daily-work-ledger-view.js";
+import { AutomaticOwnPrConflict } from "./services/automatic-own-pr-conflict.js";
 import { NotificationService } from "./services/notification-service.js";
 import { OwnerWorkRetryService } from "./services/owner-work-retry-service.js";
 import { EmployeeRegistry } from "./services/employee-registry.js";
@@ -52,6 +68,8 @@ import {
   readConfiguredConstructionCleanup,
 } from "./services/configured-workforce.js";
 import { CodeJobMemoryProjector } from "./services/code-job-memory-projector.js";
+import { ObsoleteCodeJobSettler } from "./services/obsolete-code-job-settler.js";
+import { githubEntitySessionKey } from "./lib/session-key.js";
 import { CodeJobEvidenceReader } from "./services/code-job-evidence-reader.js";
 import { ChangePackageApplicationResultReconciler } from "./services/change-package-application-result-reconciler.js";
 import { MemoryProjector } from "./services/memory-projector.js";
@@ -61,11 +79,24 @@ import { AgentMemoryQueryService } from "./services/agent-memory-query-service.j
 import { LocalSessionImporter } from "./services/local-session-importer.js";
 import { GitActivityImporter } from "./services/git-activity-importer.js";
 import { ProactiveWorkLoop } from "./services/proactive-work-loop.js";
+import { TaskRunRegistry } from './services/task-run-registry.js';
+import { createTaskRunView } from './services/task-run-view.js';
+import { createTaskRunSettler,canUseNativeStopEvidence } from './services/work-ledger-run-control.js';
 import { OrchestratorService } from "./services/orchestrator-service.js";
 import { RoleContextAssembler } from "./services/role-context-assembler.js";
+import { FailedCodeJobContextReader } from "./services/failed-code-job-context-reader.js";
 import { ProactivePrEmployeeService } from "./services/proactive-pr-employee.js";
 import { PrEngineerService } from "./services/pr-engineer-service.js";
+import { BoundReviewFeedbackReader } from "./services/bound-review-feedback-reader.js";
+import { ReviewPublicationAdoptionStore } from "./services/published-review-adoption.js";
+import { loadNativeReviewSkill } from "./lib/native-review-skill.js";
+import { ReviewPublicationReuseService, createReviewAdoptionTaskReader } from "./services/review-publication-reuse-service.js";
+import { readGitHubReviewFeedbackSnapshot } from "./adapters/github-review-feedback-snapshot.js";
+import { GitHubReviewReader } from "./adapters/github-review-reader.js";
+import { projectPullRequestReadFactsContext } from "./domain/pull-request-read-facts.js";
+import { runJson } from "./lib/command-runner.js";
 import { RefreshService } from "./services/refresh-service.js";
+import { OwnPrRepairProgressReader } from "./services/own-pr-repair-progress-reader.js";
 import { RoleWorkerDirectory } from "./services/role-worker-directory.js";
 import { WorkConditionWaker } from "./services/work-condition-waker.js";
 import { normalizeWorkCoordinationTiming } from "./services/work-coordination-timing.js";
@@ -87,8 +118,16 @@ import { createWorkLedgerRuntime } from "./work-ledger-runtime.js";
 import { createWorkProposalRuntime } from "./work-proposal-runtime.js";
 import { createWorkflowRoutingRuntime } from "./workflow-routing-runtime.js";
 import { createPrTriageWorkRequest } from "./domain/owner-work-request.js";
+import { matchRetiredTriageSource } from './services/work-ledger-triage-retirement.js';
+import { normalizeOwnerWorkRequestState } from './services/owner-work-request-state.js';
+import { isAutomaticReviewExecution } from './domain/automatic-review-policy.js';
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "./domain/prioritizer.js";
-import { samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
+import { createPullRequestExecutionBinding, samePullRequestExecutionBinding } from "./domain/pull-request-execution-binding.js";
+import { AutomaticReviewScopeExitReader } from "./services/automatic-review-scope-exit-reader.js";
+import { AutomaticReviewReentryReader } from "./services/automatic-review-reentry-reader.js";
+import { AutomaticHeadAncestryReader } from "./services/automatic-head-ancestry-reader.js";
+import { AutomaticReviewTestingStopReader } from './services/automatic-review-testing-retirement.js';
+import { AutomaticRoleHandoffReader } from "./services/automatic-role-handoff-reader.js";
 
 const GITHUB_REVIEW_PROPOSAL_RUNNER_ID = "github-review-runner";
 const GITHUB_PULL_REQUEST_ACTION_RUNNER_ID = "github-pr-action-runner";
@@ -134,7 +173,7 @@ export class ProductionCliCompositionGrant {
   }
 }
 
-export function createPrTriageHandoff(readOwnerWorkRequests) {
+export function createPrTriageHandoff(readOwnerWorkRequests, readWorkLedger = () => null) {
   if (typeof readOwnerWorkRequests !== "function") {
     throw new TypeError("PR triage handoff runtime reader is invalid");
   }
@@ -146,7 +185,17 @@ export function createPrTriageHandoff(readOwnerWorkRequests) {
           code: "PR_TRIAGE_HANDOFF_NOT_READY",
         });
       }
-      return runtime.submit(createPrTriageWorkRequest(input));
+      const request = createPrTriageWorkRequest(input);
+      if (input.targetRoleId === "pr-engineer" && input.gitTarget &&
+          ["review", "rereview", "complete_review"].includes(input.nextAction)) {
+        const ledger = readWorkLedger();
+        if (ledger) {
+          const existing = await ledger.readCurrentAutomaticReviewWork({ repository: input.repository,
+            number: input.number, headRefOid: input.expectedHeadRefOid, gitTarget: input.gitTarget });
+          if (existing !== null) return existing;
+        }
+      }
+      return runtime.submit(request);
     },
   });
 }
@@ -439,11 +488,14 @@ function productionCliRuntimeFacts(value) {
     "protectedRoots",
     "codexLoginCredentialBroker",
     "supervisedCliTemporaryRoot",
+    "originalRepairFeedbackReader",
+    "currentReviewFeedbackReader",
+    "reviewReaderFactory",
   ]);
   if (
     !Object.hasOwn(descriptors, "protectedRoots") ||
     keys.length < 1 ||
-    keys.length > 3 ||
+    keys.length > 6 ||
     keys.some(
       (key) =>
         typeof key !== "string" ||
@@ -487,12 +539,26 @@ function productionCliRuntimeFacts(value) {
   ) {
     throw new TypeError("Production CLI runtime facts are invalid");
   }
+  const feedbackReader = descriptors.originalRepairFeedbackReader?.value;
+  if (feedbackReader !== undefined && typeof feedbackReader?.read !== "function") {
+    throw new TypeError("Production CLI original feedback reader is invalid");
+  }
+  const currentFeedbackReader = descriptors.currentReviewFeedbackReader?.value;
+  const reviewReaderFactory = descriptors.reviewReaderFactory?.value;
+  if (reviewReaderFactory !== undefined && typeof reviewReaderFactory !== "function") throw new TypeError("Production review reader factory is invalid");
   return Object.freeze({
     protectedRoots: distinctAbsolutePaths(protectedRoots),
     ...(broker === undefined ? {} : { codexLoginCredentialBroker: broker }),
     ...(supervisedCliTemporaryRoot === undefined
       ? {}
       : { supervisedCliTemporaryRoot: path.resolve(supervisedCliTemporaryRoot) }),
+    ...(feedbackReader === undefined ? {} : {
+      originalRepairFeedbackReader: frozenPort(feedbackReader, ["read"], "originalRepairFeedbackReader"),
+    }),
+    ...(currentFeedbackReader === undefined ? {} : {
+      currentReviewFeedbackReader: frozenPort(currentFeedbackReader, ["read"], "currentReviewFeedbackReader"),
+    }),
+    ...(reviewReaderFactory === undefined ? {} : { reviewReaderFactory }),
   });
 }
 
@@ -753,12 +819,20 @@ async function verifyChangePackageApplicationAuthority({
 export function createBrain(config = {}, dependencies = {}) {
   if (!config.enabled) return null;
   if (config.provider === "ollama") {
-    return new OllamaBrain({
+    const fallback = new OllamaBrain({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       ...(dependencies.actionAdmissionGate === undefined
         ? {}
         : { actionAdmissionGate: dependencies.actionAdmissionGate }),
+    });
+    if (!config.primaryBrain) return fallback;
+    return new RoutedDingTalkSummaryBrain({
+      router: dependencies.router,
+      primaryBrain: config.primaryBrain,
+      allowRemoteDingTalkSummary: config.allowRemoteDingTalkSummary,
+      fallback,
+      timeoutMs: config.timeoutMs,
     });
   }
   throw new Error(`Unsupported brain provider: ${config.provider || "(empty)"}`);
@@ -772,13 +846,20 @@ export function createPrEmployeeReviewer(
   const config = { ...baseConfig, ...roleOverrides };
   if (!config.enabled) return null;
   if (config.provider === "ollama") {
-    return new OllamaPrEmployeeReviewer({
+    const fallback = new OllamaPrEmployeeReviewer({
       ...config,
       ...(dependencies.fetch ? { fetch: dependencies.fetch } : {}),
       ...(dependencies.actionAdmissionGate === undefined
         ? {}
         : { actionAdmissionGate: dependencies.actionAdmissionGate }),
     });
+    if (dependencies.primaryBrain && config.allowRemoteCodeContext !== true) {
+      throw new Error("PR employee primary brain requires explicit remote code context authorization");
+    }
+    return dependencies.primaryBrain
+      ? new RoutedPrEmployeeReviewer({ router: dependencies.router, primaryBrain: dependencies.primaryBrain,
+          fallback, timeoutMs: config.timeoutMs, contextTokens: config.contextTokens ?? config.numCtx })
+      : fallback;
   }
   throw new Error(
     `Unsupported PR employee brain provider: ${config.provider || "(empty)"}`,
@@ -834,10 +915,13 @@ export async function createApplication({
   agentMemoryQueryServiceFactory = (options) =>
     new AgentMemoryQueryService(options),
   memoryBrainRouterFactory = createConfiguredBrainRouter,
+  dingTalkBrainRouterFactory = createConfiguredBrainRouter,
+  prEmployeeBrainRouterFactory = createConfiguredBrainRouter,
   memoryAnswerDependencies = {},
   codexLoginCredentialBrokerFactory =
     createProductionCodexLoginCredentialBroker,
   codexLoginLocationsFactory = productionCodexLoginLocations,
+  nativeCodexStatusProviderFactory = createProductionSupervisedCliBrainProvider,
   localSessionImporterFactory = (options) => new LocalSessionImporter(options),
   gitActivityImporterFactory = (options) => new GitActivityImporter(options),
   codeJobMemoryProjectorFactory = (options) =>
@@ -953,6 +1037,9 @@ export async function createApplication({
   if (typeof codexLoginLocationsFactory !== "function") {
     throw new TypeError("codexLoginLocationsFactory must be a function");
   }
+  if (typeof nativeCodexStatusProviderFactory !== "function") {
+    throw new TypeError("nativeCodexStatusProviderFactory must be a function");
+  }
   const scopedRuntimeGuardFactory = createProjectScopedGuardFactory({
     projectRoot,
   });
@@ -994,6 +1081,7 @@ export async function createApplication({
         bootstrapError: null,
       };
   let config = bootstrap.candidate ?? bootstrap.fallbackConfiguration;
+  const jenkinsRuntime = createJenkinsRuntime({ projectRoot, privateRuntimeDirectory });
   const store = suppliedStore || new StateStore(path.join(projectRoot, "data"));
   const configuredOperations =
     operationsOptions &&
@@ -1023,8 +1111,31 @@ export async function createApplication({
   let configurationConfirmationRequester = null;
   let codeExecutorRuntime = null;
   let changePackageRuntime = null;
+  let automaticOwnPrRepair = null;
+  let automaticLocalCodeAuthorization = null;
+  let localCodeProposalRecovery = null;
+  let codeAuthorizationRoleRegistry = null;
+  let automaticReviewScopeExitReader = null;
+  let automaticReviewReentryReader = null;
+  let automaticHeadAncestryReader = null;
+  let automaticReviewTestingStopReader = null;
+  let automaticRoleHandoffReader = null;
   let workflowRouting = null;
   let workLedgerRuntime = null;
+  let hostContextRecoveryReader = null;
+  let ciRepairContextReader = null;
+  let workContinuationScheduler = null;
+  const originalRepairFeedbackReader = new OriginalRepairFeedbackReader({
+    store,
+    executionContextReader: Object.freeze({
+      readPullRequestExecutionContext(input) {
+        if (!workLedgerRuntime) throw Object.assign(new Error("Original feedback authority is not ready"), {
+          code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE",
+        });
+        return workLedgerRuntime.readPullRequestExecutionContext(input);
+      },
+    }),
+  });
   let ownerWorkRetry = null;
   let ownerWorkRequests = null;
   let attentionInboxRuntime = null;
@@ -1037,10 +1148,22 @@ export async function createApplication({
   let pullRequestExternalActionExecutor = null;
   let pullRequestExternalActionExecutorOwned = false;
   let codeJobReader = null;
+  let obsoleteCodeJobSettler = null;
   let inputAuthorityVerifier = null;
+  let currentReviewFeedbackReader = null;
+  let recordCompletedReviewRead = null;
+  let reviewPublicationReuse = null;
   let codeJobDeliveryEvidenceReader = null;
   let codeJobControl = null;
+  const taskRuns = new TaskRunRegistry({store,receiptStore:store,...(workCoordinationDependencies.clock ? {clock:workCoordinationDependencies.clock} : {}),
+    verifyStopped: async () => {
+      if (!canUseNativeStopEvidence(config.brainProviders)) return false;
+      const evidence = await brainProviderStatus?.readStatus();
+      return evidence?.credentialMode === 'codex-native-login' && evidence.state === 'available';
+    },
+    settleControl:(input) => createTaskRunSettler({ledger:workLedgerRuntime,codeJobReader,codeJobControl})(input)});
   let codeJobWorker = null;
+  let codeJobExecution = null;
   let codeJobMemoryProjector = null;
   let codeJobEvidenceReader = null;
   let codeJobChangePackageDispatcher = null;
@@ -1085,17 +1208,13 @@ export async function createApplication({
     const roleConfig = config.employees?.prReviewer || { enabled: false };
     const github = new GitHubAdapter({
       maxPatchCharacters: roleConfig.maxPatchCharacters,
+      readIncomingReviews: Object.hasOwn(config.githubActions || {}, "automaticReview"),
       ...(workCoordinationDependencies.clock
         ? { clock: workCoordinationDependencies.clock }
         : {}),
     });
-    const dingtalk = new DingTalkAdapter();
-    const brain = createBrain(
-      config.brain,
-      ordinaryActionAdmissionGate === null
-        ? {}
-        : { actionAdmissionGate: ordinaryActionAdmissionGate },
-    );
+    const dingtalk = new DingTalkAdapter({ ownerLogin: config.githubLogin });
+    let brain = null;
     codeExecutorRuntime = trackRuntime(
       await codeExecutorRuntimeFactory(config.codeExecutor, {
         ...codeExecutorDependencies,
@@ -1128,9 +1247,25 @@ export async function createApplication({
       ...cliProtectedRoots,
       ...credentialRoots,
     ]);
-    cliCompositionCapability = issueProductionCliCompositionGrant({
+    const cliRuntimeFacts = {
       protectedRoots: cliAndCredentialProtectedRoots,
       codexLoginCredentialBroker,
+      originalRepairFeedbackReader: frozenPort(originalRepairFeedbackReader, ["read"], "originalRepairFeedbackReader"),
+      currentReviewFeedbackReader: Object.freeze({ async read(input, options) {
+        if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+        return currentReviewFeedbackReader.read(input, options);
+      } }),
+      // This closure fixes the transport, fact source and policy to host-owned
+      // producers. Callers cannot submit coverage or substitute reader options.
+      async reviewReaderFactory(target, { signal = null } = {}) {
+        const skill = await loadNativeReviewSkill();
+        return new GitHubReviewReader({ originalRepairFeedbackReader,
+          currentReviewFeedbackReader: { async read(input, options) {
+            if (currentReviewFeedbackReader === null) throw Object.assign(new Error("PR_REVIEW_READ_FEEDBACK_UNAVAILABLE"), { code: "PR_REVIEW_READ_FEEDBACK_UNAVAILABLE" });
+            return currentReviewFeedbackReader.read(input, options);
+          } }, onCompleteReviewRead: receipt => recordCompletedReviewRead?.(receipt),
+        }).open(target, { signal, skillDocuments: skill.documents });
+      },
       ...(typeof privateRuntimeDirectory === "string" &&
           path.isAbsolute(privateRuntimeDirectory) &&
           path.resolve(privateRuntimeDirectory) ===
@@ -1142,7 +1277,43 @@ export async function createApplication({
             ),
           }
         : {}),
-    });
+    };
+    cliCompositionCapability = issueProductionCliCompositionGrant(cliRuntimeFacts);
+    const nativeProviderConfiguration = Object.values(config.brainProviders || {}).find(
+      (provider) => provider.kind === "codex-cli" && provider.credentialMode === "codex-native-login",
+    );
+    if (nativeProviderConfiguration) {
+      const nativeStatus = trackRuntime(frozenPort(
+        await nativeCodexStatusProviderFactory({
+          id: "codex-native-readiness",
+          cliKind: "codex-cli",
+          credentialMode: "codex-native-login",
+          ...(nativeProviderConfiguration.maxConcurrentTurns === undefined ? {} : {
+            maxConcurrentTurns: nativeProviderConfiguration.maxConcurrentTurns,
+          }),
+          timeoutMs: 30_000,
+        }, issueProductionCliCompositionGrant(cliRuntimeFacts)),
+        ["readStatus", "close"],
+        "nativeCodexStatusProvider",
+      ));
+      brainProviderStatus = frozenPort(nativeStatus, ["readStatus"], "brainProviderStatus");
+    }
+    if (config.brain?.primaryBrain) {
+      const router = trackRuntime(dingTalkBrainRouterFactory({
+        constructionCleanupOwner: configuredConstructionCleanupOwner,
+        brainProviders: config.brainProviders || {},
+        dependencies: brainDependencies({}, dingTalkBrainRouterFactory === createConfiguredBrainRouter),
+      }));
+      brain = createBrain(config.brain, {
+        ...(ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+        router,
+      });
+    } else {
+      brain = createBrain(
+        config.brain,
+        ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate },
+      );
+    }
     const controlledConflictPorts = conflictPreparationPorts(
       config.codeExecutor,
       codeExecutorRuntime,
@@ -1170,7 +1341,7 @@ export async function createApplication({
             : {
                 controlledCommitBuilder: frozenPort(
                   codeExecutorRuntime.controlledCommitBuilder,
-                  ["create", "find", "verify"],
+                  ["create", "find", "verify", ...(typeof Object.getOwnPropertyDescriptor(codeExecutorRuntime.controlledCommitBuilder, "readSealed")?.value === "function" ? ["readSealed"] : [])],
                   "codeExecutorRuntime.controlledCommitBuilder",
                 ),
               }),
@@ -1199,6 +1370,38 @@ export async function createApplication({
       await workflowRoutingRuntimeFactory(config, {
         ...runtimeDependencies(workflowRoutingDependencies),
         store,
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true ? {
+          headAncestryReader: Object.freeze({ read: options => automaticHeadAncestryReader?.read(options) ?? [] }),
+        } : {}),
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticReview === true ? {
+          scopeExitRecoveryReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticReviewScopeExitReader ??= new AutomaticReviewScopeExitReader({ ledger: workLedgerRuntime, github,
+              account: config.githubActions.actorAccountId,
+              ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
+            return automaticReviewScopeExitReader.read(options);
+          } }),
+        } : {}),
+        ...(config.githubActions?.enabled === true &&
+          (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true) ? {
+          scopeReentryReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticReviewReentryReader ??= new AutomaticReviewReentryReader({ ledger: workLedgerRuntime,
+              account: config.githubActions.actorAccountId, github,
+              automaticReview: config.githubActions.automaticReview === true,
+              automaticOwnPrRepair: config.githubActions.automaticOwnPrRepair === true });
+            return automaticReviewReentryReader.read(options);
+          } }),
+        } : {}),
+        ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true && config.workCoordination?.enabled === true ? {
+          roleHandoffReader: Object.freeze({ async read(options) {
+            if (!workLedgerRuntime) return [];
+            automaticRoleHandoffReader ??= new AutomaticRoleHandoffReader({ ledger: workLedgerRuntime, github,
+              account: config.githubActions.actorAccountId,
+              ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}) });
+            return automaticRoleHandoffReader.read(options);
+          } }),
+        } : {}),
         ...(ordinaryActionAdmissionGate === null
           ? {}
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -1217,11 +1420,25 @@ export async function createApplication({
         )
       : null;
     const configuredGithubActions = config.githubActions || {};
+    const automaticCodeHandlerTimeoutMs = coordinationTiming === null ? null : Math.min(
+      Math.max(30_000, 2 * (configuredGithubActions.timeoutMs ?? 60_000) +
+        OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS + coordinationTiming.resolveTimeoutMs),
+      coordinationTiming.leaseDurationMs - coordinationTiming.evidenceMutationMarginMs,
+    );
+    const automaticObjectPreparationMs = coordinationTiming === null ? null : Math.max(1, Math.min(
+      OWN_PR_REPAIR_OBJECT_MAX_PREPARATION_MS,
+      automaticCodeHandlerTimeoutMs - 2 * (configuredGithubActions.timeoutMs ?? 60_000) -
+        coordinationTiming.resolveTimeoutMs - coordinationTiming.evidenceMutationMarginMs,
+    ));
     const explicitPullRequestActions = Array.isArray(
       configuredGithubActions.enabledActions,
     )
       ? [...configuredGithubActions.enabledActions]
       : [];
+    const ownPrRepairEnabled = configuredGithubActions.automaticOwnPrRepair === true;
+    const executablePullRequestActions = [...new Set([
+      ...explicitPullRequestActions, ...(ownPrRepairEnabled ? ["push"] : []),
+    ])];
     const githubProposalExecutionEnabled =
       coordinationEnabled &&
       externalActions &&
@@ -1234,7 +1451,7 @@ export async function createApplication({
       coordinationEnabled &&
       externalActions &&
       configuredGithubActions.enabled === true &&
-      explicitPullRequestActions.length > 0;
+      executablePullRequestActions.length > 0;
     const githubReviewExecutionEnabled =
       externalActions &&
       configuredGithubActions.enabled === true &&
@@ -1290,12 +1507,107 @@ export async function createApplication({
       throw new Error("本地代码工作提案没有同时满足岗位和操作策略的执行角色");
     }
     if (coordinationEnabled) {
+      hostContextRecoveryReader = Object.freeze({
+        withStoppedRuns: (control, operation) => taskRuns.withStoppedRuns(
+          [control.run, ...(Object.hasOwn(control, "childRun") ? [control.childRun] : [])], operation),
+        async read({ itemId, childItemId }) {
+          const config = (await configurationRuntime?.reader?.readActive())?.configuration;
+          const role = await codeAuthorizationRoleRegistry?.get("orchestrator")?.roleView();
+          if (config?.githubActions?.enabled !== true || config.githubActions.automaticOwnPrRepair !== true ||
+              config.workCoordination?.enabled !== true || role?.enabled !== true || role.paused === true) return null;
+          if (childItemId) {
+            const developer = await codeAuthorizationRoleRegistry?.get("developer")?.roleView();
+            if (developer?.enabled !== true || developer.paused === true) return null;
+          }
+          try { return { actorAccountId: config.githubActions.actorAccountId, run: await taskRuns.get("work-item", itemId),
+            ...(childItemId ? { childRun: await taskRuns.get("work-item", childItemId) } : {}) }; }
+          catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+        },
+        async readCiMaterials({ itemId, inputBinding, event }) {
+          if (!ciRepairContextReader || !await hostContextRecoveryReader.read({ itemId })) return null;
+          try {
+            const observed = await ciRepairContextReader.read({ inputBinding, event });
+            const control = await hostContextRecoveryReader.read({ itemId });
+            return observed?.ciEvidence && control ? { ...control, ciEvidence: observed.ciEvidence } : null;
+          } catch (error) { if (error?.code === "CODE_CI_REPAIR_CONTEXT_UNAVAILABLE") return null; throw error; }
+        },
+        async readReviewDiagnostics({ itemId, childItemId, confirmationIds }) {
+          if (!Array.isArray(confirmationIds) || confirmationIds.length < 1 || confirmationIds.length > 4 ||
+              new Set(confirmationIds).size !== confirmationIds.length ||
+              !confirmationIds.every(id => typeof id === "string" && /^confirmation-github-review-[a-f0-9]{64}$/.test(id)) ||
+              typeof confirmationRuntime?.confirmationSettlementReader?.read !== "function") return null;
+          const confirmations = await Promise.all(confirmationIds.map(confirmationId =>
+            confirmationRuntime.confirmationSettlementReader.read({ confirmationId })));
+          const config = (await configurationRuntime?.reader?.readActive())?.configuration;
+          const roles = await Promise.all(["orchestrator", "pr-engineer"].map(id => codeAuthorizationRoleRegistry?.get(id)?.roleView()));
+          if (config?.githubActions?.enabled !== true || config.githubActions.automaticReview !== true ||
+              config.workCoordination?.enabled !== true || roles.some(role => role?.enabled !== true || role.paused === true)) return null;
+          try { return { actorAccountId: config.githubActions.actorAccountId, confirmations,
+            run: await taskRuns.get("work-item", itemId), childRun: await taskRuns.get("work-item", childItemId) }; }
+          catch (error) { if (error?.code === "TASK_RUN_NOT_FOUND") return null; throw error; }
+        },
+        async readTriageRetirement(input) {
+          const [employeeState, ownerState] = await Promise.all([
+            store.read('pr-employee-state', null), store.read('owner-work-requests-v1', null),
+          ]);
+          if (!ownerState || !Array.isArray(employeeState?.jobs)) return null;
+          const record = normalizeOwnerWorkRequestState(ownerState).records.find(row => row.workItemId === input.itemId);
+          const jobs = employeeState.jobs.filter(job => job?.handoffWorkItemId === input.itemId &&
+            matchRetiredTriageSource(input, record, job));
+          if (jobs.length !== 1) return null;
+          const control = await hostContextRecoveryReader.readReviewDiagnostics(input);
+          if (!control || control.actorAccountId.toLowerCase() !== input.inputBinding.gitTarget.sourceAccountId.toLowerCase() ||
+              typeof github.readIncomingReviewRequest !== 'function') return null;
+          let incomingFacts;
+          try { incomingFacts = await github.readIncomingReviewRequest({ repository: input.inputBinding.repository,
+            number: input.inputBinding.pullRequestNumber, account: control.actorAccountId }); }
+          catch { return null; }
+          const queue = await store.read('confirmation-queue', null);
+          if (!Array.isArray(queue?.items) || !Number.isSafeInteger(queue.revision)) return null;
+          const publishedReviews = queue.items.filter(item => item?.status === 'completed' && isAutomaticReviewExecution(item) &&
+            item.display?.payload?.target?.resourceId === `${input.inputBinding.repository}#${input.inputBinding.pullRequestNumber}` &&
+            item.display.payload.target.version === input.inputBinding.headRefOid);
+          if (publishedReviews.length === 0 || publishedReviews.length > 4) return null;
+          return { ...control, ownerRecord: record, triageJob: jobs[0], incomingFacts,
+            observedAt: new Date(workCoordinationDependencies.clock?.() ?? Date.now()).toISOString(),
+            publishedReviews: publishedReviews.map(item => ({ queueRevision: queue.revision, item })) };
+        },
+      });
       workLedgerRuntime = trackRuntime(
         await workLedgerRuntimeFactory({
           ...runtimeDependencies(workLedgerDependencies),
           store,
           assignmentSource: workflowRouting,
           operationQueue: new OperationQueue(),
+          hostContextRecoveryReader,
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true &&
+            typeof github.readPullRequestRoleHandoffFacts === "function" && typeof github.isCommitAncestor === "function" ? {
+            attachHostHeadAncestry: ports => {
+              // Keep the producer and its writer capability inside composition.
+              // No runtime/read-only/native/CLI facade receives either object.
+              automaticHeadAncestryReader = new AutomaticHeadAncestryReader({
+                ledger: Object.freeze({ readCandidates: ports.readCandidates, readItemForReconciliation: ports.readItemForReconciliation }),
+                github: frozenPort(github, ["readPullRequestRoleHandoffFacts", "isCommitAncestor"], "Head ancestry GitHub reads"),
+                record: ports.record, account: config.githubActions.actorAccountId,
+                ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+              });
+            },
+          } : {}),
+          confirmationSettlementReader: Object.freeze({
+            read: (input) => confirmationRuntime?.confirmationSettlementReader?.read(input),
+          }),
+          obsoleteCodeJobSettler: Object.freeze({
+            read: (input) => obsoleteCodeJobSettler?.read(input),
+            settle: (input, options) => obsoleteCodeJobSettler?.settle(input, options) ?? null,
+          }),
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticReview === true ? {
+            reviewTestingRetirementReader: Object.freeze({ async read(candidate) {
+              if (!codeJobReader || !codeJobControl || !taskRuns || !codeExecutorRuntime?.executor?.view) return null;
+              automaticReviewTestingStopReader ??= new AutomaticReviewTestingStopReader({ codeJobs: codeJobReader,
+                codeControl: codeJobControl, taskRuns, codeExecutor: codeExecutorRuntime.executor });
+              return automaticReviewTestingStopReader.read(candidate);
+            } }),
+          } : {}),
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -1495,16 +1807,24 @@ export async function createApplication({
     inputAuthorityVerifier = workLedgerRuntime === null
       ? null
       : Object.freeze({
-          verify: (binding) =>
-            workLedgerRuntime.verifyPullRequestExecutionBinding(binding),
+          async verify(binding) {
+            const verified = await workLedgerRuntime.verifyPullRequestExecutionBinding(binding);
+            const root = await workLedgerRuntime.readItemForReconciliation?.({ itemId: verified.rootItemId });
+            if (root?.source?.scope?.kind === "owner_requested" && root.source.identity.targetRoleId === "pr-engineer") {
+              await ownerWorkRequests?.verifyAutomaticReviewContinuation?.(verified);
+            }
+            return verified;
+          },
         });
     let activeCodeJobOptions = null;
+    let codeJobNativeExecution = null;
     if (localCodeExecutionEnabled) {
       let codeJobBrainDirectory;
       if (versionedConfiguration) {
         grantFactory = versionedCodeJobAuthorityFactory({
           configurationReader: configurationRuntime.reader,
           executorAuthority: codeExecutorRuntime.authority,
+          inspectAuthorityForWritablePaths: codeExecutorRuntime.inspectAuthorityForWritablePaths,
           startupConfiguration: config,
           brainDependencies: brainDependencies(
             workCoordinationDependencies.brainDependencies || {},
@@ -1558,7 +1878,26 @@ export async function createApplication({
         });
       }
       codeJobBrainDirectory = trackRuntime(codeJobBrainDirectory);
+      if (typeof codeJobBrainDirectory.withEntityQuiescence === "function") {
+        codeJobNativeExecution = Object.freeze({ withEntityQuiescence: (grant, operation, { signal = null } = {}) => {
+          if (!Number.isSafeInteger(grant.subject?.number) ||
+              grant.inputBinding?.pullRequestNumber !== grant.subject.number) return { executed: false };
+          return codeJobBrainDirectory.withEntityQuiescence({ roleId: grant.requestedBy.roleId,
+            brainDigest: grant.brainDigest, signal, entityKey: githubEntitySessionKey({ kind: "pull_request",
+              repository: grant.repository, number: grant.subject.number }) }, operation);
+        } });
+      }
       activeCodeJobOptions = {
+        ...(ownPrRepairEnabled ? {
+          reviewRepairContextReader: new ReviewRepairContextReader({
+            github,
+            executionContextReader: frozenPort(
+              workLedgerRuntime,
+              ["readPullRequestExecutionContext"],
+              "workLedgerRuntime",
+            ),
+          }),
+        } : {}),
         grantVerifier: frozenPort(
           grantFactory,
           ["verify"],
@@ -1579,10 +1918,12 @@ export async function createApplication({
         ),
         brainDirectory: frozenPort(
           codeJobBrainDirectory,
-          ["decide"],
+          ["decide", ...(typeof codeJobBrainDirectory.describe === "function" ? ["describe"] : [])],
           "codeJobBrainDirectory",
         ),
         workerLimits: {
+          ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true
+            ? { concurrency: 2 } : {}),
           ...(coordinationConfig.codeJobMaximumTurns === undefined
             ? {}
             : { maxTurns: coordinationConfig.codeJobMaximumTurns }),
@@ -1593,6 +1934,8 @@ export async function createApplication({
                   coordinationConfig.codeJobObservationLimit,
               }),
         },
+        // This read-only port does not alter permissions in the job grant.
+        conflictSourceReader: codeExecutorRuntime.conflictSourceReader ?? null,
         ...(codeJobChangePackageDeliveryEnabled
           ? {
               completedChangeExporter: frozenPort(
@@ -1622,6 +1965,13 @@ export async function createApplication({
     if (coordinationEnabled && memoryRuntime) {
       codeJobRuntime = trackRuntime(
         await codeJobRuntimeFactory({
+          taskRuns,
+          ...(ownPrRepairEnabled ? { automaticPauseRecovery: Object.freeze({
+            canRecover: job => automaticLocalCodeAuthorization?.canRecoverPausedCodeJob(job) ?? false,
+            canReplanUnstartedWrite: job => automaticLocalCodeAuthorization?.canReplanUnstartedWrite(job) ?? false,
+            withNativeQuiescence: (job, operation, options) => job?.grant && codeJobNativeExecution !== null
+              ? codeJobNativeExecution.withEntityQuiescence(job.grant, operation, options) : { executed: false },
+          }) } : {}),
           ...runtimeDependencies(codeJobRuntimeDependencies),
           store,
           ...(ordinaryActionAdmissionGate === null
@@ -1658,6 +2008,16 @@ export async function createApplication({
         ["pause", "resume", "cancel"],
         "codeJobRuntime.control",
       );
+      obsoleteCodeJobSettler = new ObsoleteCodeJobSettler({ codeJobReader, codeJobControl, taskRuns,
+        ...(typeof codeExecutorRuntime?.executor?.view === "function" ? {
+          codeExecutorReader: frozenPort(codeExecutorRuntime.executor, ["view"], "obsolete code executor stop reader"),
+        } : {}),
+        ...(codeJobNativeExecution !== null &&
+            typeof codeExecutorRuntime?.executor?.view === "function" &&
+            typeof codeExecutorRuntime.executor.reconcileCancellation === "function" ? {
+          nativeExecution: codeJobNativeExecution,
+          codeExecutorControl: frozenPort(codeExecutorRuntime.executor, ["reconcileCancellation"], "obsolete executor cleanup"),
+        } : {}) });
       if (codeJobChangePackageDeliveryEnabled) {
         codeJobEvidenceReader = frozenPort(
           codeJobEvidenceReaderFactory({
@@ -1741,9 +2101,14 @@ export async function createApplication({
       );
       codeJobWorker = frozenPort(
         codeJobRuntime.worker,
-        ["runCycle"],
+        ["runCycle", ...(config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true ? ['runReady'] : [])],
         "codeJobRuntime.worker",
       );
+      if (config.githubActions?.enabled === true && config.githubActions.automaticOwnPrRepair === true) {
+        codeJobExecution = Object.freeze({ runCycle: (options, runOperation) => codeJobWorker.runReady({
+          ...options, limit: coordinationConfig.codeJobLimit ?? 10,
+        }, runOperation) });
+      }
     }
     if (changePackageActionsEnabled) {
       localExecutors["local.change-package-apply"] = frozenPort(
@@ -1773,7 +2138,7 @@ export async function createApplication({
               "codeExecutorRuntime.controlledCommitPublisher",
             );
       if (
-        explicitPullRequestActions.includes("push") &&
+        executablePullRequestActions.includes("push") &&
         controlledCommitVerifier === null
       ) {
         throw new Error("GitHub push 动作需要可核验的受控 commit 证据");
@@ -1782,7 +2147,7 @@ export async function createApplication({
       let transport = pullRequestExternalActionDependencies.transport;
       if (transport === undefined) {
         if (
-          explicitPullRequestActions.includes("push") &&
+          executablePullRequestActions.includes("push") &&
           controlledCommitPublisher === null
         ) {
           throw new Error("GitHub push 动作需要受控 commit 发布端口");
@@ -1806,13 +2171,32 @@ export async function createApplication({
       }
       const constructedPullRequestExternalActionExecutor =
         pullRequestExternalActionExecutorFactory({
-          enabledActions: explicitPullRequestActions,
+          enabledActions: executablePullRequestActions,
+          ...(!ownPrRepairEnabled ? {} : {
+            pushAuthorization: {
+              verifyPush(envelope) {
+                if (!isHeadRepairExecutionSource(envelope.action?.controlledCommitEvidence?.executionSource)) {
+                  return automaticOwnPrRepair === null ? explicitPullRequestActions.includes("push")
+                    : automaticOwnPrRepair.verifyPush(envelope).then(approved => approved || explicitPullRequestActions.includes("push"));
+                }
+                if (automaticOwnPrRepair === null) {
+                  throw Object.assign(new Error("自动修复授权仍在恢复中"), {
+                    code: "GITHUB_AUTHORIZATION_UNAVAILABLE",
+                  });
+                }
+                return automaticOwnPrRepair.verifyPush(envelope);
+              },
+            },
+          }),
           credentialSource: githubCredentialSource,
           ...(configuredGithubActions.timeoutMs === undefined
             ? {}
             : { timeoutMs: configuredGithubActions.timeoutMs }),
           transport,
           inputAuthorityVerifier,
+          reviewResultVerifier: Object.freeze({ async verify(envelope, options) {
+            return reviewPublicationReuse === null ? null : reviewPublicationReuse.verifyAutomaticSettlement(envelope, options);
+          } }),
           ...(controlledCommitVerifier === null
             ? {}
             : { controlledCommitVerifier }),
@@ -1857,9 +2241,87 @@ export async function createApplication({
           ...(githubCredentialSource === null
             ? {}
             : { credentialSource: githubCredentialSource }),
+          automaticReviewGuard: new AutomaticReviewPublisher({
+            enabled: config.githubActions?.automaticReview === true,
+            github,
+            ...(workLedgerRuntime === null ? {} : { reviewAdmissionReader: {
+              read: binding => workLedgerRuntime.readAutomaticReviewAdmission(binding),
+            } }),
+            ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+          }),
         }),
       );
       pullRequestExternalActionExecutorOwned = confirmationRuntime !== null;
+    }
+    if (ownPrRepairEnabled) {
+      if (!localCodeExecutionEnabled || !confirmationRuntime || !configurationRuntime ||
+          !codeJobReader || !codeExecutorRuntime?.controlledCommitBuilder || !changePackageRuntime) {
+        throw new Error("自动修复我的 PR 需要版本化配置、开发执行器、验证配置及受控提交链路");
+      }
+      ciRepairContextReader = new CiRepairContextReader({ github: frozenPort(github,
+        ['loadPullRequestFacts', 'readPullRequestLocalWorkFacts'], 'CI repair GitHub facts'), diagnostics: jenkinsRuntime?.diagnostics ?? null });
+      const ownPrRepairDependencies = {
+        configurationReader: configurationRuntime.reader, store, ledger: workLedgerRuntime,
+        ciRepairContextReader,
+        ...(codeExecutorRuntime.settledVerificationReader ? {
+          settledVerificationReader: frozenPort(codeExecutorRuntime.settledVerificationReader, ['read'], 'settled verification recovery reader'),
+        } : {}),
+        ...(codeExecutorRuntime.inspectionEnvironmentReader ? {
+          inspectionEnvironmentReader: frozenPort(codeExecutorRuntime.inspectionEnvironmentReader, ['read'], 'inspection environment recovery reader'),
+        } : {}),
+        confirmationSettlementReader: confirmationRuntime.confirmationSettlementReader,
+        github, confirmations: Object.freeze({ ...confirmationRuntime.producerQueue, ...confirmationRuntime.queue }), codeJobReader,
+        controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
+        historicalControlledCommitReader: new HistoricalControlledCommitReader({
+          store, controlledCommitReader: codeExecutorRuntime.controlledCommitBuilder,
+        }),
+        grantVerifier: activeCodeJobOptions.grantVerifier,
+        historicalRepairFeedbackReader: Object.freeze({
+          async read({ inputBinding, feedbackDigest }) {
+            const account = inputBinding.gitTarget.sourceAccountId;
+            const live = await github.readOwnPullRequestFeedback({
+              repository: inputBinding.repository, number: inputBinding.pullRequestNumber, account,
+            });
+            if (live.state !== "open" || live.isDraft === true ||
+                live.author?.toLowerCase() !== account.toLowerCase() ||
+                live.currentUser?.toLowerCase() !== account.toLowerCase() ||
+                live.repo?.toLowerCase() !== inputBinding.repository.toLowerCase() ||
+                live.number !== inputBinding.pullRequestNumber || live.reviewFeedbackAvailable !== true ||
+                live.reviewFeedbackDigest !== feedbackDigest || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(live.headRefOid)) {
+              throw Object.assign(new Error("Original repair feedback cannot be recovered exactly"), {
+                code: "OWN_PR_REPAIR_ORIGINAL_FEEDBACK_UNAVAILABLE",
+              });
+            }
+            return {
+              context: normalizeReviewRepairFeedbackContext({ schemaVersion: 1,
+                headRefOid: inputBinding.headRefOid, reviewFeedbackDigest: feedbackDigest, feedback: live.feedback }),
+              provenance: { kind: "github_digest_matched_feedback", observedHeadRefOid: live.headRefOid,
+                observedAt: new Date().toISOString() },
+            };
+          },
+        }),
+        ownerWorkRequests: Object.freeze({
+          submitInternalReview: (request) => {
+            if (!ownerWorkRequests) throw new Error("内部复审交接运行时尚未就绪");
+            return ownerWorkRequests.submitInternalReview(request);
+          },
+        }),
+        objectSync: trackRuntime(new OwnPrRepairObjectSync({ credentialSource: githubCredentialSource,
+          maxPreparationMs: automaticObjectPreparationMs })),
+      };
+      automaticOwnPrRepair = new AutomaticOwnPrRepair({ ...ownPrRepairDependencies,
+        conflictRepair: new AutomaticOwnPrConflict({ ...ownPrRepairDependencies,
+          conflictInspectionReader: codeExecutorRuntime?.conflictInspectionReader,
+          ...(codeExecutorRuntime?.conflictSourceReader ? { codeJobControl, taskRuns } : {}) }) });
+      await automaticOwnPrRepair.recover();
+      automaticLocalCodeAuthorization = new AutomaticLocalCodeAuthorization({
+        ...ownPrRepairDependencies,
+        specialized: automaticOwnPrRepair,
+        taskRuns,
+        roleStateReader: { async read(roleId) {
+          return codeAuthorizationRoleRegistry?.get(roleId)?.roleView() ?? null;
+        } },
+      });
     }
     if (localCodeExecutionEnabled && !confirmationRuntime) {
       throw new Error("本地代码工作提案需要可用的确认运行时");
@@ -1963,17 +2425,36 @@ export async function createApplication({
       });
     }
     const proposalRunners = [];
+    let reviewProposalRunner = null;
     if (githubProposalExecutionEnabled) {
-      proposalRunners.push(
-        githubReviewProposalRunnerFactory({
+      reviewProposalRunner = githubReviewProposalRunnerFactory({
           enabled: true,
+          publicationAdopter: Object.freeze({ async handle(input, options) {
+            if (reviewPublicationReuse === null) throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+            return reviewPublicationReuse.handle(input, options);
+          } }),
           runner:
             workProposalRuntime.runners[GITHUB_REVIEW_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
+          automaticReviewPublisher: new AutomaticReviewPublisher({
+            enabled: config.githubActions.automaticReview === true,
+            assignAfterReview: config.githubActions.assignAfterAutomaticReview !== false,
+            queue: confirmationRuntime.queue,
+            confirmationInvalidator: confirmationRuntime.producerQueue,
+            github,
+            reviewAdmissionReader: {
+              read: binding => workLedgerRuntime.readAutomaticReviewAdmission(binding),
+            },
+            testingOwnersByProduct: coordinationConfig.policy?.testingOwnersByProduct || {},
+            ...(workCoordinationDependencies.clock ? { clock: workCoordinationDependencies.clock } : {}),
+          }),
           inputAuthorityVerifier,
           pullRequestContextReader: Object.freeze({
-            readCurrent: (binding) =>
-              workLedgerRuntime.readPullRequestExecutionContext(binding),
+            async readCurrent(binding) {
+              const context = await workLedgerRuntime.readPullRequestExecutionContext(binding);
+              await inputAuthorityVerifier.verify(binding);
+              return context;
+            },
           }),
           actorAccountId: config.githubActions.actorAccountId,
           leaseDurationMs: coordinationConfig.leaseDurationMs,
@@ -1983,8 +2464,8 @@ export async function createApplication({
           ...(workCoordinationDependencies.clock
             ? { clock: workCoordinationDependencies.clock }
             : {}),
-        }),
-      );
+        });
+      proposalRunners.push(reviewProposalRunner);
     }
     if (pullRequestExternalActionExecutionEnabled) {
       proposalRunners.push(
@@ -2009,22 +2490,32 @@ export async function createApplication({
       );
     }
     if (localCodeExecutionEnabled) {
-      proposalRunners.push(
-        codeActionProposalRunnerFactory({
+      const codeProposalRunner = codeActionProposalRunnerFactory({
           enabled: true,
           runner: workProposalRuntime.runners[CODE_ACTION_PROPOSAL_RUNNER_ID],
           confirmationProducer: confirmationRuntime.producerQueue,
           codeJobReader,
           grantFactory,
-          leaseDurationMs: coordinationConfig.leaseDurationMs,
+          ...(automaticOwnPrRepair === null ? {} : {
+            automaticOwnPrRepair: automaticLocalCodeAuthorization,
+            // Two current-fact checks bracket globally bounded Git preparation.
+            // Leave a margin for persisting the result before the lease expires.
+            handlerTimeoutMs: automaticCodeHandlerTimeoutMs,
+          }),
+          leaseDurationMs: automaticOwnPrRepair === null
+            ? coordinationConfig.leaseDurationMs
+            : coordinationTiming.leaseDurationMs,
           retryBaseMs: coordinationConfig.retryBaseMs,
           retryMaxMs: coordinationConfig.retryMaxMs,
           defaultBatchLimit: coordinationConfig.proposalLimit,
           ...(workCoordinationDependencies.clock
             ? { clock: workCoordinationDependencies.clock }
             : {}),
-        }),
-      );
+        });
+      proposalRunners.push(codeProposalRunner);
+      if (automaticLocalCodeAuthorization !== null) {
+        localCodeProposalRecovery = frozenPort(codeProposalRunner, ["runCycle"], "local code proposal recovery");
+      }
     }
     if (configurationProposalExecutionEnabled) {
       proposalRunners.push(
@@ -2053,6 +2544,16 @@ export async function createApplication({
     if (proposalRunners.length && !proposalRunner) {
       throw new Error("工作提案 runner 组合失败");
     }
+    const prEmployeeBrainRouter = roleConfig.enabled && roleConfig.primaryBrain
+      ? trackRuntime(prEmployeeBrainRouterFactory({
+          constructionCleanupOwner: configuredConstructionCleanupOwner,
+          brainProviders: config.brainProviders || {},
+          dependencies: brainDependencies(
+            workCoordinationDependencies.brainDependencies || {},
+            prEmployeeBrainRouterFactory === createConfiguredBrainRouter,
+          ),
+        }))
+      : null;
     const prEmployee = new ProactivePrEmployeeService({
       github,
       reviewer: roleConfig.enabled
@@ -2062,17 +2563,22 @@ export async function createApplication({
               ...roleConfig.brain,
               allowRemoteCodeContext: roleConfig.allowRemoteCodeContext,
             },
-            ordinaryActionAdmissionGate === null
-              ? {}
-              : { actionAdmissionGate: ordinaryActionAdmissionGate },
+            {
+              ...(ordinaryActionAdmissionGate === null ? {} : { actionAdmissionGate: ordinaryActionAdmissionGate }),
+              ...(prEmployeeBrainRouter ? { router: prEmployeeBrainRouter, primaryBrain: roleConfig.primaryBrain } : {}),
+            },
           )
         : null,
       store,
-      // The legacy PR employee is the low-risk Ollama patrol/triage role.
+      // The legacy PR employee handles low-risk patrol and triage.
       // Evidence-bound code Review belongs exclusively to pr-engineer.
-      config: { ...roleConfig, triageOnly: true },
+      config: { ...roleConfig, triageOnly: true,
+        automaticOwnPrRepair: ownPrRepairEnabled,
+        automaticReviewPolicy: Object.hasOwn(config.githubActions || {}, "automaticReview")
+          ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId } : null,
+      },
       operationQueue,
-      triageHandoff: createPrTriageHandoff(() => ownerWorkRequests),
+      triageHandoff: createPrTriageHandoff(() => ownerWorkRequests, () => workLedgerRuntime),
       producerQueue: confirmationRuntime
         ? frozenPort(
             confirmationRuntime.producerQueue,
@@ -2089,6 +2595,9 @@ export async function createApplication({
     let workCoordination = null;
     const configuredWorkforce = coordinationEnabled
       ? trackRuntime(configuredWorkforceFactory({
+          ...(config.githubActions?.enabled === true &&
+            (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true)
+            ? { waitForModelCapacity: true } : {}),
           constructionCleanupOwner: configuredConstructionCleanupOwner,
           brainProviders: config.brainProviders || {},
           roles: config.employees?.roles || {},
@@ -2103,7 +2612,7 @@ export async function createApplication({
           ...(ordinaryActionAdmissionGate === null
             ? {}
             : { actionAdmissionGate: ordinaryActionAdmissionGate }),
-          onRun: ({ roleId, signal = null }) => {
+          onRun: ({ roleId, signal = null, continuationTarget = null }) => {
             if (!workCoordination) {
               const error = new Error("员工主动循环尚未就绪");
               error.code = "WORK_COORDINATION_NOT_READY";
@@ -2113,6 +2622,7 @@ export async function createApplication({
               trigger: `employee:${roleId}`,
               includeWork: true,
               roleId,
+              ...(continuationTarget === null ? {} : { continuationTarget }),
               ...(signal === null ? {} : { signal }),
             });
           },
@@ -2122,6 +2632,7 @@ export async function createApplication({
       prEmployee,
       ...configuredWorkforce.employees,
     ]);
+    codeAuthorizationRoleRegistry = employeeRegistry;
     let workLedgerView = null;
     let dailyWorkLedgerView = null;
     let workGraphView = null;
@@ -2146,7 +2657,7 @@ export async function createApplication({
             ),
             ledger: frozenPort(
               workLedgerRuntime,
-              ["intake", "listItems"],
+              ["intake", "listItems", "readItemProgress", "readItemForReconciliation", "listOutbox", "verifyPullRequestExecutionBinding"],
               "owner work request ledger",
             ),
             roleReadiness: Object.freeze({
@@ -2192,6 +2703,7 @@ export async function createApplication({
               ["resolvePullRequestTarget"],
               "owner pull request resolver",
             ),
+            incomingReviewReader: Object.freeze({ read: input => github.readIncomingReviewRequest(input) }),
             ...(ordinaryActionAdmissionGate === null
               ? {}
               : { actionAdmissionGate: ordinaryActionAdmissionGate }),
@@ -2246,6 +2758,48 @@ export async function createApplication({
         ["recover"],
         "PR engineer fact recovery",
       ).recover();
+      // Deferred construction keeps this capability private to review invocations;
+      // no ledger or refresh authority is passed to the CLI.
+      let boundReviewReader = null;
+      const getBoundReviewReader = () => boundReviewReader ??= new BoundReviewFeedbackReader({ ledger: workLedgerRuntime, factsReader: prEngineerService, inputAuthorityVerifier });
+      currentReviewFeedbackReader = Object.freeze({ async read(input, options) {
+        return getBoundReviewReader().read(input, options);
+      } });
+      let reuseService = null;
+      const getReuseService = () => reuseService ??= new ReviewPublicationReuseService({
+        taskReader: createReviewAdoptionTaskReader(frozenPort(workLedgerRuntime, ["readReviewAdoptionContext"], "Review adoption task reader")),
+        factsReader: frozenPort(prEngineerService, ["get"], "Review adoption cached facts"),
+        publicationSourceReader: Object.freeze({ listReviewPublicationSources(input) {
+          const reader = workProposalRuntime.evidenceReader;
+          if (typeof reader?.listReviewPublicationSources !== "function") throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+          return reader.listReviewPublicationSources(input);
+        } }),
+        confirmationReader: Object.freeze({ readSettlements(input) {
+          const reader = confirmationRuntime?.confirmationSettlementReader;
+          if (typeof reader?.readMany !== "function") throw Object.assign(new Error("REVIEW_PUBLICATION_REUSE_UNAVAILABLE"), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+          return reader.readMany(input);
+        } }),
+        materialsReader: Object.freeze({ async read(input, options = {}) {
+          const { excludedPublication, ...request } = input;
+          const facts = await getBoundReviewReader().readCurrent(request, options);
+          const materialDigest = projectPullRequestReadFactsContext(facts).materialDigest;
+          if (typeof materialDigest !== "string") throw Object.assign(new Error("PR_REVIEW_READ_MATERIAL_CHANGED"), { code: "PR_REVIEW_READ_MATERIAL_CHANGED" });
+          return readGitHubReviewFeedbackSnapshot({ target: { gitTarget: input.gitTarget, pullRequestNumber: input.pullRequestNumber,
+            feedbackSnapshot: { taskId: input.taskId, materialDigest } }, factsReader: Object.freeze({ async read() { return facts; } }),
+            run: runJson, options: { ...options, env: { ...process.env, GH_HOST: "github.com" } }, excludedPublication });
+        } }),
+        receiptStore: new ReviewPublicationAdoptionStore({ store: frozenPort(store, ["read", "write"], "Review adoption receipt store") }),
+        inputAuthorityVerifier: frozenPort(inputAuthorityVerifier, ["verify"], "Review adoption input verifier"),
+        policyReader: async () => (await loadNativeReviewSkill()).digest,
+        ...clockOptions,
+      });
+      recordCompletedReviewRead = receipt => getReuseService().recordReviewCoverage(receipt);
+      reviewPublicationReuse = Object.freeze({
+        listCandidates: (input, options) => getReuseService().listCandidates(input, options),
+        handle: (input, options) => getReuseService().handle(input, options),
+        verifyProposal: input => getReuseService().verifyProposal(input),
+        verifyAutomaticSettlement: (input, options) => getReuseService().verifyAutomaticSettlement(input, options),
+      });
       const pullRequestFacts = frozenPort(
         prEngineerService,
         ["context"],
@@ -2266,7 +2820,7 @@ export async function createApplication({
         ["read"],
         "workflow fact source",
       );
-      const pullRequestContextReader = frozenPort(
+      const rawPullRequestContextReader = frozenPort(
         frozenPort(
           factSourceService,
           ["pullRequestTaskContextReader"],
@@ -2275,6 +2829,11 @@ export async function createApplication({
         ["read"],
         "workflow PR task context reader",
       );
+      const pullRequestContextReader = Object.freeze({ async read(input, options) {
+        const binding = createPullRequestExecutionBinding(input);
+        await inputAuthorityVerifier.verify(binding);
+        return rawPullRequestContextReader.read(input, options);
+      } });
       const proposalResultReader = workProposalRuntime.evidenceReader
         ? frozenPort(
             workProposalRuntime.evidenceReader,
@@ -2288,6 +2847,7 @@ export async function createApplication({
           )
         : null;
       const deliveryEvidenceService = deliveryEvidenceServiceFactory({
+        publicationAdoptionVerifier: frozenPort(reviewPublicationReuse, ["verifyProposal"], "Review publication adoption verifier"),
         ...(changePackageReader === null ? {} : { changePackageReader }),
         ...(codeJobDeliveryEvidenceReader === null
           ? {}
@@ -2299,7 +2859,10 @@ export async function createApplication({
         ["listForTask", "verify"],
         "deliveryEvidenceService",
       );
+      const automaticMode = config.githubActions?.enabled === true &&
+        (config.githubActions.automaticReview === true || config.githubActions.automaticOwnPrRepair === true);
       const roleContextAssembler = roleContextAssemblerFactory({
+        publicationReuseReader: frozenPort(reviewPublicationReuse, ["listCandidates"], "Review publication candidate reader"),
         graphReader: frozenPort(
           workLedgerRuntime.graphReader,
           ["getSnapshot"],
@@ -2307,7 +2870,27 @@ export async function createApplication({
         ),
         factSource,
         pullRequestContextReader,
+        ...(jenkinsRuntime === null ? {} : { ciDiagnosticReader: jenkinsRuntime.diagnostics }),
+        ...(automaticOwnPrRepair?.conflictRepair ? { conflictInspectionReader: Object.freeze({
+          read: request => automaticOwnPrRepair.conflictRepair.readInspection(request),
+        }) } : {}),
+        internalReviewHandoffReader: Object.freeze({
+          read: (input) => workLedgerRuntime.readInternalReviewHandoff(input),
+        }),
+        originalRepairFeedbackReader: Object.freeze({
+          async readBinding(input) {
+            if (automaticOwnPrRepair) await automaticOwnPrRepair.readOriginalFeedbackBinding(input);
+            return originalRepairFeedbackReader.readBinding(input);
+          },
+        }),
+        ...(codeJobReader === null ? {} : {
+          failedCodeJobContextReader: new FailedCodeJobContextReader({ codeJobReader, ledger: workLedgerRuntime }),
+        }),
         evidenceCatalog: deliveryEvidence,
+        ...(automaticMode ? {
+          settlementInputAuthorityVerifier: inputAuthorityVerifier,
+          settlementEvidenceVerifier: deliveryEvidence,
+        } : {}),
         ...(agentMemoryQueries === null
           ? {}
           : {
@@ -2319,6 +2902,7 @@ export async function createApplication({
             }),
       });
       const orchestratorService = orchestratorServiceFactory({
+        automaticMode,
         contextAssembler: roleContextAssembler,
         graphReader: workLedgerRuntime.graphReader,
         scopedGraphPlannerFactory:
@@ -2338,6 +2922,7 @@ export async function createApplication({
       });
       const attentionResultReconciler = attentionResultReconcilerFactory({
         attentionConsumer: attentionInboxRuntime.consumer,
+        attentionMaintenance: attentionInboxRuntime.maintenance ?? null,
         ledger: workLedgerRuntime,
       });
       const proposalResultReconciler = workProposalResultReconcilerFactory({
@@ -2355,11 +2940,29 @@ export async function createApplication({
           ? {}
           : { actionAdmissionGate: ordinaryActionAdmissionGate }),
       });
+      if (configurationRuntime && typeof workLedgerRuntime?.listClaimCandidates === "function" &&
+          typeof workLedgerRuntime?.readItemForReconciliation === "function" && typeof workLedgerRuntime?.readItemProgress === "function") {
+        workContinuationScheduler = new WorkContinuationScheduler({
+          store, ledger: workLedgerRuntime, configurationReader: configurationRuntime.reader, taskRuns,
+          roleStateReader: { async read(roleId) { return employeeRegistry.get(roleId)?.roleView() ?? null; } },
+          preparations: [
+            () => workLedgerRuntime.retireAutomaticReviewTestingWork?.({ limit: 10 }),
+            () => proposalResultReconciler.runCycle({ limit: 10 }),
+            () => conditionWaker.runCycle({ limit: 10 }),
+          ],
+          ...clockOptions,
+        });
+      }
       const workLoop = proactiveWorkLoopFactory({
-        ledger: workLedgerRuntime,
+        taskRuns,
+        ledger: Object.freeze({ ...workLedgerRuntime, verifyPullRequestExecutionBinding: inputAuthorityVerifier.verify }),
         roleDirectory,
         roleContextAssembler,
         orchestratorService,
+        ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
+        ...(activeCodeJobOptions?.reviewRepairContextReader === undefined ? {} : {
+          reviewRepairContextReader: activeCodeJobOptions.reviewRepairContextReader,
+        }),
         ...(agentMemoryQueries === null
           ? {}
           : {
@@ -2379,12 +2982,17 @@ export async function createApplication({
         issueActiveWindowDays:
           config.githubRead?.issueActiveWindowDays ??
             DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+        automaticReviewPolicy: Object.hasOwn(config.githubActions || {}, "automaticReview")
+          ? { enabled: config.githubActions.automaticReview, account: config.githubActions.actorAccountId }
+          : null,
       });
       const dispatcher = workIntentDispatcherFactory({
         ledger: workLedgerRuntime,
         policy,
+        leaseDurationMs: coordinationConfig.leaseDurationMs,
         attentionProducer: attentionInboxRuntime.producer,
         proposalProducer: workProposalRuntime.producer,
+        ...(automaticOwnPrRepair === null ? {} : { reviewRepairSourcePreparer: automaticOwnPrRepair }),
         ...(codeExecutorRuntime?.controlledCommitBuilder == null
           ? {}
           : {
@@ -2407,11 +3015,19 @@ export async function createApplication({
       });
       const coordinationService = workCoordinationFactory({
         ledger: workLedgerRuntime,
-        codeJobRunner: codeJobWorker,
+        codeJobRunner: codeJobExecution === null ? codeJobWorker : null,
+        ...(codeJobRuntime?.pauseRecovery ? { codeJobPauseRecovery: frozenPort(
+          codeJobRuntime.pauseRecovery, ["runCycle"], "codeJobRuntime.pauseRecovery",
+        ) } : {}),
         codeJobMemoryProjector,
         codeJobChangePackageDispatcher,
         changePackageApplicationResultReconciler,
         proposalRunner,
+        reviewProposalRunner,
+        ...(automaticOwnPrRepair === null ? {} : { automaticOwnPrRepair }),
+        ...(config.githubActions?.automaticReview === true ? { ownerPullRequestSourceRefresher: Object.freeze({
+          runCycle: options => ownerWorkRequests.refreshBlockedPullRequestSources(options),
+        }) } : {}),
         proposalResultReconciler,
         attentionResultReconciler,
         conditionWaker,
@@ -2471,7 +3087,7 @@ export async function createApplication({
       );
       attentionBrowser = frozenPort(
         attentionInboxRuntime.browser,
-        ["next", "answer", "reject", "later"],
+        ["next", "answer", "reject", "later", "listMaintenance", "readStatus"],
         "attentionInboxRuntime.browser",
       );
       attentionCoordinator = frozenPort(
@@ -2480,7 +3096,11 @@ export async function createApplication({
         "attentionCoordinator",
       );
       workCoordination = frozenPort(
-        coordinationService,
+        {intake:(...args)=>coordinationService.intake(...args),runCycle:async(...args)=>{
+          const result = await coordinationService.runCycle(...args);
+          await taskRuns.reconcile();
+          return result;
+        }},
         ["intake", "runCycle"],
         "workCoordination",
       );
@@ -2603,6 +3223,7 @@ export async function createApplication({
       notifier,
       config,
       operationQueue,
+      repairProgressReader: new OwnPrRepairProgressReader({ store, github }),
     });
     const operations = operationsRuntimeFactory(
       {
@@ -2620,6 +3241,33 @@ export async function createApplication({
       },
       operationsRuntimeDependencies,
     );
+    const standardReviewHandoff = ownerWorkRequests && confirmationRuntime?.reviewHandoffs
+      ? new ReviewHandoffReconciler({
+          confirmations: confirmationRuntime.reviewHandoffs,
+          ownerWorkRequests,
+          githubAssignee: confirmationRuntime.reviewHandoffAssignee,
+          testingOwnersByProduct: config.workCoordination?.policy?.testingOwnersByProduct || {},
+          automaticAssignmentsEnabled: config.githubActions?.automaticReview === true && config.githubActions?.assignAfterAutomaticReview !== false,
+          timeoutMs: 2 * (config.githubActions?.timeoutMs ?? 60_000) +
+            (coordinationTiming?.resolveTimeoutMs ?? 30_000),
+        }) : null;
+    const ownPrHandoff = ownPrRepairEnabled && workLedgerRuntime && codeJobReader && confirmationRuntime?.reviewHandoffAssignee
+      ? new AutomaticOwnPrHandoff({ store, configurationReader: configurationRuntime.reader,
+          ledger: workLedgerRuntime, github, codeJobReader, assignee: confirmationRuntime.reviewHandoffAssignee,
+          roleStateReader: { async read(roleId) { return employeeRegistry.get(roleId)?.roleView() ?? null; } },
+        }) : null;
+    const reviewHandoffReconciler = ownPrHandoff === null ? standardReviewHandoff : Object.freeze({
+      async runCycle(options = {}) {
+        const runOperation = options.runOperation ?? (operation => operation());
+        const results = await Promise.allSettled([
+          standardReviewHandoff?.runCycle(options),
+          runOperation(() => ownPrHandoff.runCycle({ signal: options.signal ?? null })),
+        ]);
+        const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+        if (errors.length) throw new AggregateError(errors, 'Review handoff recovery failed');
+        return results.flatMap(result => result.value === undefined ? [] : Array.isArray(result.value) ? result.value : [result.value]);
+      },
+    });
     const close = () => runtimeLifecycle.close();
     return {
       config,
@@ -2650,28 +3298,28 @@ export async function createApplication({
       workflowRouting,
       codeJobReader,
       codeJobControl,
+      taskRuns: coordinationEnabled ? Object.freeze({...createTaskRunView({registry:taskRuns,codeJobReader}),
+        control:(...args)=>ordinaryActionAdmissionGate ? ordinaryActionAdmissionGate.run(()=>taskRuns.control(...args)) : taskRuns.control(...args)}) : null,
       codeJobEvidenceReader,
+      codeJobExecution,
       workLedgerView,
       dailyWorkLedgerView,
       workGraphView,
       attentionBrowser,
       attentionCoordinator,
       workCoordination,
+      workContinuationScheduler,
+      localCodeProposalRecovery,
       ownerWorkRetry,
       ownerWorkRequests,
-      reviewHandoffReconciler: ownerWorkRequests && confirmationRuntime?.reviewHandoffs
-        ? new ReviewHandoffReconciler({
-            confirmations: confirmationRuntime.reviewHandoffs,
-            ownerWorkRequests,
-            githubAssignee: confirmationRuntime.reviewHandoffAssignee,
-          })
-        : null,
+      reviewHandoffReconciler,
       deliveryEvidence,
       memorySearch,
       memoryAnswer,
       memoryImports,
       memoryProjector,
       brainProviderStatus,
+      jenkinsConnection: jenkinsRuntime?.connection ?? null,
       operations,
       close,
     };

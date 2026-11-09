@@ -3,10 +3,13 @@ import { types as utilTypes } from "node:util";
 
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
 } from "./code-execution-source.js";
 import { digestValue } from "./code-executor-contract.js";
 import { normalizeChangePackageManifest } from "./change-package-contract.js";
+import { CodeExecutionPolicy } from "./code-execution-policy.js";
+import { executionIdentityFields, executionIdentityKeys, isExecutionIdentityProof } from "./test-runtime-identity.js";
 
 const SHA256 = /^[a-f0-9]{64}$/u;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
@@ -83,6 +86,9 @@ const RESOLUTION_KEYS = Object.freeze([
   "resolvedPaths",
   "resolvedPathsDigest",
   "finalTreeOid",
+]);
+const REVIEW_REPAIR_RESOLUTION_KEYS = Object.freeze([
+  "resolvedPaths", "resolvedPathsDigest", "finalTreeOid",
 ]);
 const COMMIT_KEYS = Object.freeze([
   "objectFormat",
@@ -330,6 +336,17 @@ function normalizeManifest(value) {
 
 function assertManifestResolvesCompleteSource(manifest, executionSource) {
   const expectedPaths = codeExecutionSourceWritablePaths(executionSource);
+  if (isHeadRepairExecutionSource(executionSource)) {
+    const policy = new CodeExecutionPolicy({ writablePaths: expectedPaths });
+    const changed = [...manifest.changes.created, ...manifest.changes.modified,
+      ...manifest.changes.deleted].map(({ path }) => policy.assertWritable(path));
+    if (changed.length === 0 || new Set(changed).size !== changed.length ||
+        manifest.workspace.sourceRevision === manifest.workspace.workspaceRevision ||
+        manifest.changes.modified.some(({ beforeSha256, blob }) => beforeSha256 === blob.sha256)) {
+      throw invalid("Review repair manifest 必须包含写范围内的真实变更");
+    }
+    return changed.sort(compareText);
+  }
   const modifiedPaths = manifest.changes.modified.map(({ path }) => path);
   if (
     manifest.workspace.sourceRevision === manifest.workspace.workspaceRevision ||
@@ -363,7 +380,7 @@ function profileProjection(profile) {
     workspaceRevision: profile.workspaceRevision,
     actionId: profile.actionId,
     attemptNumber: profile.attemptNumber,
-    imageId: profile.imageId,
+    ...executionIdentityFields(profile),
     artifactsDigest: digestValue(profile.artifacts),
   };
 }
@@ -378,13 +395,16 @@ function testProjection(manifest) {
 }
 
 function messageFromBindings({
+  sourceKind = "conflict_preparation",
   executionSourceDigest,
   packageDigest,
   passedProfilesDigest,
   workspaceRevision,
 }) {
   return [
-    "MyDashboard controlled conflict resolution",
+    sourceKind === "ci_repair" ? "MyDashboard controlled CI repair" : sourceKind === "review_repair"
+      ? "MyDashboard controlled review repair"
+      : "MyDashboard controlled conflict resolution",
     "",
     `Execution-Source-Digest: ${executionSourceDigest}`,
     `Change-Package-Digest: ${packageDigest}`,
@@ -413,6 +433,7 @@ function creationBindings(executionSourceValue, manifestValue) {
     workspace,
     resolvedPaths,
     message: messageFromBindings({
+      sourceKind: executionSource.kind,
       executionSourceDigest,
       packageDigest: packageEvidence.packageDigest,
       passedProfilesDigest: tests.passedProfilesDigest,
@@ -472,7 +493,12 @@ function normalizePackage(value) {
 }
 
 function normalizeProfile(value, workspaceRevision) {
-  const fields = exactObject(value, TEST_PROFILE_KEYS, "tests.profiles[]");
+  const fields = exactObject(value, [...TEST_PROFILE_KEYS.filter((key) => key !== "imageId"), ...executionIdentityKeys(value)], "tests.profiles[]");
+  const identityProof = Object.fromEntries(fields);
+  if (!isExecutionIdentityProof(identityProof, IMAGE_ID) ||
+    (identityProof.runtimeIdentity && identityProof.runtimeIdentity.actionId !== identityProof.actionId)) {
+    throw invalid("tests.profiles[] 执行身份无效");
+  }
   const profileWorkspaceRevision = sha256(
     fields.get("workspaceRevision"),
     "tests.profiles[].workspaceRevision",
@@ -497,12 +523,7 @@ function normalizeProfile(value, workspaceRevision) {
       fields.get("attemptNumber"),
       "tests.profiles[].attemptNumber",
     ),
-    imageId: boundedText(
-      fields.get("imageId"),
-      "tests.profiles[].imageId",
-      256,
-      IMAGE_ID,
-    ),
+    ...executionIdentityFields(identityProof),
     artifactsDigest: sha256(
       fields.get("artifactsDigest"),
       "tests.profiles[].artifactsDigest",
@@ -569,6 +590,21 @@ function exactStringArray(value, expected, name) {
 }
 
 function normalizeResolution(value, executionSource) {
+  if (isHeadRepairExecutionSource(executionSource)) {
+    const fields = exactObject(value, REVIEW_REPAIR_RESOLUTION_KEYS, "resolution");
+    const policy = new CodeExecutionPolicy({ writablePaths: codeExecutionSourceWritablePaths(executionSource) });
+    const resolvedPaths = denseArray(fields.get("resolvedPaths"), 10_000, "resolution.resolvedPaths", { minimum: 1 })
+      .map((entry) => policy.assertWritable(entry));
+    if (resolvedPaths.some((entry, index) => index > 0 && compareText(resolvedPaths[index - 1], entry) >= 0) ||
+        fields.get("resolvedPathsDigest") !== digestValue(resolvedPaths)) {
+      throw invalid("Review repair resolution 路径或摘要无效");
+    }
+    return {
+      resolvedPaths,
+      resolvedPathsDigest: digestValue(resolvedPaths),
+      finalTreeOid: gitOid(fields.get("finalTreeOid"), executionSource.inputBinding.headRefOid.length, "resolution.finalTreeOid"),
+    };
+  }
   const fields = exactObject(value, RESOLUTION_KEYS, "resolution");
   const binding = executionSource.preparationBinding;
   const oidLength = executionSource.inputBinding.gitTarget.headRefOid.length;
@@ -662,14 +698,15 @@ function normalizeCommit(value, {
   if (oidLength === undefined || target.headRefOid.length !== oidLength) {
     throw invalid("commit.objectFormat 与 Git target 不一致");
   }
-  const parents = denseArray(fields.get("parents"), 2, "commit.parents", {
-    minimum: 2,
+  const parentCount = isHeadRepairExecutionSource(executionSource) ? 1 : 2;
+  const parents = denseArray(fields.get("parents"), parentCount, "commit.parents", {
+    minimum: parentCount,
   }).map((parent, index) =>
     gitOid(parent, oidLength, `commit.parents[${index}]`));
   if (
     parents[0] !== target.headRefOid ||
-    parents[1] !== target.baseRefOid ||
-    parents[0] === parents[1]
+    (parentCount === 2 && (parents[1] !== target.baseRefOid ||
+      parents[0] === parents[1]))
   ) {
     throw invalid("commit.parents 必须按 Head、Base 顺序绑定 Git target");
   }
@@ -708,7 +745,7 @@ function evidenceCore(value) {
 function normalizeEvidenceDocument(value) {
   const fields = exactObject(value, EVIDENCE_KEYS, "controlled commit evidence");
   if (
-    fields.get("schemaVersion") !== 1 ||
+    ![1, 2].includes(fields.get("schemaVersion")) ||
     fields.get("kind") !== "controlled_git_commit"
   ) {
     throw invalid("controlled commit evidence kind 或 schemaVersion 无效");
@@ -730,6 +767,7 @@ function normalizeEvidenceDocument(value) {
   );
   const createdAt = canonicalTimestamp(fields.get("createdAt"));
   const expectedMessageDigest = rawSha256(messageFromBindings({
+    sourceKind: executionSource.kind,
     executionSourceDigest,
     packageDigest: packageEvidence.packageDigest,
     passedProfilesDigest: tests.passedProfilesDigest,
@@ -742,7 +780,7 @@ function normalizeEvidenceDocument(value) {
     expectedMessageDigest,
   });
   const core = {
-    schemaVersion: 1,
+    schemaVersion: tests.profiles.some((profile) => profile.runtimeIdentity) ? 2 : 1,
     kind: "controlled_git_commit",
     executionSource,
     executionSourceDigest,
@@ -754,6 +792,7 @@ function normalizeEvidenceDocument(value) {
     createdAt,
   };
   const evidenceDigest = sha256(fields.get("evidenceDigest"), "evidenceDigest");
+  if (fields.get("schemaVersion") !== core.schemaVersion) throw invalid("controlled commit schemaVersion 与执行身份不一致");
   const evidenceId = boundedText(
     fields.get("evidenceId"),
     "evidenceId",
@@ -795,16 +834,19 @@ export function createControlledCommitEvidence(value) {
     );
     const resolution = normalizeResolution(
       {
-        preparationId:
+        ...(isHeadRepairExecutionSource(bindings.executionSource) ? {} : { preparationId:
           bindings.executionSource.preparationBinding.preparationId,
         resultTreeOid:
-          bindings.executionSource.preparationBinding.resultTreeOid,
+          bindings.executionSource.preparationBinding.resultTreeOid }),
         resolvedPaths: resolutionInput.get("resolvedPaths"),
         resolvedPathsDigest: digestValue(bindings.resolvedPaths),
         finalTreeOid: resolutionInput.get("finalTreeOid"),
       },
       bindings.executionSource,
     );
+    if (!sameUniqueValues(resolution.resolvedPaths, bindings.resolvedPaths)) {
+      throw invalid("resolution 未绑定 manifest 真实变更路径");
+    }
     const createdAt = canonicalTimestamp(fields.get("createdAt"));
     const commit = normalizeCommit(fields.get("commit"), {
       executionSource: bindings.executionSource,
@@ -813,7 +855,7 @@ export function createControlledCommitEvidence(value) {
       expectedMessageDigest: rawSha256(bindings.message),
     });
     const core = {
-      schemaVersion: 1,
+      schemaVersion: bindings.tests.profiles.some((profile) => profile.runtimeIdentity) ? 2 : 1,
       kind: "controlled_git_commit",
       executionSource: bindings.executionSource,
       executionSourceDigest: bindings.executionSourceDigest,

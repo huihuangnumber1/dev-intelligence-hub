@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { planIntentStage, planIntentAcknowledgement, planIntentClaim } from "../src/services/work-ledger-outbox-commands.js";
 import { workGraphMemoryRecordReceipt } from "../src/domain/work-graph-memory-event.js";
 import {
   assertWorkLedgerGraphClaimable,
@@ -63,6 +64,37 @@ function stateWithItems(items) {
   );
   return state;
 }
+
+test("complete is rejected before staging or acknowledging an undelivered required report", () => {
+  const item = createAssignmentWorkItem(assignment(1), CREATED_AT);
+  Object.assign(item, { status: "working", ownerId: "employee-pr-reviewer", leaseId: "work-lease", leaseUntil: "2026-08-03T01:10:00.000Z" });
+  const state = stateWithItems([item]);
+  const input = { itemId: item.itemId, expectedRevision: item.revision, leaseId: item.leaseId,
+    actorId: item.ownerId, roleId: "pr-reviewer", intent: { schemaVersion: 1, type: "complete",
+      summary: "Diagnosis complete", reason: "Inspected", outcome: "done", evidence: [] } };
+  // Create the historical complete before its missing delivery is considered.
+  const staged = planIntentStage({ state, input, clock: () => CREATED_AT });
+  const expected = { deliverableId: "diagnosis", kind: "text-report", description: "Diagnosis report", required: true };
+  item.graph.acceptanceContracts[0].expectedDeliverables = [expected];
+  const before = structuredClone(state);
+  assert.throws(() => planIntentStage({ state, input, clock: () => CREATED_AT }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  assert.deepEqual(state, before);
+
+  const legacy = { ...state, ...staged.patch };
+  legacy.revision += 1;
+  legacy.items[0].graph.acceptanceContracts[0].expectedDeliverables = [expected];
+  const claimed = planIntentClaim({ state: legacy, input: { intentId: staged.result.outbox.intentId,
+    expectedRevision: staged.result.outbox.revision, dispatcherId: "dispatcher", leaseDurationMs: 30_000 },
+    clock: () => CREATED_AT, newLeaseId: () => "dispatch-lease" });
+  Object.assign(legacy, claimed.patch);
+  legacy.revision += 1;
+  const ack = { intentId: claimed.result.intentId, expectedRevision: claimed.result.revision,
+    dispatchLeaseId: claimed.result.dispatchLeaseId, itemExpectedRevision: legacy.items[0].revision,
+    actorId: "dispatcher", outcome: "delivered", nextStatus: "completed", details: {} };
+  assert.throws(() => planIntentAcknowledgement({ state: legacy, input: ack, clock: () => CREATED_AT }), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+  legacy.items[0].graph.deliveries = [graphDelivery({ deliverableId: "diagnosis", status: "accepted" })];
+  assert.equal(planIntentAcknowledgement({ state: legacy, input: ack, clock: () => CREATED_AT }).result.item.status, "completed");
+});
 
 function corrupted(error) {
   return error.code === "WORK_LEDGER_STATE_CORRUPTED";

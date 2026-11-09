@@ -290,19 +290,17 @@ function reviewFiles(value) {
   });
 }
 
-function truncateUtf8(value, maximumBytes) {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.byteLength <= maximumBytes) return value;
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const minimumEnd = Math.max(0, maximumBytes - 3);
-  for (let end = Math.max(0, maximumBytes); end >= minimumEnd; end -= 1) {
-    try {
-      return decoder.decode(bytes.subarray(0, end));
-    } catch {
-      // A UTF-8 code point can cross the byte boundary by at most three bytes.
-    }
+function truncateJsonString(value, maximumBytes) {
+  let bytes = 0;
+  let end = 0;
+  for (const character of value) {
+    // The empty patch already reserves JSON's two surrounding quotes.
+    const size = Buffer.byteLength(JSON.stringify(character), "utf8") - 2;
+    if (bytes + size > maximumBytes) break;
+    bytes += size;
+    end += character.length;
   }
-  return "";
+  return value.slice(0, end);
 }
 
 function reviewContextRequest(input, identity) {
@@ -375,7 +373,7 @@ function projectReviewMaterial(value, identity, factsContext) {
       502,
     );
   }
-  material.patch = truncateUtf8(value.patch, remaining);
+  material.patch = truncateJsonString(value.patch, remaining);
   material.patchTruncated ||= material.patch !== value.patch;
   return material;
 }
@@ -544,7 +542,6 @@ export class PrEngineerService {
   async observe(input, options) {
     const signal = operationSignal(options);
     signal?.throwIfAborted();
-    const identity = createPullRequestReadIdentity(input);
     const stored = await this.get(input);
     signal?.throwIfAborted();
     const now = timestamp(this.#clock(), "clock");
@@ -554,6 +551,15 @@ export class PrEngineerService {
     ) {
       return stored;
     }
+    return this.refresh(input, options);
+  }
+
+  // A review publication boundary needs a current read even while ordinary
+  // background observations are within their cache window.
+  async refresh(input, options) {
+    const signal = operationSignal(options);
+    signal?.throwIfAborted();
+    const identity = createPullRequestReadIdentity(input);
     const key = identity.identityDigest;
     const running = this.#inFlight.get(key);
     if (running) return running;

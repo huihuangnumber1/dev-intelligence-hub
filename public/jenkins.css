@@ -1,0 +1,10 @@
+.jenkins-connection { max-width: 640px; margin: 48px auto; padding: 32px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.jenkins-connection h1 { margin: 10px 0 18px; }
+.jenkins-connection form { display: grid; gap: 10px; margin-top: 28px; }
+.jenkins-connection input { width: 100%; padding: 12px; box-sizing: border-box; border: 1px solid var(--line-strong); border-radius: 5px; background: white; color: var(--ink); font: inherit; }
+.jenkins-connection button { justify-self: start; padding: 12px 20px; border-radius: 6px; background: var(--green); color: white; border: none; font: inherit; cursor: pointer; }
+.jenkins-connection button:disabled { opacity: .6; cursor: wait; }
+.jenkins-connection input:focus-visible,.jenkins-connection button:focus-visible { outline: 3px solid var(--green); outline-offset: 3px; }
+.connection-note { color: var(--muted); font-size: 14px; line-height: 1.6; }
+#connection-status { min-height: 2em; line-height: 1.6; overflow-wrap: anywhere; }
+@media(max-width:700px) { .jenkins-connection { margin: 16px; padding: 22px; } }

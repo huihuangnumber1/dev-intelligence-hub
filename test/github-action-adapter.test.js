@@ -216,6 +216,15 @@ class FakeRunner {
     let response = this.responses.shift();
     if (typeof response === "function") response = await response(input);
     if (response instanceof Error) throw response;
+    if (input.args.includes("graphql") && response?.number !== undefined) {
+      const repo = new URL(response.url).pathname.split("/").slice(1, 3).join("/");
+      const headRepo = response.headRepository?.nameWithOwner;
+      response = { data: { repository: { nameWithOwner: repo, pullRequest: {
+        ...response, author: { login: "contributor" }, changedFiles: 1,
+        baseRef: { name: response.baseRefName, repository: { nameWithOwner: repo }, target: { oid: response.liveBaseOid ?? response.baseRefOid } },
+        headRef: { name: response.headRefName, repository: { nameWithOwner: headRepo }, target: { oid: response.headRefOid } },
+      } } } };
+    }
     const stdout = response?.__jsonLines
       ? response.__jsonLines.map((value) => JSON.stringify(value)).join("\n")
       : JSON.stringify(response);
@@ -417,6 +426,61 @@ test("a confirmed testing handoff adds its named GitHub assignee idempotently", 
   });
 });
 
+test("every published automatic Review assigns its next owner before removing the reviewer", async (t) => {
+  for (const [reviewEvent, assigneeLogin] of [["APPROVE", "qt-tester"], ["REQUEST_CHANGES", "developer"], ["COMMENT", "developer"]]) {
+    await t.test(reviewEvent, async () => {
+      const request = {
+        actorAccountId: "local-owner", repository: "acme/command-center", pullRequestNumber: 42,
+        headRefOid: HEAD, reviewEvent, testingOwnerLogin: reviewEvent === "APPROVE" ? "qt-tester" : null,
+      };
+      const runner = new FakeRunner([
+        actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: HEAD }, user: { login: "developer" } },
+        actor(), pullRequestIssue(["local-owner", "other-owner"]),
+        { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["local-owner", "other-owner", assigneeLogin]),
+        { head: { sha: HEAD }, state: "open" }, actor(), pullRequestIssue(["other-owner", assigneeLogin]),
+      ]);
+      assert.equal((await createAdapter(runner).assignReviewOutcome(request)).assigneeLogin, assigneeLogin);
+      const writes = runner.calls.filter((call) => call.args.includes("POST") || call.args.includes("DELETE"));
+      assert.equal(writes.length, 2);
+      assert.ok(writes[0].args.includes("POST"));
+      assert.deepEqual(JSON.parse(writes[0].input), { assignees: [assigneeLogin] });
+      assert.ok(writes[1].args.includes("DELETE"));
+      assert.deepEqual(JSON.parse(writes[1].input), { assignees: ["local-owner"] });
+    });
+  }
+});
+
+test("automatic Review handoff refuses a changed Head", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center", pullRequestNumber: 42, headRefOid: HEAD, reviewEvent: "REQUEST_CHANGES", testingOwnerLogin: null };
+  const changed = new FakeRunner([actor(), { number: 42, state: "open", html_url: "https://github.com/acme/command-center/pull/42", head: { sha: OTHER_HEAD }, user: { login: "developer" } }]);
+  await assert.rejects(createAdapter(changed).assignReviewOutcome(request), { code: "GITHUB_HANDOFF_HEAD_CHANGED" });
+  assert.equal(changed.calls.some((call) => call.args.includes("POST")), false);
+});
+
+test("a failed next-owner assignment never removes the reviewer", async () => {
+  const runner = new FakeRunner([
+    actor(), pullRequestIssue(["local-owner"]), actor(),
+    pullRequestIssue(["local-owner"]),
+  ]);
+  await assert.rejects(createAdapter(runner).assignAssignee({
+    actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, assigneeLogin: "developer",
+  }), { code: "GITHUB_PROTOCOL" });
+  assert.equal(runner.calls.some((call) => call.args.includes("DELETE")), false);
+});
+
+test("automatic publication rechecks its scope immediately before POST", async () => {
+  const envelope = workProposalEnvelope();
+  envelope.execution.requestId = `auto-review-v1-${"a".repeat(48)}`;
+  const target = { number: 42, url: "https://github.com/acme/command-center/pull/42", state: "OPEN", baseRefName: "main", baseRefOid: BASE_HEAD, headRefName: "fix/conflict", headRefOid: HEAD, headRepository: { nameWithOwner: "contributor/command-center" } };
+  for (const guard of [null, { verify: async () => false }]) {
+    const runner = new FakeRunner([actor(), pages([]), target, actor(), target]);
+    const adapter = createAdapter(runner, { inputAuthorityVerifier: { verify: async (binding) => binding }, automaticReviewGuard: guard });
+    assert.equal((await adapter.execute(envelope)).status, "stale");
+    assert.equal(runner.calls.some((call) => call.args.includes("POST")), false);
+  }
+});
+
 test("work proposal reviews use the same sealed GitHub review protocol", async () => {
   const runner = new FakeRunner([actor("different-user")]);
   const result = await createAdapter(runner).reconcile(
@@ -436,7 +500,8 @@ test("work proposal reviews verify the full sealed Git target at execution time"
     url: "https://github.com/acme/command-center/pull/42",
     state: "OPEN",
     baseRefName: "main",
-    baseRefOid: BASE_HEAD,
+    baseRefOid: "d".repeat(40),
+    liveBaseOid: BASE_HEAD,
     headRefName: "fix/conflict",
     headRefOid: HEAD,
     headRepository: { nameWithOwner: "contributor/command-center" },
@@ -450,15 +515,13 @@ test("work proposal reviews verify the full sealed Git target at execution time"
     { status: "absent", code: "GITHUB_MARKER_ABSENT" },
   );
   assert.equal(matchingVerifier.calls.length, 1);
-  assert.equal(
-    matching.calls[2].args.at(-1),
-    "number,url,state,baseRefName,baseRefOid,headRefName,headRefOid,headRepository",
-  );
+  assert.equal(matching.calls[2].args.includes("graphql"), true);
+  assert.match(matching.calls[2].args.find((arg) => arg.startsWith("query=")), /baseRef \{ name repository \{ nameWithOwner \} target/);
 
   const changedBase = new FakeRunner([
     actor(),
     pages([]),
-    { ...currentTarget, baseRefOid: "e".repeat(40) },
+    { ...currentTarget, liveBaseOid: "e".repeat(40) },
   ]);
   assert.deepEqual(
     await createAdapter(changedBase, {
@@ -503,7 +566,7 @@ test("work proposal execution rechecks ledger authority and the full target befo
     pages([]),
     currentTarget,
     actor(),
-    { ...currentTarget, baseRefOid: "e".repeat(40) },
+    { ...currentTarget, liveBaseOid: "e".repeat(40) },
   ]);
   const stale = await createAdapter(changedBase, {
     inputAuthorityVerifier: acceptingInputAuthorityVerifier(),
@@ -559,6 +622,18 @@ test("revoked work proposal authority prevents every GitHub call", async () => {
   assert.deepEqual(result, { status: "stale" });
   assert.equal(verifierCalls, 1);
   assert.equal(runner.calls.length, 0);
+});
+
+test("unavailable historical assignment facts remain retryable at execution and unknown at reconciliation", async () => {
+  for (const method of ["execute", "reconcile"]) {
+    const runner = new FakeRunner(method === "reconcile" ? [actor(), pages([])] : []);
+    const adapter = createAdapter(runner, { inputAuthorityVerifier: { async verify() {
+      throw Object.assign(new Error("Assignment lookup unavailable"), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
+    } } });
+    assert.deepEqual(await adapter[method](workProposalEnvelope()), { status: "error",
+      error: { trust: method === "execute" ? "absent" : "unknown", code: "GITHUB_UNAVAILABLE" } });
+    assert.equal(runner.calls.some(call => call.args.includes("POST")), false);
+  }
 });
 
 test("legacy work-proposal actions are reconcile-only and cannot be retried", async () => {
@@ -1410,4 +1485,59 @@ test("pending and rejected confirmations never acquire a Review credential", asy
   });
 
   assert.equal(acquisitions, 0);
+});
+
+
+test("named reviewer handoff adds QA before removing the reviewer", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  const live = assignees => ({ ...pullRequestIssue(assignees), head: { sha: HEAD } });
+  const runner = new FakeRunner([
+    actor(), pullRequestIssue(["human-reviewer"]), live(["human-reviewer"]), actor(),
+    pullRequestIssue(["human-reviewer", "qt-tester"]), live(["human-reviewer", "qt-tester"]), actor(),
+    pullRequestIssue(["qt-tester"]),
+  ]);
+  assert.deepEqual(await createAdapter(runner).assignAssignee(request), { status: "applied", assigneeLogin: "qt-tester" });
+  const writes = runner.calls.filter(call => call.args.includes("POST") || call.args.includes("DELETE"));
+  assert.equal(writes.length, 2);
+  assert.ok(writes[0].args.includes("POST"));
+  assert.deepEqual(JSON.parse(writes[0].input), { assignees: ["qt-tester"] });
+  assert.ok(writes[1].args.includes("DELETE"));
+  assert.deepEqual(JSON.parse(writes[1].input), { assignees: ["human-reviewer"] });
+  assert.equal(runner.responses.length, 0);
+});
+
+test("named reviewer handoff refuses owner or Head drift before writing", async t => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  for (const [name, responses, code] of [
+    ["initial owner", [actor(), pullRequestIssue(["other-owner"])], "GITHUB_HANDOFF_OWNER_CHANGED"],
+    ["live owner", [actor(), pullRequestIssue(["human-reviewer"]), { ...pullRequestIssue(["other-owner"]), head: { sha: HEAD } }], "GITHUB_HANDOFF_OWNER_CHANGED"],
+    ["live Head", [actor(), pullRequestIssue(["human-reviewer"]), { ...pullRequestIssue(["human-reviewer"]), head: { sha: OTHER_HEAD } }], "GITHUB_HANDOFF_HEAD_CHANGED"],
+  ]) await t.test(name, async () => {
+    const runner = new FakeRunner(responses);
+    await assert.rejects(createAdapter(runner).assignAssignee(request), { code });
+    assert.equal(runner.calls.some(call => call.args.includes("POST") || call.args.includes("DELETE")), false);
+    assert.equal(runner.responses.length, 0);
+  });
+});
+
+test("named reviewer handoff converges after an add succeeds but its acknowledgement is lost", async () => {
+  const request = { actorAccountId: "local-owner", repository: "acme/command-center",
+    pullRequestNumber: 42, expectedHeadOid: HEAD, expectedAssigneeLogin: "human-reviewer", assigneeLogin: "qt-tester" };
+  const live = assignees => ({ ...pullRequestIssue(assignees), head: { sha: HEAD } });
+  let owners = ["human-reviewer"];
+  const first = new FakeRunner([actor(), pullRequestIssue(owners), live(owners), actor(), () => {
+    owners = ["human-reviewer", "qt-tester"];
+    throw new Error("assignment acknowledgement lost");
+  }]);
+  await assert.rejects(createAdapter(first).assignAssignee(request));
+  assert.equal(first.calls.some(call => call.args.includes("DELETE")), false);
+  assert.deepEqual(owners, ["human-reviewer", "qt-tester"]);
+  const retry = new FakeRunner([actor(), pullRequestIssue(owners), live(owners), actor(), pullRequestIssue(["qt-tester"])]);
+  assert.deepEqual(await createAdapter(retry).assignAssignee(request), { status: "applied", assigneeLogin: "qt-tester" });
+  assert.equal(retry.calls.some(call => call.args.includes("POST")), false);
+  const removal = retry.calls.find(call => call.args.includes("DELETE"));
+  assert.deepEqual(JSON.parse(removal.input), { assignees: ["human-reviewer"] });
+  assert.equal(retry.responses.length, 0);
 });

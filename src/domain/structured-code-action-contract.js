@@ -241,9 +241,13 @@ function normalizeAction(value) {
   exactObject(value, ["type", "outcome", "evidence"]);
   return {
     type,
-    outcome: boundedText(value.outcome, 4_096),
-    evidence: evidence(value.evidence),
+    ...normalizeCodeCompletionReport({ outcome: value.outcome, evidence: value.evidence }),
   };
+}
+
+export function normalizeCodeCompletionReport(value) {
+  exactObject(value, ["outcome", "evidence"]);
+  return { outcome: boundedText(value.outcome, 4_096), evidence: evidence(value.evidence) };
 }
 
 export function normalizeStructuredCodeActionDecision(value) {

@@ -70,7 +70,8 @@ function assertReusableTestAssetVersions(before, after) {
   const afterProfiles = after.codeExecutor?.profiles || {};
   for (const [profileId, profile] of Object.entries(afterProfiles)) {
     const previous = beforeProfiles[profileId];
-    if (profile?.kind !== "node-script" || previous?.kind !== "node-script") {
+    if (!["node-script", "windows-test", "windows-build"].includes(profile?.kind) ||
+      !["node-script", "windows-test", "windows-build"].includes(previous?.kind)) {
       continue;
     }
     const changed = ["title", "description", "source"].some(

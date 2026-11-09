@@ -51,6 +51,20 @@ test("Codex login status renderer handles loading, error, and pending restart", 
   assert.match(pending, /已保存，重启后生效/u);
 });
 
+test("native readiness explains the active login route without claiming task progress", () => {
+  const ready = renderBrainProviderStatus({
+    state: { ...status("available"), credentialMode: "codex-native-login" },
+  });
+  assert.match(ready, /原生登录可用/u);
+  assert.match(ready, /会话目录/u);
+  assert.match(ready, /不代表任务已经开始/u);
+  const blocked = renderBrainProviderStatus({
+    state: { ...status("broker_blocked"), credentialMode: "codex-native-login" },
+  });
+  assert.match(blocked, /执行状态待核验/u);
+  assert.doesNotMatch(blocked, /文件所有者|文件式登录可安全代理/u);
+});
+
 test("Codex login status renderer ignores private and unknown status fields", () => {
   const privateMarkers = [
     "owner@example.invalid",

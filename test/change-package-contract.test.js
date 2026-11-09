@@ -65,6 +65,21 @@ function hasCode(code) {
   return (error) => error instanceof ChangePackageError && error.code === code;
 }
 
+test("Windows package proof retains native process identity and rejects mixed identities", () => {
+  const value = draft();
+  const profile = value.passedProfiles[0];
+  delete profile.imageId;
+  Object.assign(profile, { runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: "session-1-attempt-2", actionId: profile.actionId,
+    pid: 3456, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: SHA_D }, assetVersion: 3, verificationKind: "test" });
+  const { manifest } = createChangePackage(value);
+  assert.equal(manifest.schemaVersion, 2);
+  assert.deepEqual(normalizeChangePackageManifest(manifest), manifest);
+  assert.equal(Object.hasOwn(manifest.passedProfiles[0], "imageId"), false);
+  assert.equal(manifest.passedProfiles[0].runtimeIdentity.pid, 3456);
+  assert.throws(() => createChangePackage({ ...value, passedProfiles: [{ ...profile, imageId: "fake" }] }), hasCode("INVALID_CHANGE_PACKAGE"));
+  assert.throws(() => createChangePackage({ ...value, passedProfiles: [{ ...profile, runtimeIdentity: { ...profile.runtimeIdentity, actionId: "other" } }] }), hasCode("INVALID_CHANGE_PACKAGE"));
+});
+
 test("a package is deterministic, content addressed, and fully bound", () => {
   const first = createChangePackage(draft());
   const repeated = createChangePackage({

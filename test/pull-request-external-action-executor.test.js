@@ -303,6 +303,40 @@ test("one generic execution acquires, uses, and releases one actor-bound lease",
   assert.equal(JSON.stringify(result).includes(credential.token), false);
 });
 
+test("controlled push shares its aggregate budget across repeated local verification", async () => {
+  const envelope = envelopeFor("push");
+  const transport = mutableTransport(envelope);
+  let now = 1_000_000;
+  const executor = executorFor(envelope, transport, {
+    clock: () => now, timeoutMs: 60_000,
+    controlledCommitVerifier: { async verify() {
+      now += 68_000;
+      return structuredClone(envelope.action.controlledCommitEvidence);
+    } },
+    pushAuthorization: { async verifyPush() { now += 68_000; return true; } },
+  });
+  assert.equal((await executor.execute(envelope)).status, "applied");
+  assert.ok(now > 1_060_000, "the bounded stages exceed a single request budget in aggregate");
+  assert.equal(transport.calls.filter(x => x.method === "perform").length, 1);
+});
+
+test("one slow controlled verification remains bounded within the aggregate push budget", async () => {
+  const envelope = envelopeFor("push");
+  const transport = mutableTransport(envelope);
+  const credential = recordingCredentialSource();
+  let now = 1_000_000;
+  const executor = executorFor(envelope, transport, {
+    credentialSource: credential.source, clock: () => now, timeoutMs: 60_000,
+    controlledCommitVerifier: { async verify() {
+      now += 600_001;
+      return structuredClone(envelope.action.controlledCommitEvidence);
+    } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "error", error: { code: "GITHUB_TIMEOUT", trust: "absent" } });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+});
+
 test("one generic reconcile acquires, uses, and releases one actor-bound lease", async () => {
   const envelope = envelopeFor("comment");
   const transport = mutableTransport(envelope);
@@ -483,6 +517,96 @@ test("all five actions execute once and reconcile from action-specific proof", a
     assert.equal(performed.input.pullRequestNumber, 42);
     assert.equal(JSON.stringify(applied).includes("runtime-secret"), false);
   }
+});
+
+function ownPrRepairEnvelope() {
+  const binding = pullRequestExternalActionBinding();
+  return pullRequestExternalActionEnvelope(pullRequestExternalActionPlan({
+    type: "push",
+    controlledCommitEvidence: externalActionControlledCommit(binding, { reviewRepair: true }),
+  }, { binding }));
+}
+
+test("automatic repair push requires its authorization before acquiring credentials", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const credential = recordingCredentialSource();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    credentialSource: credential.source,
+    pushAuthorization: { async verifyPush(actual) { assert.deepEqual(actual, envelope); return false; } },
+  });
+  assert.deepEqual(await executor.execute(envelope), { status: "stale" });
+  assert.equal(credential.calls.acquire.length, 0);
+  assert.deepEqual(transport.calls, []);
+});
+
+test("automatic repair push rechecks authorization immediately before publishing", async () => {
+  for (const revoke of [false, true]) {
+    const envelope = ownPrRepairEnvelope();
+    const transport = mutableTransport(envelope);
+    let checks = 0;
+    const executor = executorFor(envelope, transport, {
+      enabledActions: ["push"],
+      pushAuthorization: { async verifyPush() { checks += 1; return !revoke || checks < 3; } },
+    });
+    const result = await executor.execute(envelope);
+    assert.equal(checks, 3);
+    assert.equal(result.status, revoke ? "stale" : "applied");
+    assert.equal(transport.calls.filter(({ method }) => method === "perform").length, revoke ? 0 : 1);
+  }
+});
+
+test("unavailable automatic repair authorization preserves an unknown recovery outcome", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    pushAuthorization: { async verifyPush() {
+      throw Object.assign(new Error("authorization is recovering"), { code: "GITHUB_AUTHORIZATION_UNAVAILABLE" });
+    } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
+});
+
+test("revoked automatic repair authorization cannot clear an unknown push recovery fence", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    pushAuthorization: { async verifyPush() { return false; } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
+});
+
+test("disabling own PR repair across restart preserves an admitted unknown push", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const disabled = executorFor(envelope, transport, { enabledActions: [] });
+  assert.deepEqual(await disabled.execute(envelope), { status: "stale" });
+  const result = await disabled.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.deepEqual(transport.calls, []);
+});
+
+test("ordinary push permission cannot clear a repair recovery fence after its switch is disabled", async () => {
+  const envelope = ownPrRepairEnvelope();
+  const transport = mutableTransport(envelope);
+  const executor = executorFor(envelope, transport, {
+    enabledActions: ["push"],
+    inputAuthorityVerifier: { async verify() { throw new Error("revoked source"); } },
+  });
+  const result = await executor.reconcile(envelope);
+  assert.equal(result.status, "error");
+  assert.equal(result.error.trust, "unknown");
+  assert.equal(transport.calls.filter(({ method }) => method === "perform").length, 0);
 });
 
 test("a lost mutation response is unknown until reconciliation proves already", async () => {
@@ -671,8 +795,9 @@ test("pre-credential stale and verification errors clear operation timers", asyn
   });
   assert.equal(staleCredential.calls.acquire.length, 0);
   assert.equal(pushCredential.calls.acquire.length, 0);
-  assert.equal(timers.length, 2);
-  assert.deepEqual(cleared, timers);
+  assert.equal(timers.length, 4);
+  assert.equal(cleared.length, timers.length);
+  assert.deepEqual(new Set(cleared), new Set(timers));
 });
 
 test("lost response recovery proves completion after authority is revoked", async () => {

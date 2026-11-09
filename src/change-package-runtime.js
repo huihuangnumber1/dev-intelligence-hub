@@ -329,7 +329,7 @@ export async function createChangePackageRuntime(config, dependencies = {}) {
             packageReader,
             controlledCommitBuilder: bindPort(
               configuredControlledCommitBuilder,
-              ["create", "find", "verify"],
+              ["create", "find", "verify", ...(typeof Object.getOwnPropertyDescriptor(configuredControlledCommitBuilder, "readSealed")?.value === "function" ? ["readSealed"] : [])],
               "controlledCommitBuilder",
             ),
             store,

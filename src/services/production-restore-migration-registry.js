@@ -3,6 +3,7 @@ import path from "node:path";
 import { isDeepStrictEqual, types as utilTypes } from "node:util";
 
 import { normalizeBackupManifest } from "../domain/backup-manifest.js";
+import { originalRepairFeedbackArchiveKey } from "../domain/original-repair-feedback.js";
 import { StateStore } from "../lib/state-store.js";
 import {
   allPersistedSchemaOwners,
@@ -297,6 +298,28 @@ function emptyJournalState(value) {
     projection.entries.length === 0;
 }
 
+async function validateRepairFeedbackArchives({ descriptor, state, store, jsonByKey }) {
+  const references = new Map();
+  for (const row of [...(state?.repairs ?? []), ...(state?.published ?? [])]) {
+    if (row.feedbackSnapshotArchive) references.set(originalRepairFeedbackArchiveKey(row.feedbackSnapshotId), row.feedbackSnapshotArchive);
+  }
+  const keys = discoverStrictFamily(descriptor, jsonByKey);
+  for (const key of references.keys()) {
+    if (!jsonByKey.has(key)) throw failure(ERROR_CODES.archive, descriptor.ownerId);
+  }
+  // Archive-before-state crashes leave valid unreferenced records. Preserve and
+  // validate those too; corrupt or future records cannot enter a restored store.
+  for (const key of keys) {
+    const raw = await readPresent(store, jsonByKey, key, descriptor.ownerId);
+    declaredSchemaVersion(raw, descriptor);
+    try {
+      descriptor.verifyImmutable(structuredClone(raw), { storageKey: key, reference: references.get(key) });
+    } catch (cause) {
+      throw failure(ERROR_CODES.archive, descriptor.ownerId, cause);
+    }
+  }
+}
+
 async function migrateCandidate({ root, catalog, jsonByKey }) {
   const byId = new Map(catalog.map((descriptor) => [descriptor.ownerId, descriptor]));
   const store = new StateStore(root);
@@ -359,7 +382,10 @@ async function migrateCandidate({ root, catalog, jsonByKey }) {
   const codeJobs = await migrateFixed("code-job-state");
   await migrateFixed("code-executor-state");
   const confirmation = await validateFixed("confirmation-queue");
+  await migrateFixed("work-continuations");
   for (const ownerId of [
+    "task-run-execution-receipts",
+    "automatic-own-pr-repair-state",
     "work-proposal-state",
     "attention-inbox",
     "owner-work-requests",
@@ -379,6 +405,12 @@ async function migrateCandidate({ root, catalog, jsonByKey }) {
     discoveredRecordKeys: discoverStrictFamily(recordDescriptor, jsonByKey),
     discoveredIndexKeys: discoverStrictFamily(indexDescriptor, jsonByKey),
     codeJobState: codeJobs,
+    store,
+    jsonByKey,
+  });
+  await validateRepairFeedbackArchives({
+    descriptor: byId.get("original-repair-feedback-archive"),
+    state: candidateById.get("automatic-own-pr-repair-state"),
     store,
     jsonByKey,
   });

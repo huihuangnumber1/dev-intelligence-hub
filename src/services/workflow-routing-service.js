@@ -1,5 +1,6 @@
-import { normalizeWorkflowEvent } from "../domain/workflow-events.js";
+import { normalizeStoredWorkflowEvent, normalizeWorkflowEvent } from "../domain/workflow-events.js";
 import { DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS } from "../domain/prioritizer.js";
+import { AUTHORED_PR_APPROVED_RULE_ID } from "../domain/pr-lifecycle-routing.js";
 import { normalizeWorkflowRoutingConfig } from "../domain/workflow-router.js";
 import {
   projectWorkflowSnapshot,
@@ -40,7 +41,9 @@ import {
 import {
   boundedWorkflowString,
   cloneWorkflowValue,
+  hasExactWorkflowKeys,
   identifiedWorkflowRecord,
+  isPlainWorkflowObject,
   normalizeWorkflowTimestamp,
   workflowDigest,
   workflowServiceError,
@@ -67,7 +70,31 @@ function validateLimit(value, maximum, name) {
   return value;
 }
 
+function isContentVersion(value) {
+  return (
+    isPlainWorkflowObject(value) &&
+    Reflect.ownKeys(value).length === 0 &&
+    Object.isFrozen(value)
+  );
+}
+
+function normalizeVersionedRead(result, expectedVersion) {
+  const expectedKeys = result?.changed === true
+    ? ["changed", "version", "value"]
+    : ["changed", "version"];
+  if (
+    !hasExactWorkflowKeys(result, expectedKeys) ||
+    !isContentVersion(result.version) ||
+    (result.changed !== true && result.changed !== false) ||
+    (result.changed === false && result.version !== expectedVersion)
+  ) {
+    throw new TypeError("StateStore versioned read result is invalid");
+  }
+  return result;
+}
+
 export class WorkflowRoutingService {
+  #headAncestryReader;
   constructor({
     store,
     router,
@@ -81,6 +108,10 @@ export class WorkflowRoutingService {
     auditByteBudget = MAX_WORKFLOW_AUDIT_BYTES,
     bundleByteBudget = MAX_WORKFLOW_BUNDLE_BYTES,
     issueActiveWindowDays = DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
+    scopeExitRecoveryReader = null,
+    scopeReentryReader = null,
+    roleHandoffReader = null,
+    headAncestryReader = null,
   } = {}) {
     if (
       !store ||
@@ -103,6 +134,16 @@ export class WorkflowRoutingService {
     this.router = router;
     this.clock = clock;
     this.issueActiveWindowDays = issueActiveWindowDays;
+    if (scopeExitRecoveryReader !== null && typeof scopeExitRecoveryReader?.read !== "function") {
+      throw new TypeError("scopeExitRecoveryReader is invalid");
+    }
+    this.scopeExitRecoveryReader = scopeExitRecoveryReader;
+    if (scopeReentryReader !== null && typeof scopeReentryReader?.read !== "function") throw new TypeError("scopeReentryReader is invalid");
+    this.scopeReentryReader = scopeReentryReader;
+    if (roleHandoffReader !== null && typeof roleHandoffReader?.read !== "function") throw new TypeError("roleHandoffReader is invalid");
+    this.roleHandoffReader = roleHandoffReader;
+    if (headAncestryReader !== null && typeof headAncestryReader?.read !== "function") throw new TypeError("headAncestryReader is invalid");
+    this.#headAncestryReader = headAncestryReader;
     this.operationQueue = operationQueue || new OperationQueue();
     this.exclusiveLease = exclusiveLease;
     this.runNewWorkAdmission = newWorkAdmissionRun(actionAdmissionGate);
@@ -135,6 +176,7 @@ export class WorkflowRoutingService {
       issueActiveWindowDays,
     });
     this.state = emptyWorkflowState();
+    this.durableContentVersion = undefined;
     this.ready = false;
     this.recoveryPromise = null;
   }
@@ -245,6 +287,9 @@ export class WorkflowRoutingService {
   }
 
   async ingest({ event } = {}) {
+    if (event?.eventType === "pull_request.role_handoff" || Object.hasOwn(event?.payload ?? {}, "headAncestryProof")) {
+      throw workflowServiceError("WORKFLOW_EVENT_HOST_ONLY", "岗位责任交接只能由系统事实核验生成", 400);
+    }
     this.#assertReady();
     const normalizedEvent = normalizeWorkflowEvent(event);
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
@@ -292,18 +337,72 @@ export class WorkflowRoutingService {
       snapshot,
       projectionOptions,
     );
+    // Read ledger/GitHub before the routing lease: intake reads routing while
+    // holding the ledger lease, so the reverse order would deadlock.
+    const recoveredExits = this.scopeExitRecoveryReader !== null &&
+      snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true
+      ? await this.scopeExitRecoveryReader.read({ sourceScopeId }) : [];
+    const currentPullRequestEvents = (this.roleHandoffReader !== null || this.scopeReentryReader !== null || this.#headAncestryReader !== null) &&
+      snapshot.sourceStatus?.githubPullRequests?.ok === true && snapshot.sourceStatus.githubPullRequests.complete === true &&
+      snapshot.sourceStatus.githubPullRequests.stale !== true
+      ? Object.freeze(workflowEventsFromSnapshots(null, currentCheckpoint,
+        { sourceScopeId, ...projectionOptions }).filter(event => event.eventType.startsWith("pull_request."))) : null;
+    const roleHandoffs = this.roleHandoffReader !== null && currentPullRequestEvents !== null
+      ? await this.roleHandoffReader.read({ events: currentPullRequestEvents }) : [];
+    const reentries = this.scopeReentryReader !== null && currentPullRequestEvents !== null
+      ? await this.scopeReentryReader.read({ events: currentPullRequestEvents }) : [];
+    const ancestryEvents = this.#headAncestryReader !== null && currentPullRequestEvents !== null
+      ? await this.#headAncestryReader.read({ events: currentPullRequestEvents }) : [];
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
       const replay = this.#snapshotReplay(currentCheckpoint);
-      if (replay) return replay;
-      const config = this.#requireConfig();
       const existingEventIds = new Set(
         this.state.events.map(({ eventId }) => eventId),
       );
-      const events = workflowEventsFromSnapshots(
+      const extraEvents = recoveredExits.map(normalizeStoredWorkflowEvent).filter(event => {
+        if (event.eventType !== "pull_request.left_scope" || event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("scope recovery may only revoke its GitHub scope");
+        }
+        return !existingEventIds.has(event.eventId);
+      });
+      for (const value of roleHandoffs) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (event.eventType !== "pull_request.role_handoff" || event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("role handoff reader may only transfer its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
+      for (const value of reentries) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (!["pull_request.updated", "pull_request.created"].includes(event.eventType) ||
+            event.source.provider !== "github" || event.source.scopeId !== sourceScopeId) {
+          throw new TypeError("scope reentry reader may only reconnect its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
+      for (const value of ancestryEvents) {
+        const event = normalizeStoredWorkflowEvent(value);
+        if (!["pull_request.updated", "pull_request.created"].includes(event.eventType) || event.source.provider !== "github" ||
+            event.source.scopeId !== sourceScopeId || (event.eventType === "pull_request.updated" &&
+              !/^head-ancestry-[a-f0-9]{64}$/.test(event.payload.headAncestryProof))) {
+          throw new TypeError("Head ancestry producer may only prove its GitHub scope");
+        }
+        if (!existingEventIds.has(event.eventId)) extraEvents.push(event);
+      }
+      if (replay && extraEvents.length === 0) return replay;
+      const config = this.#requireConfig();
+      const emittedEventIds = new Set(existingEventIds);
+      // The proof seals pre-intake root revisions. Apply it before this same
+      // snapshot's ordinary metadata can advance those revisions.
+      const events = [...extraEvents.filter(event => event.eventType === "pull_request.role_handoff"),
+        ...extraEvents.filter(event => ["pull_request.updated", "pull_request.created"].includes(event.eventType)), ...(replay ? [] : workflowEventsFromSnapshots(
         this.state.checkpoint,
         currentCheckpoint,
         { sourceScopeId, ...projectionOptions },
-      ).filter((event) => !existingEventIds.has(event.eventId));
+      )), ...extraEvents.filter(event => event.eventType === "pull_request.left_scope")].filter(event => {
+        if (emittedEventIds.has(event.eventId)) return false;
+        emittedEventIds.add(event.eventId);
+        return true;
+      });
       const assignments = [];
       const audit = [];
       for (const event of events) {
@@ -424,7 +523,9 @@ export class WorkflowRoutingService {
     const assignments = [];
     if (
       includeTrustedScopeLifecycle &&
-      isPullRequestScopeLifecycleEventType(routed.event.eventType)
+      isPullRequestScopeLifecycleEventType(routed.event.eventType) &&
+      (routed.event.eventType !== "pull_request.role_handoff" || routed.result.assignments.some(assignment =>
+        assignment.ruleId === AUTHORED_PR_APPROVED_RULE_ID && assignment.target?.type === "role" && assignment.target.id === "tester"))
     ) {
       assignments.push(
         identifiedWorkflowRecord("assignmentId", "workflow-assignment", {
@@ -520,7 +621,15 @@ export class WorkflowRoutingService {
       );
     }
     try {
-      await this.store.write(WORKFLOW_STATE_KEY, normalized);
+      const writtenVersion = await this.store.write(
+        WORKFLOW_STATE_KEY,
+        normalized,
+      );
+      this.durableContentVersion =
+        typeof this.store.readVersioned === "function" &&
+        isContentVersion(writtenVersion)
+          ? writtenVersion
+          : undefined;
     } catch {
       throw workflowServiceError(
         "WORKFLOW_STATE_WRITE_FAILED",
@@ -532,7 +641,21 @@ export class WorkflowRoutingService {
   }
 
   async #readDurableState() {
-    const stored = await this.store.read(WORKFLOW_STATE_KEY, null);
+    let stored;
+    let observedVersion;
+    if (typeof this.store.readVersioned === "function") {
+      const result = normalizeVersionedRead(
+        await this.store.readVersioned(WORKFLOW_STATE_KEY, null, {
+          ifVersion: this.durableContentVersion,
+        }),
+        this.durableContentVersion,
+      );
+      if (!result.changed) return this.state;
+      stored = result.value;
+      observedVersion = result.version;
+    } else {
+      stored = await this.store.read(WORKFLOW_STATE_KEY, null);
+    }
     if (stored === null) {
       if (this.ready && this.state.revision !== 0) {
         throw workflowServiceError(
@@ -541,6 +664,7 @@ export class WorkflowRoutingService {
           503,
         );
       }
+      this.durableContentVersion = observedVersion;
       return emptyWorkflowState();
     }
     const legacy = isLegacyWorkflowPersistedState(stored);
@@ -584,7 +708,15 @@ export class WorkflowRoutingService {
         );
       }
       try {
-        await this.store.write(WORKFLOW_STATE_KEY, normalized);
+        const writtenVersion = await this.store.write(
+          WORKFLOW_STATE_KEY,
+          normalized,
+        );
+        observedVersion =
+          typeof this.store.readVersioned === "function" &&
+          isContentVersion(writtenVersion)
+            ? writtenVersion
+            : undefined;
       } catch {
         throw workflowServiceError(
           "WORKFLOW_STATE_WRITE_FAILED",
@@ -594,6 +726,7 @@ export class WorkflowRoutingService {
       }
       durable = normalized;
     }
+    this.durableContentVersion = observedVersion;
     return durable;
   }
 

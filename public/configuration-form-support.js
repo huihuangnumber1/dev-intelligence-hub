@@ -15,6 +15,7 @@ const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SAFE_GITHUB_LOGIN =
   /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const SAFE_PROFILE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ID_INSENSITIVE = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/i;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_WORKSPACE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -269,6 +270,8 @@ const LEGACY_BRAIN_FIELDS = [
   "numCtx",
   "contextTokens",
   "maxAssessmentsPerRefresh",
+  "primaryBrain",
+  "allowRemoteDingTalkSummary",
 ];
 const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
 const CLI_PROVIDER_FORBIDDEN_FIELDS = [
@@ -279,24 +282,30 @@ const CLI_PROVIDER_FORBIDDEN_FIELDS = [
   "contextTokens",
 ];
 function assertLegacyBrain(value, path, { partial = false } = {}) {
+  const globalBrain = path === "configuration.brain";
   assertFields(
     value,
     path,
-    LEGACY_BRAIN_FIELDS,
+    globalBrain ? LEGACY_BRAIN_FIELDS : LEGACY_BRAIN_FIELDS.filter((name) => !["primaryBrain", "allowRemoteDingTalkSummary"].includes(name)),
     partial ? [] : ["enabled", "provider", "model", "baseUrl"],
   );
+  if (globalBrain) {
+    if (Object.hasOwn(value, "allowRemoteDingTalkSummary") && typeof value.allowRemoteDingTalkSummary !== "boolean") throw new TypeError(`${path}.allowRemoteDingTalkSummary must be boolean`);
+    if (value.primaryBrain) assertAssignedBrain(value.primaryBrain, `${path}.primaryBrain`, { allowDingTalk: true });
+  }
 }
 
-function assertAssignedBrain(value, path) {
+function assertAssignedBrain(value, path, { allowDingTalk = false } = {}) {
   assertFields(value, path, ["provider", "model", "reasoningEffort", "remoteData"], [
     "provider",
     "model",
     "remoteData",
   ]);
+  const remoteFields = allowDingTalk ? ["requirements", "code", "memory", "dingtalk"] : ["requirements", "code", "memory"];
   assertFields(
     value.remoteData,
     `${path}.remoteData`,
-    ["requirements", "code", "memory"],
+    remoteFields,
     ["requirements", "code", "memory"],
   );
 }
@@ -310,6 +319,7 @@ function assertProvider(value, path) {
       "baseUrl",
       "apiKeyEnv",
       "credentialMode",
+      "maxConcurrentTurns",
       "protocol",
       "responseFormat",
       "timeoutMs",
@@ -353,7 +363,7 @@ function assertProvider(value, path) {
   const isCli = CLI_PROVIDER_KINDS.has(value.kind);
   const credentialMode = value.credentialMode ?? "api-key";
   const invalidCredentialMode =
-    !["api-key", "codex-login"].includes(credentialMode) ||
+    !["api-key", "codex-login", "codex-native-login"].includes(credentialMode) ||
     (value.kind === "claude-cli" && credentialMode !== "api-key") ||
     (!isCli && Object.hasOwn(value, "credentialMode"));
   if (invalidCredentialMode) {
@@ -362,6 +372,10 @@ function assertProvider(value, path) {
       `${path}.credentialMode is unavailable for this provider`,
       `${path}.credentialMode`,
     );
+  }
+  if (Object.hasOwn(value, "maxConcurrentTurns") &&
+      (value.kind !== "codex-cli" || credentialMode !== "codex-native-login")) {
+    throw formError("UNSUPPORTED_CONFIGURATION_SCHEMA", "并发容量仅用于原生 Codex 登录", `${path}.maxConcurrentTurns`);
   }
   if (isCli) return;
   const required = ["baseUrl"];
@@ -430,6 +444,7 @@ function assertEmployees(value, path) {
       "jobLimit",
       "allowRemoteCodeContext",
       "brain",
+      "primaryBrain",
     ],
     [
       "enabled",
@@ -450,6 +465,7 @@ function assertEmployees(value, path) {
   );
   requireArray(value.prReviewer.retryMinutes, `${reviewerPath}.retryMinutes`);
   assertLegacyBrain(value.prReviewer.brain, `${reviewerPath}.brain`, { partial: true });
+  if (value.prReviewer.primaryBrain) assertAssignedBrain(value.prReviewer.primaryBrain, `${reviewerPath}.primaryBrain`);
   assertNamedMap(value.roles, `${path}.roles`, assertRole);
 }
 
@@ -521,25 +537,38 @@ function assertCodeExecutor(value, path) {
   if (value.profiles) {
     assertNamedMap(value.profiles, `${path}.profiles`, (profile, profilePath) => {
       const isScript = profile.kind === "node-script";
+      const isWindows = ["windows-test", "windows-build"].includes(profile.kind);
+      const fields = ["kind", "timeoutMs", ...(isWindows ? ["nodeExecutable", "nodeSha256"] : ["image"]), ...(isScript || isWindows ? ["asset"] : [])];
       assertFields(
         profile,
         profilePath,
-        ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
-        ["kind", "image", "timeoutMs", ...(isScript ? ["asset"] : [])],
+        [...fields, ...(isWindows ? ["resources"] : [])],
+        fields,
       );
-      if (!["node-test", "node-script"].includes(profile.kind)) {
+      if (!["node-test", "node-script", "windows-test", "windows-build"].includes(profile.kind)) {
         throw formError(
           "UNSUPPORTED_CONFIGURATION_SCHEMA",
           `unsupported execution profile kind ${profile.kind}`,
           `${profilePath}.kind`,
         );
       }
-      if (isScript) {
+      if (isScript || isWindows) {
         assertFields(
           profile.asset,
           `${profilePath}.asset`,
           ["schemaVersion", "title", "description", "version", "source"],
           ["schemaVersion", "title", "description", "version", "source"],
+        );
+      }
+      if (isWindows && Object.hasOwn(profile, "resources")) {
+        requireArray(profile.resources, `${profilePath}.resources`);
+        profile.resources.forEach((resource, index) =>
+          assertFields(
+            resource,
+            `${profilePath}.resources[${index}]`,
+            ["name", "sourcePath", "sha256", "kind"],
+            ["name", "sourcePath", "sha256", "kind"],
+          ),
         );
       }
     });
@@ -809,7 +838,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.githubActions,
     "configuration.githubActions",
-    ["enabled", "credentialMode", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions"],
+    ["enabled", "credentialMode", "actorAccountId", "tokenEnv", "ghCommand", "networkEnv", "timeoutMs", "enabledActions", "automaticReview", "assignAfterAutomaticReview", "automaticOwnPrRepair"],
     ["enabled"],
   );
   if (Object.hasOwn(value.githubActions, "enabledActions")) {
@@ -837,7 +866,7 @@ function assertSupportedConfigurationShape(value) {
   assertFields(
     value.dingtalk,
     "configuration.dingtalk",
-    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
+    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun", "mailEnabled"],
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
   );
 }
@@ -951,6 +980,14 @@ function validAbsoluteLocalPath(value) {
   );
 }
 
+function validWindowsAbsolutePath(value) {
+  return (
+    /^[A-Za-z]:[\\/]/u.test(value) &&
+    !value.slice(2).includes(":") &&
+    !/["\p{Cc}]/u.test(value)
+  );
+}
+
 function validControlledGitRepository(value) {
   const match = value.match(CONTROLLED_GIT_REPOSITORY);
   if (!match) return false;
@@ -986,6 +1023,9 @@ function validFieldFormat(value, format) {
     repository: (entry) => SAFE_REPOSITORY.test(entry),
     "controlled-git-repository": validControlledGitRepository,
     "safe-id": (entry) => SAFE_ID.test(entry),
+    "profile-id": (entry) => SAFE_PROFILE_ID.test(entry),
+    "resource-name": (entry) => SAFE_PROFILE_ID.test(entry),
+    sha256: (entry) => /^[a-f0-9]{64}$/u.test(entry),
     "safe-id-insensitive": (entry) => SAFE_ID_INSENSITIVE.test(entry),
     "role-id": (entry) => SAFE_ROLE_ID.test(entry),
     "workspace-id": (entry) => SAFE_WORKSPACE_ID.test(entry),
@@ -995,6 +1035,7 @@ function validFieldFormat(value, format) {
     "condition-path": validConditionPath,
     "workspace-path": validWorkspacePath,
     "absolute-local-path": validAbsoluteLocalPath,
+    "windows-absolute-path": validWindowsAbsolutePath,
   };
   return validators[format]?.(value) ?? false;
 }
@@ -1077,6 +1118,7 @@ function editableScalarIssues(configuration) {
 
 function collectionEntryIdentity(entry, strategy) {
   if (strategy === "id") return entry?.id;
+  if (strategy === "name") return entry?.name;
   if (strategy === "type-id") return `${entry?.type}:${entry?.id}`;
   if (strategy === "typed-value") return `${typeof entry}:${JSON.stringify(entry)}`;
   return `${typeof entry}:${JSON.stringify(entry)}`;
@@ -1162,6 +1204,9 @@ function configurationReferenceIssues(configuration) {
   const profiles = new Set(Object.keys(configuration.codeExecutor.profiles || {}));
   const providerFields = [
     [["brain", "provider"], configuration.brain.provider],
+    ...(configuration.employees.prReviewer.primaryBrain ? [[
+      ["employees", "prReviewer", "primaryBrain", "provider"], configuration.employees.prReviewer.primaryBrain.provider,
+    ]] : []),
     ...Object.entries(configuration.employees.roles).flatMap(([id, role]) => [
       [
         ["employees", "roles", id, "brain", "provider"],
@@ -1283,7 +1328,7 @@ function providerConfigurationIssues(configuration) {
     const hasResponseFormat = Object.hasOwn(provider, "responseFormat");
     const credentialMode = provider.credentialMode ?? "api-key";
     const invalidCredentialMode =
-      !["api-key", "codex-login"].includes(credentialMode) ||
+      !["api-key", "codex-login", "codex-native-login"].includes(credentialMode) ||
       (provider.kind === "claude-cli" && credentialMode !== "api-key") ||
       (!isCli && Object.hasOwn(provider, "credentialMode"));
     if (
@@ -1508,7 +1553,10 @@ function configurationRelationshipIssues(configuration) {
   }
   if (
     configuration.codeExecutor.enabled &&
-    (!configuration.codeExecutor.docker ||
+    ((!configuration.codeExecutor.docker &&
+      Object.values(configuration.codeExecutor.profiles || {}).some(
+        (profile) => !["windows-test", "windows-build"].includes(profile.kind),
+      )) ||
       !configuration.codeExecutor.workspaces?.length ||
       !Object.keys(configuration.codeExecutor.profiles || {}).length ||
       !configuration.codeExecutor.requiredProfilesByWorkspace)
@@ -2376,6 +2424,28 @@ export function setConfigurationFormField(state, input) {
   });
 }
 
+function resourceEditsAfterStructureOperation(edits, operation, document) {
+  if (
+    operation.path.length !== 4 ||
+    operation.path[0] !== "codeExecutor" ||
+    operation.path[1] !== "profiles" ||
+    operation.path[3] !== "resources"
+  ) return edits;
+  const index = operation.index ?? descriptorAtPath(document, operation.path)?.value.length ?? 0;
+  return edits.flatMap((edit) => {
+    if (!pathHasPrefix(edit.path, operation.path)) return [edit];
+    const entryIndex = Number(edit.path[operation.path.length]);
+    if (operation.operation !== "add" && entryIndex === index) return [];
+    const shift = operation.operation === "add" && entryIndex >= index
+      ? 1
+      : operation.operation === "remove" && entryIndex > index ? -1 : 0;
+    if (shift === 0) return [edit];
+    const path = edit.path.slice();
+    path[operation.path.length] = `${entryIndex + shift}`;
+    return [{ ...edit, path }];
+  });
+}
+
 export function applyConfigurationStructureOperation(state, input) {
   const snapshot = normalizeFormState(state);
   if (
@@ -2404,13 +2474,14 @@ export function applyConfigurationStructureOperation(state, input) {
     snapshot.entityOperations.length,
     document,
   );
+  const retainedEdits = resourceEditsAfterStructureOperation(snapshot.edits, operation, document);
   applyStructureOperation(document, operation);
   cloneConfiguration(document);
   const resetsSlot =
     ["remove", "replace"].includes(operation.operation) &&
     !Object.hasOwn(operation, "key") &&
     !Object.hasOwn(operation, "index");
-  const edits = snapshot.edits.filter(
+  const edits = retainedEdits.filter(
     (edit) =>
       !(resetsSlot && pathHasPrefix(edit.path, operation.path)) &&
       (descriptorAtPath(document, edit.path) ||
@@ -2694,6 +2765,9 @@ function providerReferences(configuration, id, references) {
   }
   if (configuration.employees.prReviewer.brain.provider === id) {
     addReference(references, "employees.prReviewer.brain.provider", "employee_brain");
+  }
+  if (configuration.employees.prReviewer.primaryBrain?.provider === id) {
+    addReference(references, "employees.prReviewer.primaryBrain.provider", "employee_primary_brain");
   }
   for (const [roleId, roleValue] of Object.entries(configuration.employees.roles)) {
     if (roleValue.brain.provider === id) {

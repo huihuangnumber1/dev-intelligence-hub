@@ -10,8 +10,93 @@ import {
 } from "../src/services/github-review-proposal-handler.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
 import { ConfirmationQueue, ConfirmationExecutionError } from "../src/services/confirmation-queue.js";
+import { AutomaticReviewPublisher } from "../src/services/automatic-review-publisher.js";
 
 const HEAD_REF_OID = "b".repeat(40);
+
+test("explicit publication reuse bypasses every GitHub publishing path and cannot fall back", async () => {
+  const input = handlerInput();
+  const { contentDigest, ...content } = input.proposal;
+  input.proposal = normalizeBoundWorkProposal({ ...content, payload: { ...content.payload,
+    publicationReuse: { candidateId: "review-publication-candidate-" + "c".repeat(64), materialDigest: "d".repeat(64), coverageDigest: "e".repeat(64) } } });
+  const forbidden = () => assert.fail("reuse must not enter normal confirmation/publication authority");
+  const options = { confirmationProducer: { enqueue: forbidden, get: forbidden, invalidate: forbidden },
+    inputAuthorityVerifier: { verify: forbidden }, actorAccountId: "review-account", automaticReviewPublisher: { publish: forbidden } };
+  const transition = { status: "succeeded", summary: "Existing Review adopted locally", evidence: ["adoption:verified"] };
+  let calls = 0;
+  const handler = new GitHubReviewProposalHandler({ ...options, publicationAdopter: { async handle(value) {
+    calls++; assert.deepEqual(value.proposal, input.proposal); return transition;
+  } } });
+  assert.deepEqual(await handler.handle(input), transition);
+  assert.equal(calls, 1);
+  await assert.rejects(new GitHubReviewProposalHandler(options).handle(input), { code: "REVIEW_PUBLICATION_REUSE_UNAVAILABLE" });
+  const changed = Object.assign(new Error("Coverage changed"), { code: "REVIEW_PUBLICATION_REUSE_COVERAGE_CHANGED" });
+  await assert.rejects(new GitHubReviewProposalHandler({ ...options, publicationAdopter: { async handle() { throw changed; } } }).handle(input), error => error === changed);
+});
+
+test('a lost Review downstream reference recovers the completed receipt after assignment leaves scope', async () => {
+  const clock = () => new Date('2026-10-09T10:00:00.000Z');
+  const store = new MemoryStore(); let writes = 0;
+  const executor = { async execute() { writes++; return { status: 'applied', receipt: {
+    id: 'published-review', url: 'https://github.com/acme/repo/pull/42#pullrequestreview-42', createdAt: clock().toISOString() } }; },
+    async reconcile() { throw new Error('an observed completed Review must not be replayed'); } };
+  const queue = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor });
+  await queue.recover();
+  const publisher = new AutomaticReviewPublisher({ enabled: true, queue, clock, github: { async readIncomingReviewRequest() {
+    return { kind: 'pull_request', state: 'open', isDraft: false, author: 'developer', currentUser: 'review-account',
+      headRefOid: HEAD_REF_OID, incomingReviewFactsAvailable: true, reviewRecipient: 'review-account',
+      reviewReceivedAt: '2026-10-09T09:00:00Z', reviewReceivedVia: 'assignee', reviewReceivedFrom: 'developer', reviewRequestEventId: 'AE_42' };
+  } } });
+  const first = new GitHubReviewProposalHandler({ confirmationProducer: queue, inputAuthorityVerifier: acceptingVerifier(),
+    actorAccountId: 'review-account', clock, automaticReviewPublisher: publisher });
+  assert.equal((await first.handle(handlerInput())).status, 'succeeded');
+  const restarted = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor }); await restarted.recover();
+  const expected = normalizeConfirmationPlan(createGitHubReviewProposalConfirmationPlan(handlerInput().proposal,
+    { actorAccountId: 'review-account', legacyRecovery: true }));
+  const observed = await restarted.get(expected.id);
+  for (const key of ['requestedBy', 'actor', 'target', 'display', 'displayedPayloadDigest', 'approvalBindingDigest']) {
+    assert.deepEqual(observed[key], expected[key], key);
+  }
+  const recovery = new GitHubReviewProposalHandler({ confirmationProducer: restarted, actorAccountId: 'review-account', clock,
+    inputAuthorityVerifier: { async verify() { throw new Error('the automatic assignment already moved to the author'); } } });
+  const result = await recovery.handle(handlerInput({ status: 'waiting_retry', attempt: 2, downstreamRef: null }));
+  assert.equal(result.status, 'succeeded');
+  assert.ok(result.evidence.some(value => value.startsWith('confirmation:')));
+  assert.equal(writes, 1);
+  assert.equal((await restarted.readReviewHandoffs()).length, 1);
+});
+
+test("automatic proposals publish once, persist history and recover their handoff without user confirmation", async () => {
+  const clock = () => new Date("2026-10-09T10:00:00.000Z");
+  const store = new MemoryStore();
+  let writes = 0;
+  const executor = {
+    async execute() { writes++; return { status: "applied", receipt: { id: "42", url: "https://github.com/acme/repo/pull/42#pullrequestreview-42", createdAt: clock().toISOString() } }; },
+    async reconcile() { return { status: "unknown", code: "GITHUB_UNAVAILABLE" }; },
+  };
+  const queue = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor });
+  await queue.recover();
+  const publisher = new AutomaticReviewPublisher({ enabled: true, queue, clock,
+    github: { async readIncomingReviewRequest() { return { kind: "pull_request", state: "open", isDraft: false, author: "developer", currentUser: "review-account", headRefOid: HEAD_REF_OID,
+      incomingReviewFactsAvailable: true, reviewRecipient: "review-account", reviewReceivedAt: "2026-10-09T09:00:00Z", reviewReceivedVia: "assignee", reviewReceivedFrom: "developer", reviewRequestEventId: "AE_42" }; } },
+  });
+  const handler = new GitHubReviewProposalHandler({ confirmationProducer: queue, inputAuthorityVerifier: acceptingVerifier(), actorAccountId: "review-account", clock, automaticReviewPublisher: publisher });
+  const first = await handler.handle(handlerInput());
+  assert.equal(first.status, "succeeded", JSON.stringify(await queue.list({})));
+  assert.equal((await handler.handle(handlerInput())).status, "succeeded");
+  assert.equal(writes, 1);
+  const history = await queue.list({ automatic: true });
+  assert.equal(history.items.length, 1);
+  assert.equal(history.items[0].automaticReview.event, "REQUEST_CHANGES");
+  assert.equal(history.items[0].automaticReview.headRefOid, HEAD_REF_OID);
+  assert.equal(history.items[0].automaticReview.publishedUrl, "https://github.com/acme/repo/pull/42#pullrequestreview-42");
+  const restarted = new ConfirmationQueue({ store, exclusiveLease: new Guard(), clock, executor });
+  await restarted.recover();
+  const pending = await restarted.readReviewHandoffs();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].automaticReview.reviewEvent, "REQUEST_CHANGES");
+  assert.equal(writes, 1);
+});
 
 function inputBindingFor(number, { schemaVersion = 2 } = {}) {
   const binding = {
@@ -124,6 +209,7 @@ class FakeConfirmationProducer {
 
   async get(id) {
     this.getCalls.push(id);
+    if (this.plan === null || this.plan.id !== id) throw Object.assign(new Error("missing"), { code: "CONFIRMATION_NOT_FOUND" });
     return confirmationItem(this.plan, this.status, this.overrides);
   }
 
@@ -234,6 +320,38 @@ test("a self-authored blocking proposal is queued as a COMMENT review", async ()
     producer.enqueueCalls[0].display.actionLabel,
     "确认并以 COMMENT 发布到 GitHub",
   );
+});
+
+test('automatic mode retires an existing own-PR COMMENT confirmation without publishing or replacing it', async () => {
+  const producer = new FakeConfirmationProducer();
+  const options = { pullRequestContextReader: acceptingContextReader('review-account') };
+  const waiting = await handler(producer, options).handle(handlerInput());
+  const publisher = new AutomaticReviewPublisher({ enabled: true, queue: { approve: async () => assert.fail('No self Review') },
+    confirmationInvalidator: producer, github: { readIncomingReviewRequest: async () => ({ kind: 'pull_request',
+      incomingReviewFactsAvailable: true, state: 'open', isDraft: false, author: 'review-account',
+      currentUser: 'review-account', headRefOid: HEAD_REF_OID }) } });
+  const result = await handler(producer, { ...options, automaticReviewPublisher: publisher }).handle(handlerInput({
+    status: 'waiting_confirmation', attempt: 2, downstreamRef: waiting.downstreamRef }));
+  assert.equal(result.status, 'stale');
+  assert.equal(producer.status, 'stale');
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.enqueueCalls.length, 1, 'no replacement confirmation is created');
+});
+
+test("review authority accepts the ledger's optional feedback digest and keeps rejecting invalid contexts", async () => {
+  for (const extra of [{}, { reviewFeedbackDigest: "a".repeat(64) },
+    { reviewFeedbackDigest: null }, { reviewFeedbackDigest: "invalid" },
+    { reviewFeedbackDigest: "a".repeat(64), unexpected: true }]) {
+    const producer = new FakeConfirmationProducer();
+    const valid = Object.keys(extra).length === 0 ||
+      (Object.keys(extra).length === 1 && extra.reviewFeedbackDigest === "a".repeat(64));
+    const result = await handler(producer, { pullRequestContextReader: { async readCurrent(inputBinding) {
+      return { inputBinding, author: "review-account", ...extra };
+    } } }).handle(handlerInput());
+    assert.equal(producer.enqueueCalls.length, valid ? 1 : 0, JSON.stringify(extra));
+    if (valid) assert.equal(producer.enqueueCalls[0].action.reviewEvent, "COMMENT");
+    else assert.equal(result.status, "stale");
+  }
 });
 
 test("missing author context preserves the proposed verdict", async () => {
@@ -432,6 +550,34 @@ test("revoked target authority prevents enqueue and invalidates an existing conf
     producer.invalidateCalls[0][1].reason,
     "authorization_changed",
   );
+});
+
+test("a revoked historical Review assignment withdraws its pending confirmation", async () => {
+  const producer = new FakeConfirmationProducer();
+  const waiting = await handler(producer).handle(handlerInput());
+  const reader = { async readCurrent() { throw Object.assign(new Error("Assign changed"), {
+    code: "OWNER_REVIEW_ASSIGNMENT_REVOKED" }); } };
+  const result = await handler(producer, { pullRequestContextReader: reader }).handle(handlerInput({
+    status: "waiting_confirmation", downstreamRef: waiting.downstreamRef }));
+  assert.equal(result.status, "stale");
+  assert.equal(producer.invalidateCalls.length, 1);
+  assert.equal(producer.status, "stale");
+});
+
+test("unavailable assignment facts defer a Review without withdrawing or reenqueuing it", async () => {
+  const producer = new FakeConfirmationProducer();
+  const waiting = await handler(producer).handle(handlerInput());
+  const unavailable = Object.assign(new Error("GitHub unavailable"), { code: "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE" });
+  for (const override of [
+    { pullRequestContextReader: { async readCurrent() { throw unavailable; } } },
+    { pullRequestContextReader: undefined, inputAuthorityVerifier: { async verify() { throw unavailable; } } },
+  ]) {
+    await assert.rejects(handler(producer, override).handle(handlerInput({
+      status: "waiting_confirmation", downstreamRef: waiting.downstreamRef })), { code: unavailable.code });
+  }
+  assert.equal(producer.status, "pending");
+  assert.equal(producer.invalidateCalls.length, 0);
+  assert.equal(producer.enqueueCalls.length, 1);
 });
 
 test("a completed self-authored Review settles after its source authority becomes stale", async () => {

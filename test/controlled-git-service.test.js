@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fsPromises from "node:fs/promises";
 import {
   access,
   chmod,
@@ -12,9 +13,11 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { withPreparationCancellation } from "../src/lib/preparation-cancellation.js";
 
 import {
   createConflictPreparationBinding,
@@ -104,6 +107,8 @@ async function fixture(t, {
   mutateGitDuringRun = false,
   mergeBaseOutput = Buffer.from(`${MERGE_BASE}\n`),
   mergeBaseExitCode = 0,
+  extraBlobs = [],
+  windowsGitImplementation = "mingw64",
 } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-service-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -112,7 +117,7 @@ async function fixture(t, {
   const headMirrorRoot = path.resolve(root, "head.git");
   const gitCommand = path.resolve(
     root,
-    process.platform === "win32" ? "mingw64/bin/git.exe" : "bin/git",
+    process.platform === "win32" ? `${windowsGitImplementation}/bin/git.exe` : "bin/git",
   );
   for (const directory of [
     preparationRoot,
@@ -166,6 +171,7 @@ async function fixture(t, {
     [THEIRS, THEIRS_CONTENT],
     [README, README_CONTENT],
     [RESULT_CONFLICT, RESULT_CONFLICT_CONTENT],
+    ...extraBlobs,
   ]);
   const processRunner = {
     calls: [],
@@ -174,6 +180,9 @@ async function fixture(t, {
       if (request.args.includes("merge-base")) {
         return processResult(mergeBaseOutput, { exitCode: mergeBaseExitCode });
       }
+      if (request.args.includes("rev-list")) return processResult(`${TREE}\n${README}\n`);
+      if (request.args.includes("pack-objects")) return processResult(Buffer.from("test seed pack"));
+      if (request.args.includes("index-pack")) return processResult(`pack\t${TREE}\n`);
       if (request.args.includes("diff-tree")) {
         return processResult(request.args.includes(HEAD) ? headRaw : baseRaw);
       }
@@ -191,6 +200,13 @@ async function fixture(t, {
       }
       const catFile = request.args.indexOf("cat-file");
       if (catFile !== -1) {
+        if (request.args[catFile + 1] === "--batch") {
+          const oids = Buffer.from(request.input).toString("utf8").trim().split("\n");
+          return processResult(Buffer.concat(oids.map((oid) => {
+            const bytes = Buffer.from(blobs.get(oid));
+            return Buffer.concat([Buffer.from(`${oid} blob ${bytes.length}\n`), bytes, Buffer.from("\n")]);
+          })));
+        }
         return processResult(blobs.get(request.args[catFile + 2]));
       }
       throw new Error(`unexpected Git invocation: ${request.args.join(" ")}`);
@@ -224,6 +240,169 @@ function inspectionRequest(setup) {
     headMirrorRoot: setup.headMirrorRoot,
   };
 }
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
+
+async function sealingFixture(t) {
+  const contents = Array.from({ length: 7 }, (_, index) => Buffer.from(`document ${index}\n`));
+  const paths = contents.map((_, index) => `files/${index}.txt`);
+  const records = contents.map((bytes, index) => `100644 blob ${blobOid(bytes)}\t${paths[index]}\0`);
+  paths.push("files/repeat.txt", "src/value.js");
+  records.push(`100644 blob ${blobOid(contents[0])}\tfiles/repeat.txt\0`,
+    `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`);
+  const setup = await fixture(t, {
+    treeOutput: Buffer.from(records.join("")),
+    extraBlobs: contents.map((bytes) => [blobOid(bytes), bytes]),
+  });
+  return {
+    ...setup,
+    paths,
+    blobNames: new Set([...contents, RESULT_CONFLICT_CONTENT].map((bytes) =>
+      `${createHash("sha256").update(bytes).digest("hex")}.blob`)),
+  };
+}
+
+function observeSealing(t, setup, onSync) {
+  const originalOpen = fsPromises.open;
+  const originalRm = fsPromises.rm;
+  const firstStarted = deferred();
+  const fourSyncsStarted = deferred();
+  const firstClosed = deferred();
+  const state = { started: [], synced: [], closed: [], active: 0, maximumActive: 0, cleanupActive: [] };
+  t.mock.method(fsPromises, "open", async (file, flags, ...args) => {
+    if (flags !== "wx" || !setup.blobNames.has(path.basename(file))) {
+      return originalOpen(file, flags, ...args);
+    }
+    const ordinal = state.started.length;
+    state.started.push(path.basename(file));
+    state.maximumActive = Math.max(state.maximumActive, ++state.active);
+    firstStarted.resolve();
+    const handle = await originalOpen(file, flags, ...args);
+    const originalSync = handle.sync.bind(handle);
+    const originalClose = handle.close.bind(handle);
+    t.mock.method(handle, "sync", async () => {
+      state.synced.push(ordinal);
+      if (state.synced.length === 4) fourSyncsStarted.resolve();
+      await onSync(ordinal);
+      await originalSync();
+    });
+    t.mock.method(handle, "close", async () => {
+      await originalClose();
+      state.active -= 1;
+      state.closed.push(ordinal);
+      if (ordinal === 0) firstClosed.resolve();
+    });
+    return handle;
+  });
+  t.mock.method(fsPromises, "rm", async (file, ...args) => {
+    if (path.dirname(file) === setup.preparationRoot && path.basename(file).startsWith(".controlled-git-scratch-")) {
+      state.cleanupActive.push(state.active);
+    }
+    return originalRm(file, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return { state, firstStarted, fourSyncsStarted, firstClosed };
+}
+
+test("result sealing overlaps four distinct durable writes and preserves duplicate paths", async (t) => {
+  const setup = await sealingFixture(t);
+  const release = deferred();
+  const { state, firstStarted } = observeSealing(t, setup, () => release.promise);
+  const inspection = setup.createService().inspectConflict(inspectionRequest(setup));
+  let firstBatchSize;
+  try {
+    await firstStarted.promise;
+    firstBatchSize = state.started.length;
+  } finally {
+    release.resolve();
+  }
+  const prepared = await inspection;
+  assert.equal(firstBatchSize, 4);
+  assert.equal(state.maximumActive, 4);
+  assert.equal(state.active, 0);
+  assert.deepEqual(new Set(state.started), setup.blobNames);
+  assert.equal(state.started.length, setup.blobNames.size);
+  assert.equal(state.synced.length, state.started.length);
+  assert.equal(state.closed.length, state.started.length);
+  const directory = path.join(setup.preparationRoot, "preparations", prepared.preparationId);
+  const manifest = JSON.parse(await readFile(path.join(directory, "manifest.json"), "utf8"));
+  assert.deepEqual(manifest.treeEntries.map(({ path }) => path), setup.paths);
+  assert.equal(manifest.treeEntries[0].sha256, manifest.treeEntries[7].sha256);
+  assert.equal((await setup.createService().verifyPreparation({ preparationId: prepared.preparationId })).preparationId,
+    prepared.preparationId);
+});
+
+test("failed result sealing closes its entire batch before scratch cleanup", async (t) => {
+  const setup = await sealingFixture(t);
+  const failFirst = deferred();
+  const releaseRest = deferred();
+  const failure = new Error("simulated blob flush failure");
+  const { state, fourSyncsStarted, firstClosed } = observeSealing(t, setup, async (ordinal) => {
+    await (ordinal === 0 ? failFirst.promise : releaseRest.promise);
+    if (ordinal === 0) throw failure;
+  });
+  let settled = false;
+  const inspection = setup.createService().inspectConflict(inspectionRequest(setup));
+  const result = inspection.then(() => { settled = true; return null; }, (error) => { settled = true; return error; });
+  let whileOtherFlushesBlocked;
+  try {
+    await fourSyncsStarted.promise;
+    failFirst.resolve();
+    await firstClosed.promise;
+    await new Promise(setImmediate);
+    whileOtherFlushesBlocked = { settled, active: state.active, cleanupActive: [...state.cleanupActive] };
+  } finally {
+    failFirst.resolve();
+    releaseRest.resolve();
+  }
+  assert.equal((await result).cause, failure);
+  assert.deepEqual(whileOtherFlushesBlocked, { settled: false, active: 3, cleanupActive: [] });
+  assert.equal(state.started.length, 4);
+  assert.equal(state.active, 0);
+  assert.equal(state.closed.length, 4);
+  assert.deepEqual(state.cleanupActive, [0]);
+  assert.deepEqual(await readdir(setup.preparationRoot), []);
+});
+
+test("result sealing drains cancellation before starting another batch", async (t) => {
+  const setup = await sealingFixture(t);
+  const release = deferred();
+  const controller = new AbortController();
+  const { state, fourSyncsStarted } = observeSealing(t, setup, () => release.promise);
+  const inspection = withPreparationCancellation(controller.signal, () =>
+    setup.createService().inspectConflict(inspectionRequest(setup)));
+  const result = inspection.then(() => null, (error) => error);
+  let activeWhenCancelled;
+  try {
+    await fourSyncsStarted.promise;
+    controller.abort();
+    activeWhenCancelled = state.active;
+  } finally {
+    release.resolve();
+  }
+  const error = await result;
+  assert.equal(activeWhenCancelled, 4);
+  assert.equal(error.code, "CONTROLLED_GIT_INSPECTION_FAILED");
+  assert.equal(error.cause.code, "CODE_PREPARATION_ABORTED");
+  assert.equal(state.started.length, 4);
+  assert.equal(state.closed.length, 4);
+  assert.equal(state.active, 0);
+  assert.deepEqual(state.cleanupActive, [0]);
+  assert.deepEqual(await readdir(setup.preparationRoot), []);
+});
+
+test("controlled conflict inspection accepts a pinned UCRT64 Git executable", async (t) => {
+  if (process.platform !== "win32") return;
+  const setup = await fixture(t, { windowsGitImplementation: "ucrt64" });
+  const result = await setup.createService().inspectConflict(inspectionRequest(setup));
+  assert.equal(result.status, "conflicted");
+  assert.equal(result.resultTreeOid, TREE);
+});
 
 test("seals a both-modified conflict behind fixed Git commands and a content manifest", async (t) => {
   const setup = await fixture(t);
@@ -260,8 +439,14 @@ test("seals a both-modified conflict behind fixed Git commands and a content man
     assert.equal(call.env.GIT_TERMINAL_PROMPT, "0");
     assert.equal(call.env.GIT_NO_LAZY_FETCH, "1");
     assert.ok(call.env.GIT_OBJECT_DIRECTORY.startsWith(setup.preparationRoot));
-    assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.baseMirrorRoot, "objects")));
-    assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.headMirrorRoot, "objects")));
+    if (call.args.includes("merge-tree")) {
+      assert.equal(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES, path.join(call.cwd, "merge-seed-objects"));
+    } else if (call.args.includes("index-pack")) {
+      assert.equal(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES, "");
+    } else {
+      assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.baseMirrorRoot, "objects")));
+      assert.ok(call.env.GIT_ALTERNATE_OBJECT_DIRECTORIES.includes(path.join(setup.headMirrorRoot, "objects")));
+    }
     assert.equal(call.cwd.startsWith(setup.preparationRoot), true);
   }
   assert.equal(setup.mirrorInspector.calls.length, 8);
@@ -275,6 +460,24 @@ test("seals a both-modified conflict behind fixed Git commands and a content man
     mirrorRoot: setup.headMirrorRoot,
     expectedCommitOid: HEAD,
   });
+});
+
+test("Git byte ordering is distinct from canonical manifest ordering and filesystem aliases", async (t) => {
+  const records = ["README.md", "Z-notes.txt", "_notes.txt", "a-notes.txt"].map(name =>
+    `100644 blob ${README}\t${name}\0`);
+  const setup = await fixture(t, { treeOutput: Buffer.from(records.join("") + `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`) });
+  const prepared = await setup.createService().inspectConflict(inspectionRequest(setup));
+  assert.equal((await setup.createService().verifyPreparation({ preparationId: prepared.preparationId })).preparationId, prepared.preparationId);
+  for (const names of [
+    ["Z-notes.txt", "README.md", "src/value.js"],
+    ["A", "A/child.txt", "src/value.js"],
+    ...(process.platform === "win32" ? [["A/first.txt", "Z.txt", "a/second.txt", "src/value.js"]] : []),
+  ]) {
+    const unsafe = await fixture(t, { treeOutput: Buffer.from(names.map(name =>
+      `100644 blob ${name === "src/value.js" ? RESULT_CONFLICT : README}\t${name}\0`).join("")) });
+    await assert.rejects(unsafe.createService().inspectConflict(inspectionRequest(unsafe)),
+      error => error.code === "CONTROLLED_GIT_UNSUPPORTED_TREE");
+  }
 });
 
 test("rejects widened/accessor/proxy requests and unsafe merge protocols", async (t) => {
@@ -319,7 +522,7 @@ test("rejects widened/accessor/proxy requests and unsafe merge protocols", async
   );
 });
 
-test("verification survives restart and detects manifest or mirror-boundary tampering", async (t) => {
+test("verification survives mirror object updates and detects manifest or boundary tampering", async (t) => {
   const setup = await fixture(t);
   const prepared = await setup.createService().inspectConflict(inspectionRequest(setup));
   const restarted = setup.createService();
@@ -330,11 +533,18 @@ test("verification survives restart and detects manifest or mirror-boundary tamp
   assert.equal(verified.preparationId, prepared.preparationId);
 
   setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "6".repeat(64);
+  assert.equal(
+    (await restarted.verifyPreparation({ preparationId: prepared.preparationId })).preparationId,
+    prepared.preparationId,
+  );
+  const baseBoundary = setup.boundaries.get(setup.baseMirrorRoot);
+  const originalObjectDirectory = baseBoundary.objectDirectory;
+  baseBoundary.objectDirectory = path.join(setup.baseMirrorRoot, "other-objects");
   await assert.rejects(
     restarted.verifyPreparation({ preparationId: prepared.preparationId }),
     (error) => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
   );
-  setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "4".repeat(64);
+  baseBoundary.objectDirectory = originalObjectDirectory;
 
   const manifestPath = path.join(
     setup.preparationRoot,
@@ -349,6 +559,36 @@ test("verification survives restart and detects manifest or mirror-boundary tamp
     restarted.verifyPreparation({ preparationId: prepared.preparationId }),
     (error) => error?.code === "CONTROLLED_GIT_PREPARATION_TAMPERED",
   );
+});
+
+test("preparation rejects mirror mutations during inspection", async (t) => {
+  const setup = await fixture(t);
+  const preflight = setup.mirrorInspector.preflight.bind(setup.mirrorInspector);
+  let calls = 0;
+  setup.mirrorInspector.preflight = async request => {
+    if (++calls === 3) setup.boundaries.get(setup.baseMirrorRoot).boundaryDigest = "6".repeat(64);
+    return preflight(request);
+  };
+  await assert.rejects(
+    setup.createService().inspectConflict(inspectionRequest(setup)),
+    error => error?.code === "CONTROLLED_GIT_BOUNDARY_CHANGED",
+  );
+});
+
+test("sealed conflict verification responds to preparation cancellation before writing output", async t => {
+  const setup = await fixture(t), service = setup.createService();
+  const preparation = await service.inspectConflict(inspectionRequest(setup));
+  const binding = createConflictPreparationBinding({ preparation, gitTarget: gitTarget() });
+  const controller = new AbortController(), preflight = setup.mirrorInspector.preflight.bind(setup.mirrorInspector);
+  setup.mirrorInspector.preflight = async request => { const result = await preflight(request); controller.abort(); return result; };
+  const cancelled = setup.createService();
+  const targetRoot = path.join(setup.root, "cancelled-target"); await mkdir(targetRoot);
+  await assert.rejects(withPreparationCancellation(controller.signal, () => cancelled.materializeConflictPreparationForCodeJob({ binding, targetRoot, excludePaths: [] })),
+    { code: "CODE_PREPARATION_ABORTED" });
+  assert.deepEqual(await readdir(targetRoot), []);
+  setup.mirrorInspector.preflight = preflight;
+  const receipt = await service.materializeConflictPreparationForCodeJob({ binding, targetRoot, excludePaths: [] });
+  assert.equal(receipt.fileCount, 2);
 });
 
 test("verifies and materializes only the complete sealed conflict binding", async (t) => {
@@ -529,6 +769,31 @@ test("materializes fixed-label conflict evidence into a new empty code-job targe
     }),
     (error) => error?.code === "CONTROLLED_GIT_TARGET_UNAVAILABLE",
   );
+});
+
+test("materializes nested parent batches with complete ordered file evidence", async (t) => {
+  const paths = Array.from({ length: 32 }, (_, index) =>
+    `files/group${String(index).padStart(2, "0")}/nested/deeper/value.txt`,
+  );
+  const setup = await fixture(t, {
+    treeOutput: Buffer.from(
+      paths.map((name) => `100644 blob ${README}\t${name}\0`).join("") +
+      `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`,
+    ),
+  });
+  const service = setup.createService();
+  const prepared = await service.inspectConflict(inspectionRequest(setup));
+  const targetRoot = path.join(setup.root, "nested-target");
+  await mkdir(targetRoot);
+  const receipt = await service.materializeForCodeJob({
+    preparationId: prepared.preparationId,
+    targetRoot,
+  });
+  assert.deepEqual(receipt.files.map((entry) => entry.path), [...paths, "src/value.js"]);
+  for (const name of paths) {
+    assert.equal(await readFile(path.join(targetRoot, name), "utf8"), "# Example\n");
+  }
+  assert.deepEqual((await readdir(targetRoot)).sort(), ["files", "src"]);
 });
 
 test("never reports materialization success after a target-root swap or junction replacement", async (t) => {
@@ -718,7 +983,7 @@ test("enforces the evidence-directory limit before descending into overflow topo
   );
 });
 
-test("rejects result-tree paths excluded by the Code Job execution policy", async (t) => {
+test("preserves excluded result-tree paths without exposing them to the Code Job", async (t) => {
   for (const excludedPath of [
     ".env.production",
     "config.local.json",
@@ -737,18 +1002,36 @@ test("rejects result-tree paths excluded by the Code Job execution policy", asyn
             `100644 blob ${RESULT_CONFLICT}\tsrc/value.js\0`,
         ),
       });
-      await assert.rejects(
-        setup.createService().inspectConflict(inspectionRequest(setup)),
-        (error) => error?.code === "CONTROLLED_GIT_UNSUPPORTED_TREE",
-      );
+      const service = setup.createService();
+      const prepared = await service.inspectConflict(inspectionRequest(setup));
+      const targetRoot = path.join(setup.root, "workspace");
+      await mkdir(targetRoot);
+      const receipt = await service.materializeForCodeJob({ preparationId: prepared.preparationId, targetRoot });
+      assert.equal(receipt.files.some(entry => entry.path === excludedPath), false);
+      await assert.rejects(access(path.join(targetRoot, excludedPath)), { code: "ENOENT" });
+      assert.match(await readFile(path.join(targetRoot, "src/value.js"), "utf8"), /<<<<<<< /);
     });
   }
+});
+
+test("excluded paths cannot become editable conflict documents", async t => {
+  const excludedPath = "data/value.js";
+  const setup = await fixture(t, {
+    mergeOutput: conflictProtocol({ pathName: excludedPath }),
+    headRaw: rawModification(ANCESTOR, OURS, excludedPath),
+    baseRaw: rawModification(ANCESTOR, THEIRS, excludedPath),
+    headNumstat: Buffer.from(`1\t1\t${excludedPath}\0`),
+    baseNumstat: Buffer.from(`1\t1\t${excludedPath}\0`),
+    treeOutput: Buffer.from(`100644 blob ${RESULT_CONFLICT}\t${excludedPath}\0`),
+  });
+  await assert.rejects(setup.createService().inspectConflict(inspectionRequest(setup)),
+    error => error.code === "CONTROLLED_GIT_UNSUPPORTED_CONFLICT");
 });
 
 test("rejects non-modification, mode, binary, and unsafe result-tree entries", async (t) => {
   const rename = await fixture(t, {
     headRaw: Buffer.from(
-      `:100644 100644 ${ANCESTOR} ${OURS} R100\0old.js\0new.js\0`,
+      `:100644 100644 ${ANCESTOR} ${OURS} R100\0src/value.js\0new.js\0`,
     ),
   });
   await assert.rejects(

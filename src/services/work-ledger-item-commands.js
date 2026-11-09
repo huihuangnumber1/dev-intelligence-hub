@@ -16,6 +16,7 @@ import {
   boundedLedgerString,
   workLedgerError,
 } from "./work-ledger-values.js";
+import { isParentCoordinationReturn } from './work-ledger-graph-responsibility.js';
 import {
   assertWorkLedgerGraphClaimable,
   assertWorkLedgerGraphCompletable,
@@ -25,6 +26,7 @@ import {
   LEGACY_PR_SOURCE_CUTOVER_REASON,
   LEGACY_PR_SOURCE_QUARANTINE_KIND,
   pullRequestHeadAdmission,
+  sealLegacyPullRequestDecisionBudget,
 } from "./work-ledger-pr-source.js";
 
 const MIN_LEASE_MS = 1_000;
@@ -134,11 +136,15 @@ export function planWorkItemClaim({ state, input, clock, newLeaseId }) {
       409,
     );
   }
+  if (isParentCoordinationReturn(item)) {
+    throw workLedgerError('WORK_LEDGER_GRAPH_BLOCKED', '专职子任务已交回父任务编排，当前不可独立领取', 409);
+  }
   assertWorkLedgerGraphClaimable(state, itemId);
   const leaseId = newLeaseId();
   const leaseUntil = new Date(Date.parse(now) + duration).toISOString();
   const itemResult = {
     ...item,
+    source: sealLegacyPullRequestDecisionBudget(item, state.timeline),
     status: "working",
     revision: item.revision + 1,
     ownerId,

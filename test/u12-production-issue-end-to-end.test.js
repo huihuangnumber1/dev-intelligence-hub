@@ -114,7 +114,7 @@ class FastSandbox {
     return {
       exitCode: 0,
       signal: null,
-      stdout: "1 trusted profile passed",
+      stdout: "TAP version 13\nok 1 - trusted profile\n1..1\n# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0",
       stderr: "",
       durationMs: 1,
       imageId: `sha256:${"a".repeat(64)}`,
@@ -1167,11 +1167,24 @@ test("a production-composed Issue survives confirmation restart and closes on re
     true,
   );
   assert.equal(
-    archivedDetails.every(({ historyAvailable, observations, terminalDetail }) =>
-      historyAvailable === false && observations.length === 0 && terminalDetail === null
+    archivedDetails.every(({ historyAvailable, observations }) =>
+      historyAvailable === false && observations.length === 0
     ),
     true,
   );
+  assert.ok(finalCodeJobDetails.some(({ terminalDetail }) => terminalDetail?.completionReport));
+  for (const { job, terminalDetail } of archivedDetails) {
+    const original = finalCodeJobDetails.find(({ job: before }) => before.jobId === job.jobId);
+    const report = original.terminalDetail?.completionReport;
+    assert.deepEqual(terminalDetail, report ? {
+      schemaVersion: 1,
+      outcome: original.terminalDetail.outcome,
+      completedActionId: original.terminalDetail.completedActionId,
+      workspaceRevision: original.terminalDetail.workspaceRevision,
+      evidence: original.terminalDetail.evidence,
+      completionReport: report,
+    } : null);
+  }
   const archivedDeveloper = archivedDetails.find(
     ({ job }) => job.jobId === developerJobId,
   );

@@ -7,6 +7,7 @@ import {
   linkSync,
   mkdirSync,
   openSync,
+  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -175,15 +176,36 @@ function writeDurableResult(value) {
   }
 }
 
+function openNativeStderrLog() {
+  try {
+    const directory = path.join(runtimeDirectory, "logs");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    assertDirectoryIsNotLink(directory);
+    const previous = readdirSync(directory, { withFileTypes: true })
+      .filter(entry => entry.isFile() && /^node-stderr-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\.log$/u.test(entry.name))
+      .map(entry => ({ file: path.join(directory, entry.name), modified: statSync(path.join(directory, entry.name)).mtimeMs }))
+      .sort((left, right) => right.modified - left.modified);
+    // Keep seven previous instances plus this one. An active file is direct
+    // stderr output, not a stream with a hard byte limit.
+    for (const entry of previous.slice(7)) rmSync(entry.file);
+    return openSync(path.join(directory, `node-stderr-${instanceId}.log`), "wx", 0o600);
+  } catch {
+    // Diagnostics must not stop an otherwise valid service from starting.
+    return undefined;
+  }
+}
+
 let child;
 let resultPublished = false;
+let stderrDescriptor;
 try {
+  stderrDescriptor = openNativeStderrLog();
   child = spawn(process.execPath, [managedEntryScript], {
     cwd: projectDirectory,
     detached: true,
     env: childEnvironment,
     shell: false,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", stderrDescriptor ?? "ignore"],
     windowsHide: true,
   });
   await new Promise((resolve, reject) => {
@@ -219,6 +241,9 @@ try {
   }
   throw error;
 } finally {
+  if (stderrDescriptor !== undefined) {
+    try { closeSync(stderrDescriptor); } catch { /* Child owns its inherited descriptor. */ }
+  }
   if (!resultPublished) {
     rmSync(temporaryResultPath, { force: true });
   }

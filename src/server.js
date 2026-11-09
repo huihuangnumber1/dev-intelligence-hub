@@ -1,3 +1,5 @@
+import { createLanTaskBoard } from "./services/lan-task-board.js";
+import { readLanDashboard } from "./services/lan-dashboard-read.js";
 import {
   createHash,
   createHmac,
@@ -21,6 +23,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import http from "node:http";
+import { TargetedCycleQueue } from "./lib/targeted-cycle-queue.js";
+import { CONTINUATION_ROLES, normalizeContinuationTarget } from "./services/work-continuation-state.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -31,6 +35,7 @@ import {
   normalizeUnifiedDeferredOptions,
 } from "./domain/attention-deferred-contract.js";
 import { canonicalJsonDigest } from "./lib/canonical-json-digest.js";
+import { ActionAdmissionGateError } from "./lib/action-admission-gate.js";
 import { createApplicationWriterLease } from "./lib/application-writer-lease.js";
 import { projectRoot } from "./lib/config.js";
 import {
@@ -61,6 +66,9 @@ export const DRAIN_PARTICIPANTS = Object.freeze({
     "prReviewer.recoverConfirmations",
   ),
   workCoordinationCycle: drainParticipant("workCoordination.runCycle"),
+  workContinuation: drainParticipant("workContinuationScheduler.runCycle"),
+  localCodeProposalRecovery: drainParticipant("localCodeProposalRecovery.runCycle"),
+  codeJobExecution: drainParticipant("codeJobExecution.runCycle"),
   reviewHandoffRecovery: drainParticipant("reviewHandoffReconciler.runCycle"),
   employeeExecution: drainParticipant(
     "employeeRegistry.runSelected/runAll/run",
@@ -299,7 +307,9 @@ export function createManagedFileDiagnostics(
   }
   mkdirSync(logDirectory, { recursive: true, mode: 0o700 });
   const logPath = path.join(logDirectory, "server.log");
-  function write(level, value) {
+  let droppedRecords = 0;
+  let lastErrorCode = null;
+  function writeRecord(level, value) {
     const record = boundedLogRecord(level, value);
     const recordBytes = Buffer.byteLength(record, "utf8");
     const currentBytes = existsSync(logPath) ? statSync(logPath).size : 0;
@@ -314,12 +324,30 @@ export function createManagedFileDiagnostics(
     }
     appendFileSync(logPath, record, { encoding: "utf8", mode: 0o600 });
   }
+  function write(level, value) {
+    try {
+      const message = droppedRecords === 0 ? value :
+        `Managed diagnostics recovered after ${droppedRecords} dropped record(s) (${lastErrorCode}).\n${
+          value instanceof Error ? value.stack || `${value.name}: ${value.message}` : String(value)
+        }`;
+      writeRecord(level, message);
+      droppedRecords = 0;
+      lastErrorCode = null;
+    } catch (error) {
+      // Diagnostics are observational. A full or unavailable log disk must not
+      // turn a handled worker failure into an unhandled process failure.
+      droppedRecords = Math.min(Number.MAX_SAFE_INTEGER, droppedRecords + 1);
+      lastErrorCode = typeof error?.code === "string" && /^[A-Z0-9_]{1,64}$/.test(error.code)
+        ? error.code : "LOG_WRITE_FAILED";
+    }
+  }
   return Object.freeze({
     log: (value) => write("INFO", value),
     reportError: (value) => write("ERROR", value),
     logPath,
     maximumBytes,
     archiveCount,
+    get writeStatus() { return Object.freeze({ droppedRecords, lastErrorCode }); },
   });
 }
 
@@ -818,7 +846,7 @@ function requireOwnerWorkRequests(application) {
 }
 
 function ownerWorkRequestQueryOptions(url) {
-  const allowed = new Set(["limit", "cursor"]);
+  const allowed = new Set(["limit", "cursor", "sourceUrl"]);
   const keys = [...url.searchParams.keys()];
   if (
     keys.some(
@@ -834,6 +862,9 @@ function ownerWorkRequestQueryOptions(url) {
       : {}),
     ...(url.searchParams.has("cursor")
       ? { cursor: url.searchParams.get("cursor") }
+      : {}),
+    ...(url.searchParams.has("sourceUrl")
+      ? { sourceUrl: url.searchParams.get("sourceUrl") }
       : {}),
   };
 }
@@ -999,10 +1030,25 @@ function requireMemorySearch(application) {
   return search;
 }
 
+const memoryHealthProbes = new WeakMap();
+
 async function readMemoryHealth(application) {
   if (!application.memorySearch) return null;
+  let probe = memoryHealthProbes.get(application);
+  if (!probe) {
+    const authorityCheck = Promise.resolve().then(() => requireMemorySearch(application).getHealth());
+    let timeout;
+    probe = Promise.race([authorityCheck, new Promise(resolve => {
+      timeout = setTimeout(() => resolve(Object.freeze({
+        ready: false, authorityCurrent: false, checking: true,
+      })), 250);
+    })]).finally(() => clearTimeout(timeout));
+    const release = () => memoryHealthProbes.delete(application);
+    authorityCheck.then(release, release);
+    memoryHealthProbes.set(application, probe);
+  }
   try {
-    return await requireMemorySearch(application).getHealth();
+    return await probe;
   } catch (error) {
     if (
       error?.code === "MEMORY_AUTHORITY_NOT_CURRENT" &&
@@ -1061,7 +1107,7 @@ function memoryQueryOptions(url) {
 }
 
 function confirmationHistoryQueryOptions(url) {
-  const allowed = new Set(["status", "kind", "roleId", "limit", "cursor"]);
+  const allowed = new Set(["status", "kind", "roleId", "limit", "cursor", "automatic"]);
   const keys = [...url.searchParams.keys()];
   if (
     keys.some(
@@ -1073,6 +1119,10 @@ function confirmationHistoryQueryOptions(url) {
   }
 
   const options = {};
+  if (url.searchParams.has("automatic")) {
+    if (url.searchParams.get("automatic") !== "true") throw httpError(400, "自动 Review 筛选无效");
+    options.automatic = true;
+  }
   if (url.searchParams.has("status")) {
     const status = url.searchParams.get("status");
     if (!confirmationHistoryStatuses.has(status)) {
@@ -1120,6 +1170,7 @@ function confirmationHistoryQueryOptions(url) {
 
 function confirmationHistoryFilters(options) {
   return {
+    ...(options.automatic ? { automatic: true } : {}),
     ...(options.status ? { status: options.status } : {}),
     ...(options.kind ? { kind: options.kind } : {}),
     ...(options.roleId ? { roleId: options.roleId } : {}),
@@ -1175,6 +1226,9 @@ async function readUnifiedAttention(application, options) {
         ? external.queueRevision
         : 0,
       item: external.item || null,
+      ...(external.automaticReviewEnabled === true ? {
+        automaticReviewEnabled: true, systemManagedCount: external.systemManagedCount,
+      } : {}),
     };
   }
   return {
@@ -1290,6 +1344,7 @@ function brainProviderStatusProjection(value) {
     "fileLoginAvailable",
   ];
   const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.hasOwn(descriptors, "credentialMode")) fields.push("credentialMode");
   if (
     Reflect.ownKeys(descriptors).length !== fields.length ||
     fields.some(
@@ -1306,6 +1361,7 @@ function brainProviderStatusProjection(value) {
   const capabilities = brainProviderStatusCapabilities.get(status.state);
   if (
     status.schemaVersion !== 1 ||
+    (Object.hasOwn(status, "credentialMode") && status.credentialMode !== "codex-native-login") ||
     !capabilities ||
     status.cliAvailable !== capabilities.cliAvailable ||
     status.fileLoginAvailable !== capabilities.fileLoginAvailable
@@ -1343,6 +1399,45 @@ function requireOperationsBrowser(application, methods) {
     throw httpError(503, "系统运维端口未启用");
   }
   return browser;
+}
+
+const BACKUP_DIAGNOSTIC_CODES = new Set([
+  "BACKUP_CORRUPTED", "BACKUP_IO_FAILED", "BACKUP_QUIESCENCE_FAILED",
+  "BACKUP_QUIESCENCE_INVALID", "BACKUP_RELEASE_FAILED", "BACKUP_SOURCE_CHANGED",
+  "BACKUP_SOURCE_INVALID", "BACKUP_STORAGE_INVALID", "INVALID_BACKUP_MANIFEST",
+  "CHECKPOINT_CAPACITY_EXCEEDED", "CHECKPOINT_EMPTY", "CHECKPOINT_FILE_INVALID",
+  "CHECKPOINT_PATH_INVALID", "CHECKPOINT_ROOT_INVALID", "CHECKPOINT_SOURCE_CHANGED",
+  "CHECKPOINT_STORE_INVALID", "QUIESCENCE_ALREADY_ACTIVE", "QUIESCENCE_DRAIN_TIMEOUT",
+  "QUIESCENCE_TOKEN_INVALID",
+]);
+
+function reportBackupFailure(reportError, error) {
+  const diagnostic = {
+    code: BACKUP_DIAGNOSTIC_CODES.has(error?.code) ? error.code : "BACKUP_CREATE_FAILED",
+    stage: "create_backup",
+  };
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1, current = current.cause) {
+    if (depth > 0 && BACKUP_DIAGNOSTIC_CODES.has(current.code)) {
+      diagnostic.causeCode = current.code;
+    }
+    if (["metadata_preflight", "checkpoint_inventory", "checkpoint_release"].includes(current.stage)) {
+      diagnostic.stage = current.stage;
+    }
+    const counts = {};
+    for (const key of ["fileCount", "directoryCount", "totalBytes"]) {
+      const value = current.counts?.[key];
+      if (Number.isSafeInteger(value) && value >= 0) counts[key] = value;
+    }
+    if (Object.keys(counts).length > 0) diagnostic.counts = counts;
+  }
+  try {
+    // Never hand the original Error/cause to diagnostics: messages and stacks
+    // can carry private paths or payloads, including after the observer leaves.
+    reportError(JSON.stringify(diagnostic));
+  } catch {
+    // A failed log sink must not replace the backup outcome or prevent release.
+  }
 }
 
 function requiresOperationalAdmission(method) {
@@ -2265,6 +2360,16 @@ function runConfirmationRead(backgroundWork, operation) {
   return runConfirmationAccess(backgroundWork, "runConfirmationRead", operation);
 }
 
+function runAttentionOperation(backgroundWork, operation) {
+  return runConfirmationAccess(backgroundWork, "runAttentionOperation", operation);
+}
+
+function localOperationRunner({ operationalAdmission, access, runDrainParticipant, signal }) {
+  return operation => operationalAdmission.run(() => access.run(() => runDrainParticipant(
+    DRAIN_PARTICIPANTS.confirmationOperation, () => { signal.throwIfAborted(); return operation(signal); },
+  )));
+}
+
 function signalBackgroundAgency(backgroundWork, options, reportError) {
   if (typeof backgroundWork?.signalAgency !== "function") return;
   Promise.resolve()
@@ -2460,6 +2565,36 @@ function attachServerLifecycle(
 ) {
   const closeServer = server.close.bind(server);
   let shutdownPromise = null;
+  let httpClosing = false;
+  const idleConnections = new Set();
+  const activeRequests = new WeakMap();
+  server.on("connection", (socket) => {
+    if (httpClosing) {
+      socket.destroy();
+      return;
+    }
+    idleConnections.add(socket);
+    socket.once("close", () => {
+      idleConnections.delete(socket);
+      activeRequests.delete(socket);
+    });
+  });
+  server.prependListener("request", (request, response) => {
+    const socket = request.socket;
+    idleConnections.delete(socket);
+    activeRequests.set(socket, (activeRequests.get(socket) ?? 0) + 1);
+    response.once("finish", () => {
+      const remaining = (activeRequests.get(socket) ?? 1) - 1;
+      if (remaining > 0) {
+        activeRequests.set(socket, remaining);
+        return;
+      }
+      activeRequests.delete(socket);
+      if (socket.destroyed) return;
+      idleConnections.add(socket);
+      if (httpClosing) socket.destroySoon();
+    });
+  });
 
   async function performShutdown() {
     const deadline = Date.now() + shutdownDrainTimeoutMs;
@@ -2467,7 +2602,12 @@ function attachServerLifecycle(
     const stoppingBackground = backgroundWork?.stop
       ? runLifecycleStep(() => backgroundWork.stop({ signal: controller.signal }))
       : Promise.resolve();
+    httpClosing = true;
     const closingHttp = closeHttpServer(closeServer);
+    // Incomplete headers on either a new or reused connection have no accepted
+    // handler to drain. Flush earlier responses before closing these sockets;
+    // accepted requests, including pipelined writes, retain their drain barrier.
+    for (const socket of idleConnections) socket.destroySoon();
     const serviceResults = await settleBeforeDeadline(
       [stoppingBackground, closingHttp],
       deadline,
@@ -2563,6 +2703,7 @@ export function createDashboardServer(
   shutdownDrainTimeoutMs = shutdownTimeoutMilliseconds(shutdownDrainTimeoutMs);
   const processController = createManagedProcessController(managedProcess);
   const expectedOrigin = `http://127.0.0.1:${application.config.port}`;
+  const lanTaskBoard = createLanTaskBoard((target, signal) => readLanDashboard(expectedOrigin, target, signal), { store: application.store });
   const employeeRegistry = resolveEmployeeRegistry(application);
   const operationalAdmission = resolveOperationalAdmission(application);
   const handleRequest = async (
@@ -2696,7 +2837,19 @@ export function createDashboardServer(
           application,
           ["createBackup"],
         );
-        sendJson(response, 201, await operations.createBackup());
+        let created;
+        try {
+          created = await operations.createBackup();
+        } catch (error) {
+          reportBackupFailure(reportError, error);
+          if (!response.destroyed && !response.writableEnded) {
+            sendJson(response, Number.isInteger(error.statusCode) ? error.statusCode : 500, {
+              error: internalServerErrorMessage,
+            });
+          }
+          return;
+        }
+        if (!response.destroyed && !response.writableEnded) sendJson(response, 201, created);
         return;
       }
       if (
@@ -2706,6 +2859,24 @@ export function createDashboardServer(
         await operationalAdmission.run(() =>
           handleRequest(request, response, true),
         );
+        return;
+      }
+      if (url.pathname === "/api/ci/jenkins/connection" && ["GET", "POST"].includes(request.method)) {
+        requireNoQuery(url, "Jenkins 连接参数无效");
+        const connection = requireApplicationPort(application, "jenkinsConnection", ["status", "connect"], "Jenkins 连接未启用");
+        if (request.method === "GET") {
+          await withClientAbortSignal(request, response, async signal => {
+            const result = await connection.status({ signal });
+            if (!signal.aborted && !response.destroyed) sendJson(response, 200, result);
+          });
+        } else {
+          assertTrustedMutation(request, expectedOrigin, { json: true });
+          const input = requireExactJsonFields(await readJsonBody(request, 8192), ["repository", "buildUrl", "username", "password"], "Jenkins 连接字段无效");
+          await withClientAbortSignal(request, response, async signal => {
+            const result = await connection.connect(input, { signal });
+            if (!signal.aborted && !response.destroyed) sendJson(response, 200, result);
+          });
+        }
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/health") {
@@ -2720,6 +2891,7 @@ export function createDashboardServer(
           refreshing: Boolean(application.refreshService.running),
           employee,
           employees,
+          ...(application.workContinuationScheduler ? { continuations: application.workContinuationScheduler.readStatus() } : {}),
           ...(runtimeSource ? { runtimeSource } : {}),
           ...(memory ? { memory } : {}),
         });
@@ -3194,6 +3366,10 @@ export function createDashboardServer(
             prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
             externalActionsEnabled:
               application.config.githubActions?.enabled === true,
+            automaticReviewEnabled:
+              application.config.githubActions?.enabled === true &&
+              application.config.githubActions?.enabledActions?.includes("review") === true &&
+              application.config.githubActions?.automaticReview === true,
           },
         });
         return;
@@ -3212,6 +3388,10 @@ export function createDashboardServer(
             prEmployeePaused: prRole ? Boolean(prRole.paused) : true,
             externalActionsEnabled:
               application.config.githubActions?.enabled === true,
+            automaticReviewEnabled:
+              application.config.githubActions?.enabled === true &&
+              application.config.githubActions?.enabledActions?.includes("review") === true &&
+              application.config.githubActions?.automaticReview === true,
           },
         });
         return;
@@ -3280,6 +3460,42 @@ export function createDashboardServer(
           : await view.listTimeline(queryOptions(url, { order: true }));
         sendJson(response, 200, result);
         return;
+      }
+      if (url.pathname === "/api/lan-task-board" && ["GET", "POST"].includes(request.method)) {
+        requireNoQuery(url);
+        if (request.socket.remoteAddress !== "127.0.0.1") throw httpError(403, "仅本机可以管理局域网看板");
+        if (request.method === "POST") {
+          assertTrustedMutation(request, expectedOrigin, { json: true });
+          sendJson(response, 200, await lanTaskBoard.configure(await readJsonBody(request)));
+        } else {
+          await lanTaskBoard.ready;
+          sendJson(response, 200, lanTaskBoard.view());
+        }
+        return;
+      }
+      if (request.method === 'GET' && url.pathname === '/api/task-runs') {
+        requireNoQuery(url);
+        sendJson(response,200,application.taskRuns ? await application.taskRuns.list() : {enabled:false,items:[],held:[]});
+        return;
+      }
+      const taskRunRoute = url.pathname.match(/^\/api\/task-runs\/(work-item|code-job)\/([^/]+)(\/control)?$/);
+      if (taskRunRoute && ['GET','POST'].includes(request.method)) {
+        requireNoQuery(url);
+        const port = requireApplicationPort(application,'taskRuns',['get','control'],'运行任务控制未启用');
+        const [,kind,encodedId,controlPath] = taskRunRoute;
+        let taskId;
+        try { taskId = decodeURIComponent(encodedId); } catch { throw httpError(400,'任务标识编码无效'); }
+        if (request.method === 'GET' && !controlPath) {
+          sendJson(response,200,await port.get(kind,taskId)); return;
+        }
+        if (request.method === 'POST' && controlPath) {
+          assertTrustedMutation(request,expectedOrigin,{json:true});
+          const result = await port.control(kind,taskId,await readJsonBody(request));
+          sendJson(response,200,result);
+          signalBackgroundAgency(backgroundWork,{trigger:'owner_task_control'},reportError);
+          return;
+        }
+        throw httpError(405,'运行任务请求方法无效');
       }
       if (
         request.method === "GET" &&
@@ -3529,6 +3745,25 @@ export function createDashboardServer(
         sendJson(response, 200, next);
         return;
       }
+      if (request.method === "GET" && url.pathname === "/api/attention/maintenance") {
+        requireNoQuery(url, "维护故障查询参数无效");
+        const browser = application.attentionBrowser;
+        const result = typeof browser?.listMaintenance === "function"
+          ? await runConfirmationRead(backgroundWork, () => browser.listMaintenance())
+          : { items: [], total: 0 };
+        sendJson(response, 200, result);
+        return;
+      }
+      const internalAttentionRead = url.pathname.match(/^\/api\/attention\/internal\/(attention-[a-f0-9]{64})$/);
+      if (request.method === "GET" && internalAttentionRead) {
+        requireNoQuery(url, "内部请示状态查询参数无效");
+        const browser = application.attentionBrowser;
+        if (typeof browser?.readStatus !== "function") throw httpError(503, "内部请示状态查询暂不可用");
+        const item = await runConfirmationRead(backgroundWork, () =>
+          browser.readStatus({ requestId: internalAttentionRead[1] }));
+        sendJson(response, 200, { item });
+        return;
+      }
       const internalAttentionAction = url.pathname.match(
         /^\/api\/attention\/internal\/(attention-[a-f0-9]{64})\/(answer|reject|later)$/,
       );
@@ -3539,7 +3774,7 @@ export function createDashboardServer(
           throw httpError(400, "requestId 只能来自请求路径");
         }
         const operation = internalAttentionAction[2];
-        const item = await runConfirmationOperation(backgroundWork, () =>
+        const item = await runAttentionOperation(backgroundWork, () =>
           requireAttentionBrowser(application)[operation]({
             ...input,
             requestId: internalAttentionAction[1],
@@ -3847,15 +4082,20 @@ export function createDashboardServer(
       }
       const ownerIntakeBlocked = status === 503 && isOwnerWorkSubmission &&
         ownerIntakeBlockedCodes.has(error.code);
+      const confirmationFactsPending = status === 503 &&
+        error.code === "CONFIRMATION_FACTS_NOT_READY";
       sendJson(response, status, {
         error: ownerIntakeBlocked
           ? "请求已保存并路由，但尚未进入工作台账。请重试原请求，不要重复创建。"
           : status >= 500 ? internalServerErrorMessage : error.message,
-        ...(ownerIntakeBlocked ? { code: error.code } : {}),
+        ...(ownerIntakeBlocked || confirmationFactsPending || (typeof error.code === 'string' && /^TASK_RUN_[A-Z_]+$/.test(error.code))
+          ? { code: error.code }
+          : {}),
       });
     }
   };
   const server = http.createServer(handleRequest);
+  server.once("close", () => { void lanTaskBoard.close().catch(reportError); });
   const managedServer = attachServerLifecycle(
     server,
     application,
@@ -3884,6 +4124,60 @@ function shutdownAbort() {
   });
 }
 
+function isPureConfigurationRestartRejection(error, seen = new Set()) {
+  // A completed admission rejection must not block the restart that opens
+  // admission. Every error leaf must still be a known, side-effect-free fence.
+  try {
+    return hasOnlyConfigurationRestartRejections(error, seen);
+  } catch {
+    return false;
+  }
+}
+
+function hasOnlyConfigurationRestartRejections(error, seen) {
+  if (!(error instanceof Error) || seen.has(error) || seen.size >= 64) return false;
+  seen.add(error);
+  const fields = Object.getOwnPropertyDescriptors(error);
+  const value = (key) => fields[key]?.value;
+  const hasOnlyFields = (allowed) => Reflect.ownKeys(fields)
+    .every((key) => allowed.includes(key) &&
+      (key === "stack" || Object.hasOwn(fields[key], "value")));
+  const prototype = Object.getPrototypeOf(error);
+  if (prototype === ActionAdmissionGateError.prototype) {
+    return value("code") === "RUNTIME_RESTART_REQUIRED" &&
+      value("statusCode") === 409 &&
+      hasOnlyFields(["stack", "message", "name", "code", "statusCode"]);
+  }
+  if (prototype === Error.prototype) {
+    const causeCodes = value("causeCodes");
+    const causeDetails = value("causeDetails");
+    const stage = value("stage");
+    return value("code") === "WORK_COORDINATION_STAGE_FAILED" &&
+      typeof stage === "string" && /^[a-z][a-z_]{0,63}$/u.test(stage) &&
+      value("message") === `员工主动循环阶段失败: ${stage} [RUNTIME_RESTART_REQUIRED]` &&
+      Array.isArray(causeCodes) && causeCodes.length === 1 &&
+      Object.getOwnPropertyDescriptor(causeCodes, "0")?.value === "RUNTIME_RESTART_REQUIRED" &&
+      Array.isArray(causeDetails) && causeDetails.length === 0 &&
+      hasOnlyFields(["stack", "message", "cause", "code", "stage", "causeCodes", "causeDetails", "result"]) &&
+      isPureConfigurationRestartRejection(value("cause"), seen);
+  }
+  if (prototype !== AggregateError.prototype ||
+      !hasOnlyFields(["stack", "message", "errors", "result"])) return false;
+  const message = value("message");
+  const errors = value("errors");
+  if (typeof message !== "string" ||
+      !(message === "one or more work proposal runners failed" ||
+        message.startsWith("员工主动循环有多个阶段失败: ") ||
+        message.startsWith("员工主动循环、旧岗位巡查或记忆投影失败: ")) ||
+      !Array.isArray(errors) || errors.length === 0 || errors.length > 64) return false;
+  for (let index = 0; index < errors.length; index += 1) {
+    const entry = Object.getOwnPropertyDescriptor(errors, String(index));
+    if (!entry || !Object.hasOwn(entry, "value") ||
+        !isPureConfigurationRestartRejection(entry.value, seen)) return false;
+  }
+  return true;
+}
+
 function backgroundOperationOptions(input, signal) {
   const options = { ...input };
   Object.defineProperty(options, "signal", {
@@ -3895,8 +4189,8 @@ function backgroundOperationOptions(input, signal) {
   return options;
 }
 
-function backgroundRefreshOptions(notify, signal) {
-  return backgroundOperationOptions({ notify }, signal);
+function backgroundRefreshOptions(notify, signal, deferDingTalkSummary = false) {
+  return backgroundOperationOptions({ notify, ...(deferDingTalkSummary ? { deferDingTalkSummary: true } : {}) }, signal);
 }
 
 async function drainBackgroundWork(operation, drainTimeoutMs) {
@@ -3939,11 +4233,13 @@ function configurationSafeModeBackgroundWork(
   const skip = () => Promise.resolve(skipped);
   const confirmationEnabled = Boolean(application.confirmationQueue);
   const confirmationAccess = createConfirmationAccessGate(confirmationEnabled);
-  const confirmationReadAccess = createConfirmationAccessGate(confirmationEnabled);
+  const confirmationReadAccess = createConfirmationAccessGate(true);
   confirmationAccess.open();
   confirmationReadAccess.open();
   const workController = new AbortController();
   let stopPromise = null;
+  const runLocalOperation = localOperationRunner({ operationalAdmission, access: confirmationReadAccess,
+    runDrainParticipant, signal: workController.signal });
   return Object.freeze({
     initialRefresh: Promise.resolve(skipped),
     timers: Object.freeze([]),
@@ -3961,14 +4257,8 @@ function configurationSafeModeBackgroundWork(
     mutateFacts: skip,
     signalAgency: skip,
     runEmployee: skip,
-    runConfirmationRead(operation) {
-      return operationalAdmission.run(() => confirmationReadAccess.run(
-        () => runDrainParticipant(
-          DRAIN_PARTICIPANTS.confirmationOperation,
-          () => operation(workController.signal),
-        ),
-      ));
-    },
+    runConfirmationRead: runLocalOperation,
+    runAttentionOperation: runLocalOperation,
     runConfirmationOperation(operation) {
       return operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -3996,8 +4286,10 @@ export function startApplicationBackgroundWork(
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,
     reportError = console.error,
+    log = console.log,
     drainTimeoutMs = defaultShutdownDrainTimeoutMs,
     observeDrainParticipant = () => {},
+    runtimeRevision = null,
   } = {},
 ) {
   drainTimeoutMs = shutdownTimeoutMilliseconds(drainTimeoutMs);
@@ -4019,10 +4311,13 @@ export function startApplicationBackgroundWork(
   const confirmationAccess = createConfirmationAccessGate(
     Boolean(application.confirmationQueue),
   );
-  const confirmationReadAccess = createConfirmationAccessGate(
-    Boolean(application.confirmationQueue),
-  );
+  const confirmationReadAccess = createConfirmationAccessGate(true);
+  // Local projections and source-bound internal answers do not need GitHub
+  // freshness. External confirmations retain the separate mutation gate.
+  confirmationReadAccess.open();
   const workController = new AbortController();
+  const runLocalOperation = localOperationRunner({ operationalAdmission, access: confirmationReadAccess,
+    runDrainParticipant, signal: workController.signal });
   let stopped = false;
   let stopPromise = null;
   const backgroundPriority = Object.freeze({
@@ -4034,11 +4329,86 @@ export function startApplicationBackgroundWork(
   );
   let backgroundOperationActive = false;
   let factsReady = false;
-  let confirmationReadReady = false;
+  const independentEmployeeFactWaiters = new Set();
+  let activeIndependentEmployeeCycles = 0;
   let pendingFactCycles = 0;
   let factCycleSequence = 0;
+  let readyFactCycleSequence = 0;
   const coalescedAgencyCycles = new Map();
+  const targetedEmployeeCycles = new TargetedCycleQueue();
   const coalescedRefreshCycles = new Map();
+
+  function releaseIndependentEmployeeFactWaiters(ready) {
+    for (const resolve of independentEmployeeFactWaiters) resolve(ready);
+    independentEmployeeFactWaiters.clear();
+  }
+
+  function automaticAgencyCyclesEnabled() {
+    const actions = application.config.githubActions;
+    return actions?.enabled === true &&
+      (actions.automaticReview === true || actions.automaticOwnPrRepair === true);
+  }
+
+  function independentEmployeeFactsReady() {
+    // Queuing a future refresh does not change the last fully admitted facts.
+    // Starting that refresh closes factsReady until routing and intake finish.
+    return factsReady && (automaticAgencyCyclesEnabled() || readyFactCycleSequence === factCycleSequence);
+  }
+
+  function waitForIndependentEmployeeFacts(signal) {
+    signal?.throwIfAborted();
+    if (stopped) return Promise.resolve(false);
+    if (independentEmployeeFactsReady()) return Promise.resolve(true);
+    if (pendingFactCycles === 0) return Promise.resolve(false);
+    return new Promise((resolve, reject) => {
+      const finish = ready => {
+        independentEmployeeFactWaiters.delete(finish);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(ready);
+      };
+      const onAbort = () => {
+        independentEmployeeFactWaiters.delete(finish);
+        signal.removeEventListener('abort', onAbort);
+        reject(signal.reason);
+      };
+      independentEmployeeFactWaiters.add(finish);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  function isIndependentEmployeeCycle(options) {
+    if (options.includeLegacyEmployees || options.employeeIds?.length !== 1) return false;
+    return options.employeeIds[0] === "pr-engineer" || automaticAgencyCyclesEnabled();
+  }
+
+  async function runIndependentEmployee(options) {
+    options.signal.throwIfAborted();
+    if (stopped || !independentEmployeeFactsReady()) {
+      return { skipped: "facts_not_ready" };
+    }
+    const employeeId = options.employeeIds[0];
+    let continuationOutcome = null;
+    activeIndependentEmployeeCycles += 1;
+    try {
+      // Each role keeps its scoped coordination and execution checks. General
+      // code jobs and memory projection must not delay role handoffs or Reviews.
+      await runDrainParticipant(DRAIN_PARTICIPANTS.employeeExecution, () => {
+        const runOptions = backgroundOperationOptions({ trigger: options.trigger,
+          ...(options.continuationTarget == null ? {} : { continuationTarget: options.continuationTarget,
+            onContinuationOutcome: outcome => { continuationOutcome = outcome; } }) }, options.signal);
+        if (typeof employeeRegistry.runSelected === "function") return employeeRegistry.runSelected([employeeId], runOptions);
+        if (typeof employeeRegistry.run === "function") return employeeRegistry.run(employeeId, runOptions);
+        if (employeeId === "pr-reviewer" && typeof employeeRegistry.runAll === "function") return employeeRegistry.runAll(runOptions);
+        throw new TypeError("employee registry cannot run the selected role");
+      });
+      options.signal.throwIfAborted();
+      if (employeeId === "pr-engineer") await recoverReviewHandoffs(options.signal);
+      signalWorkContinuations();
+      return { skipped: null, ...(continuationOutcome === null ? {} : { continuationOutcome }) };
+    } finally {
+      activeIndependentEmployeeCycles -= 1;
+    }
+  }
 
   function reportBackgroundError(error) {
     try {
@@ -4064,9 +4434,24 @@ export function startApplicationBackgroundWork(
       });
   }
 
-  function enqueueBackgroundOperation(priority, operation) {
+  function enqueueBackgroundOperation(priority, operation, signal = null) {
     return new Promise((resolve, reject) => {
-      backgroundQueues.get(priority).push({ operation, resolve, reject });
+      signal?.throwIfAborted();
+      const queue = backgroundQueues.get(priority);
+      const onAbort = () => {
+        const index = queue.indexOf(entry);
+        if (index < 0) return;
+        queue.splice(index, 1);
+        signal.removeEventListener('abort', onAbort);
+        reject(signal.reason);
+      };
+      const entry = { operation() {
+        signal?.removeEventListener('abort', onAbort);
+        signal?.throwIfAborted();
+        return operation();
+      }, resolve, reject };
+      queue.push(entry);
+      signal?.addEventListener('abort', onAbort, { once: true });
       runNextBackgroundOperation();
     });
   }
@@ -4199,10 +4584,13 @@ export function startApplicationBackgroundWork(
       return;
     }
     try {
-      await runDrainParticipant(
+      const result = await runDrainParticipant(
         DRAIN_PARTICIPANTS.memoryProjection,
         () => application.memoryProjector.runCycle({ signal }),
       );
+      if (result?.authorityBound?.status === "deferred") {
+        log(`memory_projection_deferred stage=${stage} code=${result.authorityBound.code} attempts=${result.authorityBound.attempts}`);
+      }
     } catch (error) {
       failures.push(agencyCycleFailure(stage, error));
     }
@@ -4210,6 +4598,7 @@ export function startApplicationBackgroundWork(
 
   async function performAgencyCycle({
     trigger,
+    continuationTarget = null,
     includeLegacyEmployees = false,
     employeeIds = [],
     discardWhenFactsPending = false,
@@ -4258,7 +4647,8 @@ export function startApplicationBackgroundWork(
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     if (selectedEmployeeIds.length > 0 && !stopped) {
       try {
-        const runOptions = backgroundOperationOptions({ trigger }, signal);
+        const runOptions = backgroundOperationOptions({ trigger,
+          ...(continuationTarget === null ? {} : { continuationTarget }) }, signal);
         await runDrainParticipant(
           DRAIN_PARTICIPANTS.employeeExecution,
           async () => {
@@ -4286,18 +4676,33 @@ export function startApplicationBackgroundWork(
     if (signal.aborted) throwAgencyCycleFailures(failures, signal);
     await projectMemory(failures, signal, "memory_after_employee");
     throwAgencyCycleFailures(failures, signal);
+    signalWorkContinuations();
     return { skipped: null };
   }
 
-  function enqueueAgencyCycle(
+  async function enqueueAgencyCycle(
     options,
     priority,
     { admitOnDequeue = false } = {},
   ) {
+    if (isIndependentEmployeeCycle(options) || automaticAgencyCyclesEnabled()) {
+      // Waiting for a refresh is not active work: maintenance must be able to
+      // close admission without needing another admitted refresh to release it.
+      while (!stopped) {
+        if (!await waitForIndependentEmployeeFacts(options.signal) || stopped) return { skipped: "facts_not_ready" };
+        const result = await operationalAdmission.run(() => {
+          options.signal?.throwIfAborted();
+          if (!independentEmployeeFactsReady()) return { skipped: "facts_changed_before_admission" };
+          return isIndependentEmployeeCycle(options) ? runIndependentEmployee(options) : performAgencyCycle(options);
+        });
+        if (result?.skipped !== "facts_changed_before_admission") return result;
+      }
+      return { skipped: "stopped" };
+    }
     const operation = () => admitOnDequeue
       ? operationalAdmission.run(() => performAgencyCycle(options))
       : performAgencyCycle(options);
-    return enqueueBackgroundOperation(priority, operation);
+    return enqueueBackgroundOperation(priority, operation, options.signal);
   }
 
   function coalesceCycle(cycles, key, createCycle) {
@@ -4346,24 +4751,90 @@ export function startApplicationBackgroundWork(
     priority,
     runOptions = {},
   ) {
+    const continuationTarget = normalizeContinuationTarget(options.continuationTarget);
+    if (continuationTarget === null) return startCoalescedAgencyCycle(key, options, priority, runOptions);
+    if (options.employeeIds?.length !== 1 || options.includeLegacyEmployees) throw new TypeError('target requires one employee');
+    const roleKey = `employee:${options.employeeIds[0]}`;
+    return targetedEmployeeCycles.run(JSON.stringify([roleKey, continuationTarget]), {
+      signal: options.signal ? AbortSignal.any([workController.signal, options.signal]) : workController.signal,
+      current: () => coalescedAgencyCycles.get(roleKey),
+      execute: () => startCoalescedAgencyCycle(roleKey, { ...options, continuationTarget }, priority, runOptions),
+    });
+  }
+
+  function startCoalescedAgencyCycle(
+    key,
+    options,
+    priority,
+    runOptions = {},
+  ) {
+    if (isIndependentEmployeeCycle(options)) {
+      key = `employee:${options.employeeIds[0]}`;
+    }
+    if (isIndependentEmployeeCycle(options) || automaticAgencyCyclesEnabled()) {
+      runOptions = { ...runOptions, admitOnDequeue: true };
+    }
     return runCoalescedTracked(
       coalescedAgencyCycles,
       key,
-      (signal) => enqueueAgencyCycle(
-        {
-          ...options,
-          factCycleSequenceAtRequest: factCycleSequence,
-          signal,
-        },
-        priority,
-        runOptions,
-      ),
+      async (signal) => {
+        const executionSignal = options.signal ? AbortSignal.any([signal, options.signal]) : signal;
+        try {
+          return await enqueueAgencyCycle({ ...options, factCycleSequenceAtRequest: factCycleSequence, signal: executionSignal }, priority, runOptions);
+        } catch (error) {
+          // The continuation owns this cancellation. Its durable receipt is
+          // tracked separately; cooperative cancellation is not a drain failure.
+          if (executionSignal.aborted && error === executionSignal.reason && error?.code === "WORK_CONTINUATION_TIMEOUT") {
+            return { skipped: "continuation_timeout" };
+          }
+          throw error;
+        }
+      },
       runOptions,
     );
   }
 
+  function signalWorkContinuations() {
+    if (stopped) return Promise.resolve();
+    if (application.config.githubActions?.enabled === true &&
+        application.config.githubActions.automaticOwnPrRepair === true &&
+        independentEmployeeFactsReady() && typeof application.codeJobExecution?.runCycle === "function") {
+      // Execution owns its full lifetime separately from housekeeping. Fresh
+      // PR facts and completed-job publication must not wait for another model.
+      runCoalescedTracked(coalescedAgencyCycles, "code-job-execution", signal =>
+        runDrainParticipant(DRAIN_PARTICIPANTS.codeJobExecution, () =>
+          application.codeJobExecution.runCycle({ signal }, operation => runTracked(
+            () => runDrainParticipant(DRAIN_PARTICIPANTS.codeJobExecution, operation), { rethrow: true }))),
+      { rethrow: true }).catch(reportBackgroundError);
+    }
+    if (application.config.githubActions?.enabled === true &&
+        application.config.githubActions.automaticOwnPrRepair === true &&
+        independentEmployeeFactsReady() && typeof application.localCodeProposalRecovery?.runCycle === "function") {
+      // Existing proposals must be polled even while a native code job owns a
+      // long-running employee cycle. The shared runner coalesces concurrent polls.
+      runCoalescedTracked(coalescedAgencyCycles, "local-code-proposal-recovery", signal =>
+        runDrainParticipant(DRAIN_PARTICIPANTS.localCodeProposalRecovery, () =>
+          application.localCodeProposalRecovery.runCycle({ signal })),
+      { rethrow: true }).catch(reportBackgroundError);
+    }
+    if (!application.workContinuationScheduler) return Promise.resolve();
+    return runCoalescedTracked(coalescedAgencyCycles, "work-continuations", (signal) =>
+      runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, () => application.workContinuationScheduler.runCycle({
+        signal,
+        runtimeRevision,
+        allowDispatch: independentEmployeeFactsReady(),
+        dispatch: ({ roleId, signal: executionSignal, continuationTarget }) => runCoalescedAgencyCycle(`employee:${roleId}`, {
+          trigger: "scheduled", employeeIds: [roleId], discardWhenFactsPending: true, signal: executionSignal, continuationTarget,
+        }, backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }),
+        runOperation: operation => runTracked(
+          () => runDrainParticipant(DRAIN_PARTICIPANTS.workContinuation, operation), { rethrow: true },
+        ),
+      })),
+    );
+  }
+
   function enqueueFactCycle(factOperation, signal = workController.signal) {
-    factCycleSequence += 1;
+    const sequence = ++factCycleSequence;
     pendingFactCycles += 1;
     const operation = async () => {
       try {
@@ -4386,16 +4857,25 @@ export function startApplicationBackgroundWork(
         signal.throwIfAborted();
         if (stopped) return result;
         factsReady = true;
-        confirmationReadReady = true;
-        confirmationReadAccess.open();
+        readyFactCycleSequence = sequence;
+        if (independentEmployeeFactsReady()) releaseIndependentEmployeeFactWaiters(true);
+        signalWorkContinuations();
         if (pendingFactCycles === 1) {
           confirmationAccess.open();
           try {
-            await performAgencyCycle({
-              trigger: "refresh_completed",
-              includeLegacyEmployees: true,
-              signal,
-            });
+            if (automaticAgencyCyclesEnabled()) {
+              // Fact ownership ends after intake and confirmation reconciliation.
+              // Every automatic cycle retains its own tracked lifetime instead.
+              for (const [key, cycle] of [
+                ["coordination", { includeLegacyEmployees: false }],
+                ["employee:pr-reviewer", { employeeIds: ["pr-reviewer"] }],
+              ]) {
+                runCoalescedAgencyCycle(key, { trigger: "refresh_completed", ...cycle, signal },
+                  backgroundPriority.scheduled, { rethrow: true, admitOnDequeue: true }).catch(reportBackgroundError);
+              }
+            } else {
+              await performAgencyCycle({ trigger: "refresh_completed", includeLegacyEmployees: true, signal });
+            }
           } catch (error) {
             if (signal.aborted) throw error;
             reportBackgroundError(error);
@@ -4405,6 +4885,7 @@ export function startApplicationBackgroundWork(
       } finally {
         pendingFactCycles -= 1;
         if (stopped) factsReady = false;
+        if (pendingFactCycles === 0 && !factsReady) releaseIndependentEmployeeFactWaiters(false);
       }
     };
     return enqueueBackgroundOperation(
@@ -4423,11 +4904,18 @@ export function startApplicationBackgroundWork(
           () => runDrainParticipant(
             DRAIN_PARTICIPANTS.refresh,
             () => application.refreshService.refresh(
-              backgroundRefreshOptions(notify, signal),
+              backgroundRefreshOptions(notify, signal, typeof application.refreshService.summarizePendingDingTalk === "function"),
             ),
           ),
           signal,
-        ),
+        ).then(result => {
+          if (!stopped && typeof application.refreshService.summarizePendingDingTalk === "function") {
+            // Enrichment owns a tracked lifetime, but never holds fact admission.
+            runTracked(summarySignal => runDrainParticipant(DRAIN_PARTICIPANTS.refresh,
+              () => application.refreshService.summarizePendingDingTalk({ signal: summarySignal })));
+          }
+          return result;
+        }),
       runOptions,
     );
   }
@@ -4437,6 +4925,10 @@ export function startApplicationBackgroundWork(
     { notify: false },
     { rethrow: true },
   );
+
+  if (application.workContinuationScheduler || application.localCodeProposalRecovery || application.codeJobExecution) {
+    timers.push(setIntervalFn(signalWorkContinuations, 10_000));
+  }
 
   timers.push(
     setIntervalFn(
@@ -4466,7 +4958,9 @@ export function startApplicationBackgroundWork(
   for (const schedule of employeeRegistry.schedules()) {
     timers.push(
       setIntervalFn(
-        () => runCoalescedAgencyCycle(`employee:${schedule.id}`, {
+        () => application.workContinuationScheduler && automaticAgencyCyclesEnabled() && CONTINUATION_ROLES.has(schedule.id)
+          ? signalWorkContinuations()
+          : runCoalescedAgencyCycle(`employee:${schedule.id}`, {
           trigger: "scheduled",
           employeeIds: [schedule.id],
           discardWhenFactsPending: true,
@@ -4481,7 +4975,7 @@ export function startApplicationBackgroundWork(
     if (stopPromise) return stopPromise;
     stopped = true;
     factsReady = false;
-    confirmationReadReady = false;
+    releaseIndependentEmployeeFactWaiters(false);
     workController.abort(shutdownAbort());
     for (const timer of timers) clearIntervalFn(timer);
     const tasksToDrain = [...activeTasks];
@@ -4494,7 +4988,8 @@ export function startApplicationBackgroundWork(
       const failures = results
         .filter((result) =>
           result.status === "rejected" &&
-          result.reason !== workController.signal.reason
+          result.reason !== workController.signal.reason &&
+          !isPureConfigurationRestartRejection(result.reason)
         )
         .map((result) => result.reason);
       if (failures.length === 1) throw failures[0];
@@ -4512,7 +5007,7 @@ export function startApplicationBackgroundWork(
     return backgroundDrainStatus({
       runDrainParticipant,
       activeTaskCount: activeTasks.size,
-      backgroundOperationActive,
+      backgroundOperationActive: backgroundOperationActive || activeIndependentEmployeeCycles > 0,
       confirmationOperationCount:
         confirmationAccess.activeCount() + confirmationReadAccess.activeCount(),
       queuedOperationCount: [...backgroundQueues.values()]
@@ -4544,14 +5039,8 @@ export function startApplicationBackgroundWork(
         backgroundPriority.factOrExplicit,
         { rethrow: true },
       ),
-    runConfirmationRead: (operation) =>
-      operationalAdmission.run(() => {
-        if (!confirmationReadReady) throw confirmationUnavailable();
-        return confirmationReadAccess.run(() => runDrainParticipant(
-          DRAIN_PARTICIPANTS.confirmationOperation,
-          () => operation(workController.signal),
-        ));
-      }),
+    runConfirmationRead: runLocalOperation,
+    runAttentionOperation: runLocalOperation,
     runConfirmationOperation: (operation) =>
       operationalAdmission.run(() => confirmationAccess.run(
         () => runDrainParticipant(
@@ -4580,6 +5069,8 @@ function createDeferredBackgroundWork(
   startBackgroundWorkFn,
   reportError,
   drainTimeoutMs,
+  log,
+  runtimeRevision,
 ) {
   let delegate = null;
   let startPromise = null;
@@ -4599,6 +5090,8 @@ function createDeferredBackgroundWork(
       const started = startBackgroundWorkFn(application, {
         reportError,
         drainTimeoutMs,
+        log,
+        runtimeRevision,
       });
       if (!started || typeof started !== "object") {
         throw new TypeError("startBackgroundWorkFn must return background work");
@@ -4636,6 +5129,8 @@ function createDeferredBackgroundWork(
     runEmployee: (...arguments_) => requireDelegate().runEmployee(...arguments_),
     runConfirmationRead: (...arguments_) =>
       requireDelegate().runConfirmationRead(...arguments_),
+    runAttentionOperation: (...arguments_) =>
+      requireDelegate().runAttentionOperation(...arguments_),
     runConfirmationOperation: (...arguments_) =>
       requireDelegate().runConfirmationOperation(...arguments_),
     confirmationReady: () => delegate?.confirmationReady?.() === true,
@@ -4677,11 +5172,15 @@ export async function startDashboardServer(
         startBackgroundWorkFn,
         reportError,
         shutdownDrainTimeoutMs,
+        log,
+        runtimeSourceIdentityInput?.runtimeDigest ?? null,
       );
     } else {
       backgroundWork = startBackgroundWorkFn(application, {
         reportError,
         drainTimeoutMs: shutdownDrainTimeoutMs,
+        log,
+        runtimeRevision: runtimeSourceIdentityInput?.runtimeDigest ?? null,
       });
     }
     server = createDashboardServer(application, {

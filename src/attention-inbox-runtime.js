@@ -45,10 +45,13 @@ export async function createAttentionInboxRuntime({
       ...(authority ? { authority } : {}),
     });
     await inbox.recover();
+    await inbox.archiveRetired();
     return Object.freeze({
       producer: frozenPort({ create: (value) => inbox.create(value) }),
       browser: frozenPort({
-        next: () => inbox.next(),
+        readStatus: (options) => inbox.readStatus(options),
+        next: (options) => inbox.next(options),
+        listMaintenance: () => inbox.listMaintenance(),
         answer: (value) => inbox.answer(value),
         reject: (value) => inbox.reject(value),
         later: (value) => inbox.later(value),
@@ -56,6 +59,8 @@ export async function createAttentionInboxRuntime({
       consumer: frozenPort({
         readOutbox: (options) => inbox.readOutbox(options),
       }),
+      maintenance: frozenPort({ archiveRetired: () => inbox.archiveRetired(),
+        retrySystemQuestions: (options) => inbox.retrySystemQuestions(options) }),
       close,
     });
   } catch (error) {

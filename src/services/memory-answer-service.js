@@ -107,14 +107,6 @@ function dataEntries(value, name) {
   return entries;
 }
 
-function exact(value, keys, name) {
-  const fields = new Map(dataEntries(value, name));
-  if (fields.size !== keys.length || keys.some((key) => !fields.has(key))) {
-    throw new TypeError(`${name} is invalid`);
-  }
-  return fields;
-}
-
 function runtimeSignal(value = {}) {
   const entries = dataEntries(value, "answer options");
   if (entries.length > 1 || entries.some(([key]) => key !== "signal")) {
@@ -186,13 +178,12 @@ function brainDescription(value, expected, name) {
   ) {
     throw new TypeError(`${name} is invalid`);
   }
-  const remoteData = exact(
-    fields.get("remoteData"),
-    ["requirements", "code", "memory"],
-    `${name}.remoteData`,
-  );
-  if ([...remoteData.values()].some((allowed) => typeof allowed !== "boolean")) {
-    throw new TypeError(`${name} is invalid`);
+  const remoteData = new Map(dataEntries(fields.get("remoteData"), `${name}.remoteData`));
+  const requiredGrants = ["requirements", "code", "memory"];
+  if (requiredGrants.some(key => !remoteData.has(key)) ||
+      [...remoteData.keys()].some(key => !requiredGrants.includes(key) && key !== "dingtalk") ||
+      [...remoteData.values()].some(allowed => typeof allowed !== "boolean")) {
+    throw new TypeError(`${name}.remoteData is invalid`);
   }
   return Object.freeze({
     provider: fields.get("provider"),

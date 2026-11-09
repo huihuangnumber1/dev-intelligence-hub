@@ -131,6 +131,22 @@ function invokeManager(
   );
 }
 
+async function invokeManagerInJob(root, executable, extraArguments = []) {
+  const resultPath = path.join(root, "job launch result.json");
+  const host = spawnSync(executable, [
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+    path.join(projectRoot, "test", "fixtures", "managed-launch-job.ps1"),
+    "-ProjectDirectory", root,
+    "-PowerShellPath", executable,
+    "-ResultPath", resultPath,
+    ...extraArguments,
+  ], { cwd: root, encoding: "utf8", timeout: 45_000, windowsHide: true });
+  assert.equal(host.error, undefined, `${host.stderr}\n${host.stdout}`);
+  assert.equal(host.status, 0, `${host.stderr}\n${host.stdout}`);
+  const result = JSON.parse((await readFile(resultPath, "utf8")).replace(/^\uFEFF/u, ""));
+  return { ...host, managerExitCode: result.managerExitCode };
+}
+
 function isolatedRealServerEnvironment() {
   const environment = {};
   for (const [name, value] of Object.entries(process.env)) {
@@ -379,7 +395,15 @@ async function rewriteFixtureManager(root, find, replace) {
   const source = await readFile(managerPath, "utf8");
   const changed = source.replace(find, replace);
   assert.notEqual(changed, source, "fixture manager mutation must match production source");
-  await writeFile(managerPath, changed, "utf8");
+  // Windows can briefly retain a script handle after the preceding manager exits.
+  // Retry only that transient fixture write; persistent locks still fail the test.
+  for (let attempt = 0; ; attempt += 1) {
+    try { await writeFile(managerPath, changed, "utf8"); return; }
+    catch (error) {
+      if (error.code !== "EBUSY" || attempt >= 19) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 async function installRecoveryTerminationTrap(root, markerPath) {
@@ -1321,6 +1345,46 @@ test(
     assert.match(finalStatus.stdout, /is stopped/);
   },
 );
+
+for (const [label, executable, skip] of [
+  ["Windows PowerShell", powershell, WINDOWS_MANAGER_SKIP],
+  ["PowerShell 7", powershell7, POWERSHELL_7_MANAGER_SKIP],
+]) {
+  test(
+    `${label} managed server survives the launching command job closing`,
+    { skip },
+    async (t) => {
+      const { root, port } = await createFixture(t);
+      const host = await invokeManagerInJob(root, executable);
+      assert.equal(host.managerExitCode, 0, `${host.stderr}\n${host.stdout}`);
+      const runtime = readRuntimeInfo(root);
+      const state = JSON.parse(await readFile(
+        path.join(runtime.runtimeDirectory, "mydashboard-server-process.json"),
+        "utf8",
+      ));
+      await waitForHealth(port, state.processId);
+      const stopped = invokeManager(root, "Stop", 10, executable);
+      assert.equal(stopped.status, 0, `${stopped.stderr}\n${stopped.stdout}`);
+      await assertPortUnavailable(port);
+    },
+  );
+  test(
+    `${label} refuses to start inside a job that forbids breakaway`,
+    { skip },
+    async (t) => {
+      const { root, port } = await createFixture(t);
+      const host = await invokeManagerInJob(root, executable, ["-DenyBreakaway"]);
+      assert.notEqual(host.managerExitCode, 0, `${host.stderr}\n${host.stdout}`);
+      assert.match(`${host.stderr}\n${host.stdout}`, /Unable to detach MyDashboard launcher/u);
+      await assertPortUnavailable(port);
+      const runtime = readRuntimeInfo(root);
+      await assert.rejects(readFile(
+        path.join(runtime.runtimeDirectory, "mydashboard-server-process.json"),
+        "utf8",
+      ), { code: "ENOENT" });
+    },
+  );
+}
 
 test(
   "managed Stop accepts a 10.5-second liveness stall within the fifteen-second cap",
@@ -3889,3 +3953,91 @@ test(
     await unlink(secondRuntime.runtimeDirectory);
   },
 );
+
+for (const beforePreparation of [true, false]) {
+  test(
+    "RecoverFailedShutdown preserves code-executor artifacts " + (beforePreparation ? "present before preparation" : "added after snapshot"),
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      let fixture = await prepareFailedShutdownRecovery(t, { createRecoverySnapshot: !beforePreparation });
+      const artifactPath = path.join(fixture.root, "data", "code-executor", "artifacts", "output.json");
+      const artifact = Buffer.from('{"result":"audited immutable output"}\n');
+      await mkdir(path.dirname(artifactPath), { recursive: true });
+      await writeFile(artifactPath, artifact);
+      const rootPath = path.join(fixture.root, "data", "fixture-data.json");
+      if (beforePreparation) {
+        await writeFile(rootPath, '{"artifact":"code-executor/artifacts/output.json"}\n');
+        const prepared = invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10);
+        assert.equal(prepared.status, 0, prepared.stderr + prepared.stdout);
+        const snapshotId = prepared.stdout.match(/shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u)?.[0];
+        assert.equal(typeof snapshotId, "string");
+        fixture = { ...fixture, snapshotId, snapshotDirectory: path.join(fixture.runtime.runtimeDirectory, "recovery-snapshots", snapshotId) };
+      }
+      const rootBytes = await readFile(rootPath);
+      assert.deepEqual(await readFile(artifactPath), artifact);
+      assert.equal(await fileExists(path.join(fixture.snapshotDirectory, "data", "code-executor")), false);
+      assert.deepEqual(await readFile(path.join(fixture.snapshotDirectory, "data", "fixture-data.json")), rootBytes);
+      await assertRecoveryCompleted(fixture, invokeRecovery(fixture));
+      assert.deepEqual(await readFile(artifactPath), artifact);
+      assert.deepEqual(await readFile(rootPath), rootBytes);
+    },
+  );
+}
+
+for (const invalidKind of ["wrong case", "file", "junction", "snapshot directory"]) {
+  test(
+    "RecoverFailedShutdown rejects code-executor " + invalidKind + " before termination",
+    { skip: WINDOWS_MANAGER_SKIP },
+    async (t) => {
+      const fixture = await prepareFailedShutdownRecovery(t);
+      const component = path.join(fixture.root, "data", "code-executor");
+      if (invalidKind === "wrong case") await mkdir(path.join(fixture.root, "data", "Code-Executor"));
+      if (invalidKind === "file") await writeFile(component, "invalid component file\n");
+      if (invalidKind === "junction") {
+        const target = path.join(fixture.root, "executor-junction-target");
+        await mkdir(target);
+        await symlink(target, component, "junction");
+      }
+      if (invalidKind === "snapshot directory") await mkdir(path.join(fixture.snapshotDirectory, "data", "code-executor"));
+      await assertRecoveryRejectedBeforeKill(fixture, invokeRecovery(fixture));
+    },
+  );
+}
+
+for (const variant of ["recover", "late-terminal", "changed-request"]) {
+  test(`interrupted shutdown with authenticated request and missing terminal: ${variant}`,
+    { skip: WINDOWS_MANAGER_SKIP }, async t => {
+      const fixture = await createUnexpectedExitRecoveryFixture(t, {prepare:false});
+      const receipt = {schemaVersion:1, phase:"requested", status:"unknown", processId:fixture.state.processId,
+        instanceId:fixture.state.instanceId, startIdentity:fixture.state.startIdentity,
+        atUnixMilliseconds:String(Date.now()), errorCode:null, hmac:""};
+      receipt.hmac = signFixtureDocument(fixture.state.controlToken, receiptPayload(receipt));
+      const original = JSON.stringify(receipt) + "\n";
+      await writeFile(fixture.requestedPath, original);
+      const prepared = invokeManager(fixture.root, "PrepareFailedShutdownRecovery", 10);
+      assert.equal(prepared.status, 0, prepared.stderr + prepared.stdout);
+      fixture.snapshotId = prepared.stdout.match(/shutdown-failure-[0-9]{8}-[0-9]{6}-[a-f0-9]{32}/u)?.[0];
+      assert.equal(typeof fixture.snapshotId, "string");
+      fixture.snapshotDirectory = path.join(fixture.runtime.runtimeDirectory, "recovery-snapshots", fixture.snapshotId);
+      const manifest = JSON.parse(await readFile(path.join(fixture.snapshotDirectory,"manifest.json"),"utf8"));
+      assert.equal(manifest.reason, "managed_shutdown_exit_without_terminal");
+      assert.equal(await readFile(fixture.requestedPath,"utf8"),original);
+      assert.equal(await fileExists(fixture.terminalPath),false);
+      if (variant === "late-terminal") await writeFile(fixture.terminalPath, '{"late":true}\n');
+      if (variant === "changed-request") await writeSignedReceipt(fixture,"requested",r=>({...r,atUnixMilliseconds:String(Date.now()+1)}));
+      const result = invokeRecovery(fixture);
+      if (variant !== "recover") {
+        assert.notEqual(result.status,0,result.stdout);
+        assert.equal(await fileExists(fixture.controlPath),true);
+        assert.equal(await fileExists(fixture.requestedPath),true);
+        return;
+      }
+      await assertRecoveryCompleted(fixture,result);
+      const incident = await onlyRecoveryIncident(fixture);
+      assert.equal(await readFile(path.join(incident.directory,"requested-receipt.json"),"utf8"),original);
+      assert.equal(await fileExists(path.join(incident.directory,"terminal-receipt.json")),false);
+      const record = JSON.parse(await readFile(incident.recordPath,"utf8"));
+      assert.equal(record.sourceHashes.requestedReceipt,createHash("sha256").update(original).digest("hex"));
+      assert.equal(record.state,"recovered");
+    });
+}

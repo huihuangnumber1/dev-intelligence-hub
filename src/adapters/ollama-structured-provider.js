@@ -1,3 +1,4 @@
+import { currentTaskExecution } from "../lib/task-execution-context.js";
 import {
   normalizeAbortSignal,
   runStructuredProviderRequest,
@@ -273,6 +274,7 @@ export class OllamaStructuredProvider {
       operation: async () => {
         let response;
         try {
+          currentTaskExecution()?.reportModelState?.("running");
           response = await this.#fetch(this.#requestUrl, {
             method: "POST",
             redirect: "error",

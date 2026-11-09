@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 import { GitObjectSnapshotter } from "../src/adapters/git-object-snapshotter.js";
 
@@ -28,14 +29,7 @@ function locateGit() {
   const candidate = result.stdout.split(/\r?\n/u).find(Boolean);
   if (!candidate || !path.isAbsolute(candidate)) return null;
   if (process.platform !== "win32") return path.resolve(candidate);
-  const installationRoot = path.dirname(path.dirname(candidate));
-  const implementation = path.join(
-    installationRoot,
-    "mingw64",
-    "bin",
-    "git.exe",
-  );
-  return existsSync(implementation) ? path.resolve(implementation) : null;
+  return windowsGitImplementationCandidates(candidate).find(existsSync) ?? null;
 }
 
 async function git(gitCommand, cwd, args) {
@@ -53,6 +47,54 @@ function shellPath(value) {
 }
 
 const gitCommand = locateGit();
+
+test(
+  "real Git materialization combines multiple blob batches and a large object",
+  { skip: gitCommand === null ? "Git is unavailable" : false },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "git-object-snapshot-batches-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const repository = path.join(root, "repository");
+    const targetRoot = path.join(root, "snapshot");
+    await Promise.all([mkdir(repository), mkdir(targetRoot)]);
+    const contents = new Map();
+    for (let index = 0; index < 129; index += 1) {
+      contents.set(`file-${String(index).padStart(3, "0")}.txt`, Buffer.from(`content-${index}\n`));
+    }
+    contents.set("large.bin", Buffer.alloc(2_000_000, 0x61));
+    contents.set("duplicate.txt", contents.get("file-000.txt"));
+    await Promise.all([...contents].map(([name, content]) => writeFile(path.join(repository, name), content)));
+    await git(gitCommand, repository, ["init"]);
+    await git(gitCommand, repository, ["config", "user.name", "MyDashboard Test"]);
+    await git(gitCommand, repository, ["config", "user.email", "mydashboard@example.invalid"]);
+    await git(gitCommand, repository, ["add", "--all"]);
+    await git(gitCommand, repository, ["commit", "-m", "multi-batch baseline"]);
+    const headOid = (await git(gitCommand, repository, ["rev-parse", "HEAD"])).stdout.trim();
+    const snapshotter = new GitObjectSnapshotter({ gitCommand, limits: { maxFileBytes: 2_000_000 } });
+    const boundary = await snapshotter.preflight({ sourceRoot: repository });
+
+    const result = await snapshotter.materialize({
+      sourceRoot: repository,
+      targetRoot,
+      headOid,
+      excludePaths: [],
+      expectedBoundaryDigest: boundary.boundaryDigest,
+      expectedGitCommand: boundary.gitCommand,
+      expectedGitExecutableSha256: boundary.gitExecutableSha256,
+      expectedGitExecutableBytes: boundary.gitExecutableBytes,
+      expectedGitExecutableMode: boundary.gitExecutableMode,
+      expectedGitExecutableUid: boundary.gitExecutableUid,
+      expectedGitExecutableGid: boundary.gitExecutableGid,
+    });
+
+    assert.equal(result.headOid, headOid);
+    assert.equal(result.fileCount, contents.size);
+    assert.equal(result.totalBytes, [...contents.values()].reduce((sum, content) => sum + content.length, 0));
+    for (const [name, content] of contents) {
+      assert.deepEqual(await readFile(path.join(targetRoot, name)), content);
+    }
+  },
+);
 
 test(
   "real Git materialization stays on the sealed commit across new Head, dirty files, hooks, and filters",

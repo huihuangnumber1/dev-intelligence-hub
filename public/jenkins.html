@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jenkins 连接 · 开发智能中枢</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/jenkins.css"></head>
+<body><main class="jenkins-connection">
+<a href="/">← 返回中枢</a><p class="eyebrow">CI CONNECTION</p><h1>连接 Jenkins</h1>
+<p>让岗位自动读取本仓库的构建结果和失败日志。此连接仅用于读取指定任务，不会触发或修改 Jenkins 构建。</p>
+<form id="connection-form" method="post" action="/api/ci/jenkins/connection" autocomplete="off">
+<label for="repository">GitHub 仓库</label><input id="repository" name="repository" required placeholder="owner/repository" maxlength="256">
+<label for="build-url">一个已有构建的链接</label><input id="build-url" name="buildUrl" type="url" required placeholder="https://ci.example/job/QuickTest/123/" maxlength="2048">
+<label for="username">Jenkins 账号</label><input id="username" name="username" required autocomplete="off" maxlength="128">
+<label for="password">密码或 API Token</label><input id="password" name="password" type="password" required autocomplete="new-password" maxlength="4096">
+<p class="connection-note">凭据由当前 Windows 用户加密保存，不会写入 PR、模型上下文或应用配置。连接后，本仓库可自动读取该 Jenkins 任务的其他构建。</p>
+<button type="submit" disabled>连接并验证</button>
+</form><p id="connection-status" role="status" aria-live="polite">正在读取连接状态…</p>
+</main><script type="module" src="/jenkins.js"></script></body></html>

@@ -1,10 +1,12 @@
+import { isInternalRepairReviewEvent } from "../domain/internal-repair-review.js";
+import { brainRecoveryCode } from "./brain-recovery-intent.js";
 import {
   createWorkIntentDispatchBinding,
   LEGACY_UNKNOWN_WORK_INTENT_BINDING,
   normalizeBoundWorkIntent,
   normalizeWorkIntentDispatchBinding,
 } from "../domain/work-intent-dispatch-binding.js";
-import { createProposalDeliveryEvidenceTarget } from "../domain/delivery-evidence-contract.js";
+import { createProposalDeliveryEvidenceTarget, DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE } from "../domain/delivery-evidence-contract.js";
 import {
   createPullRequestExecutionBinding,
   normalizePullRequestExecutionBinding,
@@ -13,6 +15,7 @@ import {
 import { normalizeBoundWorkProposal } from "../domain/work-proposal-contract.js";
 import {
   normalizeCodeExecutionSource,
+  isHeadRepairExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
 import { normalizeControlledCommitEvidence } from "../domain/controlled-commit-evidence.js";
@@ -220,14 +223,20 @@ function validateDispatcherId(value) {
   return value;
 }
 
-function dispatchLimit(options) {
-  const entries = exactDataMap(options, Object.hasOwn(options, "limit") ? ["limit"] : []);
-  if (!entries) throw new TypeError("dispatchPending options are invalid");
+function dispatchOptions(options) {
+  const entries = dataMap(options);
+  if (!entries || [...entries.keys()].some((key) => !["limit", "roleId"].includes(key))) {
+    throw new TypeError("dispatchPending options are invalid");
+  }
   const limit = entries.has("limit") ? entries.get("limit") : 50;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_DISPATCH_BATCH) {
     throw new TypeError(`limit must be between 1 and ${MAX_DISPATCH_BATCH}`);
   }
-  return limit;
+  const roleId = entries.has("roleId") ? entries.get("roleId") : null;
+  if (entries.has("roleId") && (typeof roleId !== "string" || !SAFE_ROLE_ID.test(roleId))) {
+    throw new TypeError("roleId is invalid");
+  }
+  return { limit, roleId };
 }
 
 function normalizedTimestamp(value) {
@@ -457,6 +466,14 @@ function evidenceTargetFor(item, requester, intent) {
   ].includes(intent.type)) {
     return null;
   }
+  if (
+    intent.type === "propose_code_action" &&
+    intent.operation === "inspect" &&
+    intent.deliverableId === undefined &&
+    currentWorkItemInputBinding(item) !== null
+  ) {
+    return null;
+  }
   const contract = item?.graph?.acceptanceContracts?.at(-1);
   if (
     contract === undefined ||
@@ -496,10 +513,12 @@ function conflictPreparationRequirement(item, intent, inputBinding) {
   const payload = dataMap(event?.get("payload"));
   const dirty = payload?.get("mergeStateStatus") === "DIRTY";
   const resolveConflict = payload?.get("nextAction") === "resolve_conflict";
+  const ownerConflict = resolveConflict && event?.get("eventType") === "pull_request.owner_requested" &&
+    dataMap(event.get("source"))?.get("provider") === "local-owner";
   if (!dirty && !resolveConflict) return "none";
   if (
-    dirty !== resolveConflict ||
-    !ACTIVE_PULL_REQUEST_EVENTS.has(event?.get("eventType")) ||
+    (!ownerConflict && dirty !== resolveConflict) ||
+    (!ownerConflict && !ACTIVE_PULL_REQUEST_EVENTS.has(event?.get("eventType"))) ||
     inputBinding === null ||
     inputBinding.schemaVersion !== 2
   ) {
@@ -901,6 +920,7 @@ function attentionRequest(claimed, item, bound) {
       { label: "来源事件", value: sourceContext(currentWorkItemEvent(item)) },
     ],
     choices: payload.get("choices"),
+    ...(Object.hasOwn(claimed, "brainRecovery") ? { recoveryCode: brainRecoveryCode(claimed) } : {}),
   };
 }
 
@@ -939,11 +959,13 @@ export class WorkIntentDispatcher {
   #isIntentDispatchCurrent;
   #verifyInputAuthority;
   #prepareConflictExecutionSource;
+  #prepareReviewRepairSource;
   #verifyControlledCommitEvidence;
   #clock;
   #dispatcherId;
   #leaseDurationMs;
   #retryDelayMs;
+  #readInternalReviewHandoff;
 
   constructor({
     ledger,
@@ -951,6 +973,7 @@ export class WorkIntentDispatcher {
     attentionProducer,
     proposalProducer,
     conflictExecutionSourcePreparer,
+    reviewRepairSourcePreparer,
     controlledCommitEvidenceReader,
     actionAdmissionGate,
     clock = () => new Date(),
@@ -962,6 +985,8 @@ export class WorkIntentDispatcher {
       typeof ledger?.verifyPullRequestExecutionBinding === "function"
         ? ledger.verifyPullRequestExecutionBinding.bind(ledger)
         : null;
+    this.#readInternalReviewHandoff = typeof ledger?.readInternalReviewHandoff === "function"
+      ? ledger.readInternalReviewHandoff.bind(ledger) : null;
     this.#ledger = validateDependency(
       ledger,
       [
@@ -992,6 +1017,9 @@ export class WorkIntentDispatcher {
       ["prepare"],
       "conflictExecutionSourcePreparer",
     )?.prepare ?? null;
+    this.#prepareReviewRepairSource = optionalDependency(
+      reviewRepairSourcePreparer, ["prepare"], "reviewRepairSourcePreparer",
+    )?.prepare ?? null;
     this.#verifyControlledCommitEvidence = optionalDependency(
       controlledCommitEvidenceReader,
       ["verify"],
@@ -1006,9 +1034,9 @@ export class WorkIntentDispatcher {
   }
 
   async dispatchPending(options = {}) {
-    const limit = dispatchLimit(options);
+    const { limit, roleId } = dispatchOptions(options);
     const now = this.#now();
-    const { candidates, quarantined } = await this.#eligibleOutbox(now, limit);
+    const { candidates, quarantined } = await this.#eligibleOutbox(now, limit, roleId);
     const result = emptyResult(candidates.length + quarantined.length);
     for (const candidate of quarantined) {
       const isolated = bindingUncertain(
@@ -1033,7 +1061,7 @@ export class WorkIntentDispatcher {
     return result;
   }
 
-  async #eligibleOutbox(now, limit) {
+  async #eligibleOutbox(now, limit, roleId) {
     const [pending, dispatching] = await Promise.all([
       this.#readAllPages(this.#ledger.listOutbox, { status: "pending" }, "outbox"),
       this.#readAllPages(
@@ -1076,6 +1104,7 @@ export class WorkIntentDispatcher {
     const candidates = [];
     const quarantined = [];
     for (const entry of ordered) {
+      if (roleId !== null && entry.requestedBy?.roleId !== roleId) continue;
       if (hasLegacyUnknownBinding(entry)) {
         if (quarantined.length < limit) quarantined.push(entry);
       } else if (candidates.length < limit) {
@@ -1257,7 +1286,9 @@ export class WorkIntentDispatcher {
       const hasExecutionSource =
         bound.kind === "code_action_proposal" &&
         Object.hasOwn(bound.binding, "executionSource");
-      if (conflictRequirement === "required") {
+      if (conflictRequirement === "required" ||
+          (hasExecutionSource && bound.binding.executionSource.kind === "conflict_preparation" &&
+            isInternalRepairReviewEvent(currentWorkItemEvent(item)))) {
         try {
           if (!hasExecutionSource) throw new TypeError("execution source missing");
           preparedExecutionSource(bound.binding.executionSource, inputBinding);
@@ -1267,7 +1298,7 @@ export class WorkIntentDispatcher {
             code: "conflict-binding-unsealed",
           });
         }
-      } else if (hasExecutionSource) {
+      } else if (hasExecutionSource && !isHeadRepairExecutionSource(bound.binding.executionSource)) {
         return this.#ackFailure(claimed, item, {
           nextStatus: "blocked",
           code: "conflict-source-unexpected",
@@ -1305,6 +1336,18 @@ export class WorkIntentDispatcher {
           };
         }
       }
+      if (executionSource === undefined && conflictRequirement !== "required" && this.#prepareReviewRepairSource !== null) {
+        try {
+          executionSource = await this.#admitAction(() => this.#prepareReviewRepairSource({
+            item, inputBinding, intent: claimed.intent, roleId: requester.roleId,
+          }));
+        } catch (error) {
+          const code = ownErrorCode(error);
+          if (!['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE', 'OWN_PR_CONFLICT_SOURCE_NOT_READY'].includes(code)) throw error;
+          return this.#ackFailure(claimed, item, { nextStatus: 'retry_wait',
+            code: code === 'OWN_PR_CONFLICT_SOURCE_NOT_READY' ? 'conflict-source-unavailable' : 'ci-source-unavailable' });
+        }
+      }
       let controlledCommitEvidence;
       if (isPullRequestPushIntent(claimed.intent)) {
         if (this.#verifyControlledCommitEvidence === null) {
@@ -1332,6 +1375,9 @@ export class WorkIntentDispatcher {
           );
         }
       }
+      const internalReview = this.#readInternalReviewHandoff === null || requester.roleId !== "pr-engineer" ||
+        !["propose_github_review", "propose_github_pull_request_action"].includes(claimed.intent.type) ? null
+        : await this.#readInternalReviewHandoff({ itemId: item.itemId });
       const bindingPlan = await this.#admitAction(() => {
         let plannedBound;
         try {
@@ -1347,6 +1393,7 @@ export class WorkIntentDispatcher {
               roleId: requester.roleId,
               event: currentWorkItemEvent(item),
               inputBinding,
+              ...(internalReview === null ? {} : { internalReview: true }),
               ...(executionSource === undefined ? {} : { executionSource }),
               ...(controlledCommitEvidence === undefined
                 ? {}
@@ -1373,11 +1420,13 @@ export class WorkIntentDispatcher {
           );
         } catch (error) {
           const code = ownErrorCode(error);
+          let failureCode = POLICY_BLOCK_CODES.has(code) ? "policy-denied" : "policy-binding-invalid";
+          const incompatibleDelivery = code === DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE && claimed.intent.type === "propose_code_action" &&
+            ["verify", "modify"].includes(claimed.intent.operation) && claimed.intent.deliverableId === undefined;
+          if (incompatibleDelivery) failureCode = "delivery-evidence-incompatible";
           return {
             status: "failed",
-            code: POLICY_BLOCK_CODES.has(code)
-              ? "policy-denied"
-              : "policy-binding-invalid",
+            code: failureCode,
           };
         }
         try {
@@ -1608,6 +1657,7 @@ export class WorkIntentDispatcher {
       const outcome = dataMap(bound.payload)?.get("outcome");
       return this.#ackDelivered(claimed, item, {
         nextStatus: "completed",
+        localCompletion: true,
         details: {
           resultRef: bound.intentId,
           ...(typeof outcome === "string" ? { outcome } : {}),
@@ -1636,7 +1686,7 @@ export class WorkIntentDispatcher {
     });
   }
 
-  async #ackDelivered(claimed, item, { nextStatus, details, target }) {
+  async #ackDelivered(claimed, item, { nextStatus, details, target, localCompletion = false }) {
     try {
       await this.#ledger.ackIntent({
         intentId: claimed.intentId,
@@ -1659,7 +1709,12 @@ export class WorkIntentDispatcher {
           downstreamRef: details.downstreamRef ?? details.resultRef,
         },
       };
-    } catch {
+    } catch (error) {
+      if (localCompletion && error?.code === "WORK_LEDGER_GRAPH_BLOCKED") {
+        return this.#ackFailure(claimed, item, {
+          nextStatus: "retry_wait", code: "completion-delivery-required",
+        });
+      }
       return {
         claimed: true,
         counter: "uncertain",

@@ -167,6 +167,7 @@ test("Docker profiles run pinned Node tests with a read-only, offline boundary",
   assert.equal(setup.processRunner.calls.length, 3);
   const invocation = setup.processRunner.calls[2];
   assert.equal(invocation.command.endsWith("docker.exe"), true);
+  assert.equal(invocation.args.includes("--test-reporter=tap"), true);
   assert.equal(invocation.args.includes("none"), true);
   assert.equal(invocation.args.includes("--read-only"), true);
   assert.deepEqual(
@@ -258,6 +259,7 @@ test("approved Node script assets are materialized by digest and run read-only",
   );
   assert.ok(assetMount);
   assert.equal(invocation.args.includes("--allow-fs-read=/test-library"), true);
+  assert.equal(invocation.args.includes("--test-reporter=tap"), false);
   assert.equal(invocation.args.at(-1), "/test-library/test.mjs");
   assert.equal(invocation.args.includes(source), false);
 
@@ -731,4 +733,25 @@ test("cleanup proves absence and reports containers that remain", async (t) => {
     executionId: "run-one",
     actionId: "action-one",
   });
+});
+
+test('profile readiness probes the configured Docker server and exact image without running a container', async t => {
+  const f = await fixture(t, [result({ stdout: '29.2.1' }), result({ stdout: `sha256:${'a'.repeat(64)}` })]);
+  assert.deepEqual(await f.sandbox.readProfileReadiness({ profileId: 'node-tests' }), {
+    schemaVersion: 1, profileId: 'node-tests', profileConfigDigest: f.sandbox.getProfileFingerprint('node-tests'),
+    imageId: `sha256:${'a'.repeat(64)}`,
+  });
+  assert.deepEqual(f.processRunner.calls.map(call => call.args.slice(2)), [
+    ['version', '--format', '{{.Server.Version}}'], ['image', 'inspect', '--format', '{{.Id}}', image],
+  ]);
+  assert.equal(f.processRunner.calls.some(call => call.args.includes('run')), false);
+});
+
+for (const [name, responses, code] of [
+  ['daemon unavailable', [result({ exitCode: 1 })], 'SANDBOX_UNAVAILABLE'],
+  ['image unavailable', [result({ stdout: '29.2.1' }), result({ exitCode: 1 })], 'SANDBOX_IMAGE_UNAVAILABLE'],
+]) test(`profile readiness preserves ${name}`, async t => {
+  const f = await fixture(t, responses);
+  await assert.rejects(f.sandbox.readProfileReadiness({ profileId: 'node-tests' }), { code });
+  assert.equal(f.processRunner.calls.some(call => call.args.includes('run')), false);
 });

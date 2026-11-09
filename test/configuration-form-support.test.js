@@ -306,6 +306,180 @@ function representativeConfiguration() {
   });
 }
 
+test("Windows fixed assets round-trip through the structured form without Docker identity", () => {
+  const config = structuredClone(representativeConfiguration());
+  config.codeExecutor.profiles.native = {
+    kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe",
+    nodeSha256: "a".repeat(64), timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Native regression", description: "Production assertions", version: 1, source: "throw new Error('configure assertions');" },
+  };
+  const state = createConfigurationFormState(config);
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration.codeExecutor.profiles.native, config.codeExecutor.profiles.native);
+  assert.equal(Object.hasOwn(result.configuration.codeExecutor.profiles.native, "image"), false);
+});
+
+function windowsOnlyConfiguration({ resources } = {}) {
+  const configuration = structuredClone(representativeConfiguration());
+  const profile = structuredClone(configurationStructureTemplate(["codeExecutor", "profiles"], "windows-test").value);
+  if (resources !== undefined) profile.resources = resources;
+  configuration.codeExecutor.profiles = { native: profile };
+  configuration.codeExecutor.requiredProfilesByWorkspace = Object.fromEntries(
+    configuration.codeExecutor.workspaces.map(({ id }) => [id, ["native"]]),
+  );
+  delete configuration.codeExecutor.docker;
+  return configuration;
+}
+
+function windowsResource(overrides = {}) {
+  return { name: "test-data", sourcePath: "D:/test assets/data", sha256: "b".repeat(64), kind: "directory", ...overrides };
+}
+
+test("enabled Windows-only configuration round-trips without Docker and without adding resources", () => {
+  const configuration = windowsOnlyConfiguration();
+  configuration.codeExecutor.profiles.build = configurationStructureTemplate(["codeExecutor", "profiles"], "windows-build").value;
+  assert.doesNotThrow(() => normalizeConfigurationDocument(configuration));
+  const result = configurationDocumentFromForm(createConfigurationFormState(configuration));
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration, configuration);
+  for (const profile of Object.values(result.configuration.codeExecutor.profiles)) {
+    assert.equal(Object.hasOwn(profile, "resources"), false);
+  }
+});
+
+test("enabled mixed Windows and container profiles still require Docker", () => {
+  const configuration = windowsOnlyConfiguration();
+  configuration.codeExecutor.profiles.container = configurationStructureTemplate(["codeExecutor", "profiles"]).value;
+  assert.throws(() => normalizeConfigurationDocument(configuration), /Docker/u);
+  assert.throws(() => createConfigurationFormState(configuration), /authoritative configuration constraint/iu);
+});
+
+test("Windows resource configuration supports unchanged, add, edit and delete round-trips", () => {
+  const configuration = windowsOnlyConfiguration({ resources: [windowsResource()] });
+  const initial = createConfigurationFormState(configuration);
+  assert.deepEqual(configurationDocumentFromForm(initial).configuration, configuration);
+  let state = applyConfigurationStructureOperation(initial, {
+    operation: "add", path: ["codeExecutor", "profiles", "native", "resources"],
+    value: windowsResource({ name: "settings", sourcePath: "C:\\test assets\\settings.json", kind: "file", sha256: "c".repeat(64) }),
+  });
+  state = setConfigurationFormField(state, {
+    path: ["codeExecutor", "profiles", "native", "resources", 1, "sourcePath"], kind: "text", rawValue: "D:/fixtures/settings.json",
+  });
+  state = applyConfigurationStructureOperation(state, {
+    operation: "remove", path: ["codeExecutor", "profiles", "native", "resources"], index: 0,
+  });
+  const result = configurationDocumentFromForm(state);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.configuration.codeExecutor.profiles.native.resources, [
+    windowsResource({ name: "settings", sourcePath: "D:/fixtures/settings.json", kind: "file", sha256: "c".repeat(64) }),
+  ]);
+  assert.deepEqual(normalizeConfigurationDocument(result.configuration).codeExecutor.profiles.native, result.configuration.codeExecutor.profiles.native);
+
+  const absent = createConfigurationFormState(windowsOnlyConfiguration());
+  const added = applyConfigurationStructureOperation(absent, {
+    operation: "add", path: ["codeExecutor", "profiles", "native", "resources"],
+    value: configurationStructureTemplate(["codeExecutor", "profiles", "native", "resources"]).value,
+  });
+  assert.equal(configurationDocumentFromForm(added).ok, true);
+  assert.equal(Object.hasOwn(configurationDocumentFromForm(absent).configuration.codeExecutor.profiles.native, "resources"), false);
+});
+
+test("resource insertion, replacement and deletion keep edits attached to the intended resource", () => {
+  const path = ["codeExecutor", "profiles", "native", "resources"];
+  let state = createConfigurationFormState(windowsOnlyConfiguration({ resources: [windowsResource({ name: "original" })] }));
+  state = setConfigurationFormField(state, { path: [...path, 0, "sourcePath"], kind: "text", rawValue: "D:/edited/original" });
+  state = applyConfigurationStructureOperation(state, { operation: "add", path, index: 0, value: windowsResource({ name: "inserted" }) });
+  let resources = configurationDocumentFromForm(state).configuration.codeExecutor.profiles.native.resources;
+  assert.equal(resources[0].sourcePath, "D:/test assets/data");
+  assert.equal(resources[1].sourcePath, "D:/edited/original");
+  state = applyConfigurationStructureOperation(state, { operation: "replace", path, index: 1, value: windowsResource({ name: "replacement" }) });
+  resources = configurationDocumentFromForm(state).configuration.codeExecutor.profiles.native.resources;
+  assert.equal(resources[1].sourcePath, "D:/test assets/data");
+  state = setConfigurationFormField(state, { path: [...path, 0, "sourcePath"], kind: "text", rawValue: "D:/edited/inserted" });
+  state = applyConfigurationStructureOperation(state, { operation: "remove", path, index: 0 });
+  resources = configurationDocumentFromForm(state).configuration.codeExecutor.profiles.native.resources;
+  assert.deepEqual(resources, [windowsResource({ name: "replacement" })]);
+});
+
+test("Windows resource form validation matches resource boundaries and unique names", () => {
+  const invalidResources = [
+    [windowsResource({ name: "Unsafe_name" })],
+    [windowsResource({ name: "a".repeat(65) })],
+    [windowsResource({ sourcePath: "relative/data" })],
+    [windowsResource({ sourcePath: "C:relative/data" })],
+    [windowsResource({ sourcePath: 'C:/data/"quoted"' })],
+    [windowsResource({ sha256: "g".repeat(64) })],
+    [windowsResource({ sha256: "a".repeat(63) })],
+    [windowsResource({ kind: "executable" })],
+    [windowsResource(), windowsResource({ sourcePath: "D:/other" })],
+    Array.from({ length: 17 }, (_, index) => windowsResource({ name: `data-${index}` })),
+    [windowsResource({ command: "run" })],
+  ];
+  for (const resources of invalidResources) {
+    const configuration = windowsOnlyConfiguration({ resources });
+    assert.throws(() => normalizeConfigurationDocument(configuration));
+    assert.throws(() => createConfigurationFormState(configuration));
+  }
+  const sixteen = windowsOnlyConfiguration({ resources: Array.from({ length: 16 }, (_, index) => windowsResource({ name: `data-${index}` })) });
+  assert.equal(configurationDocumentFromForm(createConfigurationFormState(sixteen)).ok, true);
+  const initial = createConfigurationFormState(windowsOnlyConfiguration({ resources: [windowsResource()] }));
+  for (const [field, rawValue] of [["name", "Unsafe_name"], ["sourcePath", "relative/path"], ["sha256", "bad"], ["kind", "executable"]]) {
+    const state = setConfigurationFormField(initial, { path: ["codeExecutor", "profiles", "native", "resources", 0, field], kind: "text", rawValue });
+    assert.equal(configurationDocumentFromForm(state).ok, false, field);
+  }
+  const duplicate = applyConfigurationStructureOperation(initial, {
+    operation: "add", path: ["codeExecutor", "profiles", "native", "resources"], value: windowsResource({ sourcePath: "D:/other" }),
+  });
+  assert.equal(configurationDocumentFromForm(duplicate).issues.some(({ code }) => code === "DUPLICATE_CONFIGURATION_ENTRY"), true);
+});
+
+test("Windows resource source paths match backend validation for additions and edits", async (t) => {
+  const cases = [
+    { sourcePath: "D:/fixtures", valid: true },
+    { sourcePath: "c:\\test assets\\fixtures", valid: true },
+    { sourcePath: "d:/fixtures\\settings.json", valid: true },
+    { sourcePath: "C:/", valid: true },
+    { sourcePath: "d:\\", valid: true },
+    { sourcePath: "//server/share/fixtures", valid: false },
+    { sourcePath: "\\\\server\\share\\fixtures", valid: false },
+    { sourcePath: "/fixtures", valid: false },
+    { sourcePath: "\\fixtures", valid: false },
+    { sourcePath: "D:/fixtures:stream", valid: false },
+    { sourcePath: "D:fixtures", valid: false },
+    { sourcePath: 'D:/fixtures/"quoted"', valid: false },
+    { sourcePath: "D:/fixtures/\u0001control", valid: false },
+  ];
+  const resourcesPath = ["codeExecutor", "profiles", "native", "resources"];
+  const sourcePathField = [...resourcesPath, 0, "sourcePath"];
+  for (const kind of ["windows-test", "windows-build"]) {
+    const configuration = windowsOnlyConfiguration({ resources: [windowsResource()] });
+    configuration.codeExecutor.profiles.native.kind = kind;
+    const initial = createConfigurationFormState(configuration);
+    for (const { sourcePath, valid } of cases) {
+      await t.test(`${kind}: ${JSON.stringify(sourcePath)}`, () => {
+        const candidate = structuredClone(configuration);
+        candidate.codeExecutor.profiles.native.resources[0].sourcePath = sourcePath;
+        if (valid) assert.doesNotThrow(() => normalizeConfigurationDocument(candidate));
+        else assert.throws(() => normalizeConfigurationDocument(candidate), { name: "ConfigurationContractError" });
+
+        const edited = setConfigurationFormField(initial, { path: sourcePathField, kind: "text", rawValue: sourcePath });
+        const added = applyConfigurationStructureOperation(initial, {
+          operation: "add", path: resourcesPath, value: windowsResource({ name: "added", sourcePath }),
+        });
+        for (const state of [edited, added]) {
+          const result = configurationDocumentFromForm(state);
+          assert.equal(result.ok, valid);
+          if (valid) assert.doesNotThrow(() => normalizeConfigurationDocument(result.configuration));
+          else assert.equal(result.issues.some(({ path, code }) => path.endsWith(".sourcePath") && code === "INVALID_CONFIGURATION_TEXT"), true);
+        }
+        if (valid) assert.doesNotThrow(() => createConfigurationFormState(candidate));
+        else assert.throws(() => createConfigurationFormState(candidate), /authoritative configuration constraint/u);
+      });
+    }
+  }
+});
+
 function configurationWithGitHeadSnapshot() {
   const configuration = structuredClone(representativeConfiguration());
   configuration.codeExecutor.gitCommand =
@@ -1801,6 +1975,46 @@ test("PR external action capabilities can be configured without editing JSON", (
   assert.equal(configurationDocumentFromForm(unknown).ok, false);
 });
 
+test("mail summary can be added, toggled and removed without altering other settings", () => {
+  const configuration = representativeConfiguration();
+  const initial = createConfigurationFormState(configuration);
+  const path = ["dingtalk", "mailEnabled"];
+  const added = applyConfigurationStructureOperation(initial, { operation: "add", path, value: false });
+  const enabled = setConfigurationFormField(added, { path, kind: "boolean", rawValue: true });
+  assert.equal(configurationDocumentFromForm(enabled).configuration.dingtalk.mailEnabled, true);
+  const disabled = setConfigurationFormField(enabled, { path, kind: "boolean", rawValue: false });
+  assert.equal(configurationDocumentFromForm(disabled).configuration.dingtalk.mailEnabled, false);
+  const removed = applyConfigurationStructureOperation(disabled, { operation: "remove", path });
+  assert.deepEqual(configurationDocumentFromForm(removed).configuration, configuration);
+  assert.equal(configurationFieldDescriptor(path, false).control, "checkbox");
+});
+
+test("own PR repair can be added, toggled and removed without granting generic push", () => {
+  const configuration = structuredClone(representativeConfiguration());
+  delete configuration.githubActions.automaticOwnPrRepair;
+  const initial = createConfigurationFormState(configuration);
+  const path = ["githubActions", "automaticOwnPrRepair"];
+  const added = applyConfigurationStructureOperation(initial, {
+    operation: "add", path, value: false,
+  });
+  const replaced = applyConfigurationStructureOperation(added, {
+    operation: "replace", path, value: true,
+  });
+  const enabled = configurationDocumentFromForm(replaced);
+  assert.equal(enabled.ok, true);
+  assert.equal(normalizeConfigurationDocument(enabled.configuration).githubActions.automaticOwnPrRepair, true);
+  assert.deepEqual(enabled.configuration.githubActions.enabledActions, configuration.githubActions.enabledActions);
+
+  const toggled = setConfigurationFormField(replaced, {
+    path, kind: "boolean", rawValue: false,
+  });
+  assert.equal(configurationDocumentFromForm(toggled).configuration.githubActions.automaticOwnPrRepair, false);
+  const removed = applyConfigurationStructureOperation(toggled, { operation: "remove", path });
+  const restored = configurationDocumentFromForm(removed);
+  assert.equal(restored.ok, true);
+  assert.deepEqual(normalizeConfigurationDocument(restored.configuration), configuration);
+});
+
 test("structured operation boundary rejects getters, aliases, prototypes and disallowed paths", () => {
   const initial = createConfigurationFormState(representativeConfiguration());
   let getterCalled = false;
@@ -1950,6 +2164,30 @@ test("provider, role, workspace and profile support add, replace and remove", ()
   assert.equal(state.dirty, true);
 });
 
+test("profile form rejects IDs outside the sandbox boundary", () => {
+  const initial = createConfigurationFormState(representativeConfiguration());
+  for (const id of ["node_test", "node.test", "a".repeat(65)]) {
+    assert.throws(() => applyConfigurationStructureOperation(initial, {
+      operation: "add",
+      path: ["codeExecutor", "profiles"],
+      key: id,
+      value: configurationStructureTemplate(["codeExecutor", "profiles"]).value,
+    }));
+    const edited = setConfigurationFormField(initial, {
+      path: ["codeExecutor", "requiredProfilesByWorkspace", "dashboard", 0],
+      kind: "text",
+      rawValue: id,
+    });
+    const result = configurationDocumentFromForm(edited);
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.issues.some((issue) => issue.path?.includes("requiredProfilesByWorkspace")),
+      true,
+      JSON.stringify(result.issues),
+    );
+  }
+});
+
 test("the Responses provider variant materializes as a closed structured configuration", () => {
   const initial = createConfigurationFormState(representativeConfiguration());
   const template = configurationStructureTemplate(
@@ -2038,9 +2276,24 @@ test("CLI credential mode is added structurally without rewriting legacy provide
   assert.equal(result.ok, true);
   assert.equal(result.configuration.brainProviders["legacy-cli"].credentialMode, "api-key");
 
+  const nativeState = setConfigurationFormField(state, {
+    path: ["brainProviders", "legacy-cli", "credentialMode"],
+    kind: "text",
+    rawValue: "codex-native-login",
+  });
+  const native = configurationDocumentFromForm(nativeState);
+  assert.equal(native.ok, true);
+  assert.equal(native.configuration.brainProviders["legacy-cli"].credentialMode, "codex-native-login");
+  assert.doesNotThrow(() => normalizeConfigurationDocument(native.configuration));
+  assert.equal(
+    Object.hasOwn(configurationDocumentFromForm(initial).configuration.brainProviders["legacy-cli"], "credentialMode"),
+    false,
+  );
+
   for (const [kind, credentialMode] of [
     ["codex-cli", "unsupported"],
     ["claude-cli", "codex-login"],
+    ["claude-cli", "codex-native-login"],
     ["ollama", "api-key"],
   ]) {
     const invalid = structuredClone(configuration);

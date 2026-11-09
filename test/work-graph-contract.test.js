@@ -9,6 +9,7 @@ import {
   getBlockedWorkGraphTasks,
   getParallelReadyWorkGraphTaskIds,
   getReadyWorkGraphTaskIds,
+  normalizeWorkGraphDelivery,
   normalizeWorkGraphSnapshot,
   validateWorkGraphTransition,
 } from "../src/domain/work-graph-contract.js";
@@ -81,6 +82,70 @@ function draft(tasks, overrides = {}) {
 function hasCode(code) {
   return (error) => error instanceof WorkGraphError && error.code === code;
 }
+
+test("delivery summaries preserve multiline Chinese Markdown and existing ASCII reports", () => {
+  for (const summary of [
+    "Implementation and tests are complete",
+    "  ## 复审结果\n\n- 当前 Head 已核对\r\n\t证据：完整差异和原始反馈\r保留产品验证限制  ",
+  ]) {
+    const normalized = normalizeWorkGraphDelivery(delivery({ summary }));
+    assert.equal(normalized.summary, summary);
+    assert.ok(Object.isFrozen(normalized));
+    const snapshot = createWorkGraphSnapshot(
+      draft([task("review", { revision: 2, deliveries: [normalized] })]),
+    );
+    const restored = normalizeWorkGraphSnapshot(JSON.parse(JSON.stringify(snapshot)));
+    assert.deepEqual(restored, snapshot);
+    assert.equal(restored.tasks[0].deliveries[0].summary, summary);
+  }
+});
+
+test("delivery summaries keep the UTF-8 byte limit and reject non-prose controls", () => {
+  for (const summary of ["x".repeat(16_384), `${"审".repeat(5_461)}\n`]) {
+    assert.equal(Buffer.byteLength(summary, "utf8"), 16_384);
+    assert.equal(normalizeWorkGraphDelivery(delivery({ summary })).summary, summary);
+    assert.throws(
+      () => normalizeWorkGraphDelivery(delivery({ summary: `${summary}x` })),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+  }
+  for (const code of [...Array(32).keys(), 127]) {
+    if ([9, 10, 13].includes(code)) continue;
+    assert.throws(
+      () => normalizeWorkGraphDelivery(delivery({ summary: `Review${String.fromCharCode(code)}complete` })),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+  }
+  for (const summary of ["", " \r\n\t ", null, 42]) {
+    assert.throws(
+      () => normalizeWorkGraphDelivery(delivery({ summary })),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+  }
+});
+
+test("prose delivery formatting does not relax graph identifiers or other text fields", () => {
+  for (const control of ["\n", "\r", "\t"]) {
+    assert.throws(
+      () => normalizeWorkGraphDelivery(delivery({ deliverableId: `review${control}report` })),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+    assert.throws(
+      () => createWorkGraphSnapshot(draft([task("review", {
+        responsibility: responsibility(`PR${control}reviewer`),
+      })])),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+    assert.throws(
+      () => createWorkGraphSnapshot(draft([task("review", {
+        acceptanceContracts: [contract({ acceptanceCriteria: [
+          { criterionId: "review", description: `Review${control}complete` },
+        ] })],
+      })])),
+      hasCode("WORK_GRAPH_INVALID"),
+    );
+  }
+});
 
 test("creates a deterministic schema v1 snapshot without retaining caller data", () => {
   const input = draft([

@@ -13,6 +13,7 @@ import { StateStore } from "../src/lib/state-store.js";
 import { CodeExecutionJournal } from "../src/services/code-execution-journal.js";
 import { CodeJobStore } from "../src/services/code-job-store.js";
 import { CodeJobWorkerService } from "../src/services/code-job-worker-service.js";
+import { ObsoleteCodeJobSettler } from "../src/services/obsolete-code-job-settler.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
 import { ControlledCodeExecutor } from "../src/services/controlled-code-executor.js";
 
@@ -262,17 +263,25 @@ test("cancelling an admitted unknown write discards it without resume and surviv
   assert.equal(await readFile(isolatedFile, "utf8"), ISOLATED_CONTENT);
   assert.equal(await readFile(sourceFile, "utf8"), SOURCE_CONTENT);
 
-  const cancelling = await jobs.cancel({
-    jobId,
-    expectedRevision: unknown.revision,
-    reason: "Discard the uncertain isolated write",
+  let cancellationRequests = 0;
+  const settler = new ObsoleteCodeJobSettler({
+    codeJobReader: jobs,
+    codeJobControl: { cancel: (request) => {
+      cancellationRequests += 1;
+      return jobs.cancel(request);
+    } },
   });
-  assert.equal(cancelling.job.status, "cancelling");
+  const settlementInput = { grant: approval().grant, receipt: { id: jobId, createdAt: created.job.createdAt } };
+  assert.equal((await settler.settle(settlementInput)).status, "cancelling");
+  assert.equal((await settler.settle(settlementInput)).status, "cancelling");
+  assert.equal(cancellationRequests, 1);
 
   const cancelledCycle = await worker.runCycle();
   assert.equal(cancelledCycle.outcomes[0].status, "cancelled");
   const cancelled = await jobs.getForWorker(jobId);
   assert.equal(cancelled.status, "cancelled");
+  assert.equal((await settler.settle(settlementInput)).status, "cancelled");
+  assert.equal(cancellationRequests, 1);
   assert.equal(cancelled.execution.pendingAction, null);
   assert.equal(cancelled.execution.actionAdmission, null);
   assert.equal(cancelled.execution.uncertainty, null);

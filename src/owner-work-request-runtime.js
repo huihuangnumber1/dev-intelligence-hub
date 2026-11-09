@@ -17,6 +17,7 @@ export async function createOwnerWorkRequestRuntime({
   roleReadiness,
   capabilityReadiness,
   pullRequestResolver,
+  incomingReviewReader,
   actionAdmissionGate,
   operationQueue,
   clock,
@@ -67,6 +68,7 @@ export async function createOwnerWorkRequestRuntime({
       roleReadiness,
       ...(capabilityReadiness === undefined ? {} : { capabilityReadiness }),
       ...(pullRequestResolver === undefined ? {} : { pullRequestResolver }),
+      ...(incomingReviewReader === undefined ? {} : { incomingReviewReader }),
       exclusiveLease: guard,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
       ...(operationQueue === undefined ? {} : { operationQueue }),
@@ -75,9 +77,12 @@ export async function createOwnerWorkRequestRuntime({
     await service.recover();
     return Object.freeze({
       submit: (request, options) => admit(() => service.submit(request, options)),
+      submitInternalReview: (request, options) => admit(() => service.submitInternalReview(request, options)),
       get: (requestId) => admit(() => service.get(requestId)),
       list: (options) => admit(() => service.list(options)),
       resumePending: () => admit(() => service.resumePending()),
+      refreshBlockedPullRequestSources: options => admit(() => service.refreshBlockedPullRequestSources(options)),
+      verifyAutomaticReviewContinuation: binding => admit(() => service.verifyAutomaticReviewContinuation(binding)),
       close,
     });
   } catch (error) {
@@ -118,10 +123,15 @@ export function createLazyOwnerWorkRequestRuntime(factory) {
   };
   return Object.freeze({
     submit: async (...arguments_) => (await resolve()).submit(...arguments_),
+    submitInternalReview: async (...arguments_) => (await resolve()).submitInternalReview(...arguments_),
     get: async (...arguments_) => (await resolve()).get(...arguments_),
     list: async (...arguments_) => (await resolve()).list(...arguments_),
     resumePending: async (...arguments_) =>
       (await resolve()).resumePending(...arguments_),
+    refreshBlockedPullRequestSources: async (...arguments_) =>
+      (await resolve()).refreshBlockedPullRequestSources(...arguments_),
+    verifyAutomaticReviewContinuation: async (...arguments_) =>
+      (await resolve()).verifyAutomaticReviewContinuation(...arguments_),
     async close() {
       closed = true;
       if (runtimePromise === null) return;

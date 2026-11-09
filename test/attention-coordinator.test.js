@@ -26,6 +26,18 @@ function internalItem() {
   };
 }
 
+test("automatic Review activity remains visible when no human confirmation is waiting", async () => {
+  const coordinator = new AttentionCoordinator({ externalQueue: { async next() {
+    return { queueRevision: 4, pendingCount: 0, item: null,
+      automaticReviewEnabled: true, systemManagedCount: 3 };
+  } } });
+  const next = await coordinator.next();
+  assert.equal(next.item, null);
+  assert.equal(next.pendingCount, 0);
+  assert.equal(next.systemManagedCount, 3);
+  assert.equal(next.automaticReviewEnabled, true);
+});
+
 test("external authorization stays first and storage/action ports remain separate", async () => {
   let internalReads = 0;
   const coordinator = new AttentionCoordinator({

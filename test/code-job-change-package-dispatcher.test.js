@@ -10,7 +10,7 @@ import {
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   CodeJobChangePackageDispatcher,
@@ -70,17 +70,18 @@ function conflictAuthority() {
   return { inputBinding, executionSource };
 }
 
-function completedJob({ conflict = false } = {}) {
-  const authority = conflict ? conflictAuthority() : null;
+function completedJob({ conflict = false, repair = false } = {}) {
+  const authority = conflict || repair ? conflictAuthority() : null;
+  if (repair) authority.executionSource = createReviewRepairCodeExecutionSource({ inputBinding: authority.inputBinding, writablePaths: ["src"] });
   const grant = createCodeJobGrant({
-    schemaVersion: conflict ? 3 : 2,
+    schemaVersion: authority ? 3 : 2,
     proposalId: "work-intent-proposal-1",
     contentDigest: "a".repeat(64),
     policyVersion: 7,
     requestedBy: { roleId: "developer", workItemId: "work-1" },
     source: { assignmentId: "assignment-1", eventId: "event-1" },
     subject: {
-      id: conflict
+      id: authority
         ? "github:pr:acme/widgets#17"
         : "github:issue:acme/widgets#17",
       repository: "acme/widgets",
@@ -352,6 +353,33 @@ test("dispatcher exports, creates, and acknowledges each event serially", async 
       packageDigest: manifest.packageDigest,
     });
   }
+});
+
+test("an unchanged repair package does not block the following real controlled commit", async () => {
+  const first = createCodeJobChangePackageEvent({ sequence: 1, previousDigest: null, job: completedJob({ repair: true }) });
+  const second = createCodeJobChangePackageEvent({ sequence: 2, previousDigest: first.eventDigest, job: completedJob({ conflict: true }) });
+  let setup, commits = 0;
+  setup = fixture([first, second], {
+    completedChangeExporter: { async export(request) {
+      const changes = exportedChangeSet();
+      return request.sessionId === first.exportRequest.sessionId
+        ? { ...changes, workspace: { ...changes.workspace, sourceRevision: WORKSPACE_REVISION }, created: [], modified: [], deleted: [] }
+        : changes;
+    } },
+    controlledCommitDelivery: { async deliver(request) {
+      commits++;
+      assert.equal(request.eventId, second.eventId);
+      return controlledCommitReceipt(second, createChangePackage(setup.state.drafts[1]).manifest);
+    } },
+  });
+  const result = await setup.dispatcher.runCycle();
+  assert.equal(result.acknowledged, 2);
+  assert.equal(result.unchanged, 1);
+  assert.equal(result.pending, 0);
+  assert.equal(commits, 1);
+  assert.equal(setup.source.state.acknowledgements[0].noChanges, true);
+  assert.equal(setup.source.state.acknowledgements[0].controlledCommit, undefined);
+  assert.ok(setup.source.state.acknowledgements[1].controlledCommit);
 });
 
 test("dispatcher commits a schema v3 event before ack while keeping source and Git authority narrow", async () => {

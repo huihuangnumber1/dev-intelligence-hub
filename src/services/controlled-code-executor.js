@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { withPreparationCancellation, withoutPreparationCancellation, throwIfPreparationAborted,
+  isPreparationAbort } from "../lib/preparation-cancellation.js";
 import {
   ControlledCodeExecutorError,
   digestValue,
@@ -17,17 +19,19 @@ import {
   samePullRequestExecutionBinding,
 } from "../domain/pull-request-execution-binding.js";
 import { DockerSandboxError } from "../adapters/docker-test-sandbox.js";
+import { WindowsTestRunnerError } from "../adapters/windows-fixed-test-runner.js";
+import { executionIdentityKeys, executionIdentityFields, isExecutionIdentityProof } from "../domain/test-runtime-identity.js";
+import { isWindowsTestProfile } from "../domain/windows-test-profile.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { CodeExecutionJournalError } from "./code-execution-journal.js";
 
 export { ControlledCodeExecutorError };
 
 const LEGACY_SCHEMA_VERSION = 1;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 export const CONTROLLED_CODE_EXECUTOR_STATE_KEY = "code-executor-state";
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
-const IMAGE_ID = /^sha256:[a-f0-9]{64}$/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_CONTAINER_NAME = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
@@ -249,6 +253,10 @@ function isRecordedError(value, { nullable = true } = {}) {
     return false;
   }
   if (!Object.hasOwn(value, "details")) return true;
+  if (Object.hasOwn(value.details ?? {}, "origin") || Object.hasOwn(value.details ?? {}, "notExecuted")) {
+    return value.code === "SANDBOX_ABORTED" && hasExactKeys(value.details, ["origin", "notExecuted", "cleanupPending"]) &&
+      value.details.origin === "windows_fixed_prelaunch" && value.details.notExecuted === true && value.details.cleanupPending === false;
+  }
   if (!hasOnlyKeys(value.details, ERROR_DETAIL_KEYS)) return false;
   return Object.entries(value.details).every(([key, entry]) => {
     if (["cleanupPending", "truncated"].includes(key)) {
@@ -354,6 +362,8 @@ function validateAction(sessionId, action, attemptCount) {
   ) {
     invalidState();
   }
+  if (action.error?.details?.notExecuted === true && (action.type !== "run_profile" || action.status !== "failed" ||
+      action.workspaceRevisionAfter !== action.workspaceRevisionBefore)) invalidState();
   for (const [kind, reference] of Object.entries(action.outputArtifacts)) {
     if (
       !ARTIFACT_KINDS.has(kind) ||
@@ -406,7 +416,7 @@ function validateProfileState(session) {
         "attemptNumber",
         "workspaceRevision",
         "configDigest",
-        "imageId",
+        ...executionIdentityKeys(proof),
       ]) ||
       typeof proof.passed !== "boolean" ||
       !SAFE_ID.test(proof.actionId) ||
@@ -414,8 +424,8 @@ function validateProfileState(session) {
       proof.attemptNumber < 1 ||
       !isRevision(proof.workspaceRevision) ||
       !isRevision(proof.configDigest) ||
-      typeof proof.imageId !== "string" ||
-      !IMAGE_ID.test(proof.imageId)
+      !isExecutionIdentityProof(proof) ||
+      (proof.runtimeIdentity && (proof.runtimeIdentity.actionId !== proof.actionId || proof.runtimeIdentity.executionId !== attemptExecutionId(session.id, proof.attemptNumber)))
     ) {
       invalidState();
     }
@@ -676,6 +686,11 @@ function validateSession(sessionId, session) {
 }
 
 function upgradeLegacyState(value) {
+  if (isPlainRecord(value) && [1, 2].includes(value.schemaVersion) && isPlainRecord(value.sessions)) {
+    if (Object.values(value.sessions).some((session) => isPlainRecord(session?.verifiedProfiles) &&
+      Object.values(session.verifiedProfiles).some((proof) => Object.hasOwn(proof ?? {}, "runtimeIdentity")))) return value;
+    if (value.schemaVersion === 2) { value.schemaVersion = SCHEMA_VERSION; return value; }
+  }
   if (
     !isPlainRecord(value) ||
     value.schemaVersion !== LEGACY_SCHEMA_VERSION ||
@@ -974,7 +989,7 @@ function normalizeProfileConfiguration(
   return byWorkspace;
 }
 
-function attemptExecutionId(sessionId, number) {
+export function attemptExecutionId(sessionId, number) {
   const digest = digestValue({ number, sessionId }).slice(0, 24);
   return `attempt-${digest}`;
 }
@@ -1098,6 +1113,7 @@ function safeRecordedError(error, fallbackCode = "ACTION_FAILED") {
     error instanceof ControlledCodeExecutorError ||
     error instanceof CodeExecutionError ||
     error instanceof DockerSandboxError ||
+    error instanceof WindowsTestRunnerError ||
     error instanceof CodeExecutionJournalError;
   const code =
     trustedError &&
@@ -1129,6 +1145,11 @@ function safeRecordedError(error, fallbackCode = "ACTION_FAILED") {
     }
   }
   if (Object.keys(details).length) recorded.details = details;
+  if (error instanceof WindowsTestRunnerError && error.code === "SANDBOX_ABORTED" &&
+      error.details?.origin === "windows_fixed_prelaunch" && error.details.notExecuted === true && error.details.cleanupPending === false &&
+      Object.keys(error.details).length === 3) {
+    recorded.details = { ...details, origin: "windows_fixed_prelaunch", notExecuted: true };
+  }
   return recorded;
 }
 
@@ -1170,8 +1191,7 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
     typeof value.stderr !== "string" ||
     !Number.isFinite(value.durationMs) ||
     value.durationMs < 0 ||
-    typeof value.imageId !== "string" ||
-    !IMAGE_ID.test(value.imageId) ||
+    !isExecutionIdentityProof(value) ||
     typeof value.profileFingerprint !== "string" ||
     !SHA256.test(value.profileFingerprint) ||
     typeof value.timedOut !== "boolean"
@@ -1185,6 +1205,53 @@ function validateSandboxResult(value, expectedProfileFingerprint) {
     );
   }
   return value;
+}
+
+function nodeTestSummary(stdout) {
+  const lines = stdout.split(/\r?\n/u);
+  if (lines[0] !== "TAP version 13") return null;
+  const plans = lines.flatMap((line, index) =>
+    /^1\.\.(\d+)$/u.test(line) ? [index] : [],
+  );
+  if (plans.length !== 1) return null;
+  const planIndex = plans[0];
+  const rootPlan = Number(lines[planIndex].slice(3));
+  if (!Number.isSafeInteger(rootPlan)) return null;
+  const counts = {};
+  const labels = {
+    tests: "total",
+    pass: "passed",
+    fail: "failed",
+    cancelled: "cancelled",
+    skipped: "skipped",
+    todo: "todo",
+  };
+  for (const line of lines.slice(planIndex + 1)) {
+    const match = /^# (tests|pass|fail|cancelled|skipped|todo) (\d+)$/u.exec(line);
+    if (!match) continue;
+    const name = labels[match[1]];
+    const count = Number(match[2]);
+    if (Object.hasOwn(counts, name) || !Number.isSafeInteger(count)) return null;
+    counts[name] = count;
+  }
+  if (
+    Object.keys(counts).length !== 6 ||
+    counts.total < rootPlan ||
+    counts.passed + counts.failed + counts.cancelled + counts.skipped + counts.todo !== counts.total
+  ) {
+    return null;
+  }
+  return { ...counts, executed: counts.passed + counts.failed };
+}
+
+function isNodeTestSummary(value) {
+  return hasExactKeys(value, [
+    "total", "passed", "failed", "cancelled", "skipped", "todo", "executed",
+  ]) &&
+    ["total", "passed", "failed", "cancelled", "skipped", "todo", "executed"]
+      .every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0) &&
+    value.executed === value.passed + value.failed &&
+    value.total === value.executed + value.cancelled + value.skipped + value.todo;
 }
 
 function validateExecutionCreation(
@@ -1359,9 +1426,11 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
       "exitCode",
       "signal",
       "durationMs",
-      "imageId",
+      ...executionIdentityKeys(value),
+      ...(Object.hasOwn(value || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
       "profileFingerprint",
       "timedOut",
+      ...(Object.hasOwn(value || {}, "testSummary") ? ["testSummary"] : []),
     ]) ||
     value.exitCode !== 0 ||
     !(
@@ -1370,10 +1439,11 @@ function validateSandboxProofArtifact(value, expectedFingerprint) {
     ) ||
     !Number.isFinite(value.durationMs) ||
     value.durationMs < 0 ||
-    typeof value.imageId !== "string" ||
-    !IMAGE_ID.test(value.imageId) ||
+    !isExecutionIdentityProof(value) ||
+    (Object.hasOwn(value || {}, "runtimeIdentity") && !isRevision(value.workspaceRevision)) ||
     value.profileFingerprint !== expectedFingerprint ||
-    value.timedOut !== false
+    value.timedOut !== false ||
+    (Object.hasOwn(value, "testSummary") && !isNodeTestSummary(value.testSummary))
   ) {
     throw executorError("EXECUTOR_STATE_INVALID", "测试证明审计产物无效");
   }
@@ -1470,14 +1540,18 @@ function validateSucceededActionResult(session, action, input, result) {
         "exitCode",
         "signal",
         "durationMs",
-        "imageId",
+        ...executionIdentityKeys(result),
+        ...(Object.hasOwn(result || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
         "profileFingerprint",
         "timedOut",
         "stdout",
         "stderr",
+        ...(Object.hasOwn(result || {}, "testSummary") ? ["testSummary"] : []),
       ]) ||
       typeof result.stdout !== "string" ||
-      typeof result.stderr !== "string"
+      typeof result.stderr !== "string" ||
+      (Object.hasOwn(result, "testSummary") &&
+        digestValue(result.testSummary) !== digestValue(nodeTestSummary(result.stdout)))
     ) {
       invalidPersistedActionResult();
     }
@@ -1502,18 +1576,21 @@ function validateFailedActionResult(session, action, input, result) {
       "exitCode",
       "signal",
       "durationMs",
-      "imageId",
+      ...executionIdentityKeys(result),
+      ...(Object.hasOwn(result || {}, "runtimeIdentity") ? ["workspaceRevision"] : []),
       "profileFingerprint",
       "timedOut",
       "error",
       "stdout",
       "stderr",
+      ...(Object.hasOwn(result || {}, "testSummary") ? ["testSummary"] : []),
     ])
   ) {
     assertArtifactKinds(action, ["output", "stdout", "stderr"]);
     if (
-      result.exitCode === 0 ||
-      !recordedErrorsMatch(result.error, action.error)
+      !recordedErrorsMatch(result.error, action.error) ||
+      (Object.hasOwn(result, "testSummary") &&
+        digestValue(result.testSummary) !== digestValue(nodeTestSummary(result.stdout)))
     ) {
       invalidPersistedActionResult();
     }
@@ -1650,6 +1727,10 @@ export class ControlledCodeExecutor {
       profileDefinitions,
       requiredProfilesByWorkspace,
     );
+    this.profileKinds = new Map(
+      Object.entries(profileDefinitions).map(([id, definition]) => [id, definition.kind]),
+    );
+    this.profileDefinitions = structuredClone(profileDefinitions);
     validateDependency(
       sandbox,
       ["getProfileFingerprint"],
@@ -1693,16 +1774,18 @@ export class ControlledCodeExecutor {
     return recovery;
   }
 
-  start(request) {
+  start(request, options = {}) {
     let normalized;
+    let runtime;
     try {
       normalized = normalizeStartRequest(request);
+      runtime = normalizeRuntimeOptions(options);
       this.#assertReady();
     } catch (error) {
       return Promise.reject(error);
     }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
-      this.#start(normalized),
+      withPreparationCancellation(runtime.signal, () => this.#start(normalized)),
     );
   }
 
@@ -1910,16 +1993,18 @@ export class ControlledCodeExecutor {
     });
   }
 
-  resume(request) {
+  resume(request, options = {}) {
     let normalized;
+    let runtime;
     try {
       normalized = normalizeResumeRequest(request);
+      runtime = normalizeRuntimeOptions(options);
       this.#assertReady();
     } catch (error) {
       return Promise.reject(error);
     }
     return this.#queueForSession(normalized.sessionId).enqueue(() =>
-      this.#resume(normalized),
+      withPreparationCancellation(runtime.signal, () => this.#resume(normalized)),
     );
   }
 
@@ -1980,7 +2065,7 @@ export class ControlledCodeExecutor {
     }
     if (stored === MISSING_STATE) return emptyState();
     const legacy = isPlainRecord(stored) &&
-      stored.schemaVersion === LEGACY_SCHEMA_VERSION;
+      [LEGACY_SCHEMA_VERSION, 2].includes(stored.schemaVersion);
     const state = validateState(upgradeLegacyState(stored));
     if (legacy && persistLegacyUpgrade) await this.#writeState(state);
     return state;
@@ -2050,7 +2135,9 @@ export class ControlledCodeExecutor {
         }
         return { changed: false, value: { existing: true } };
       }
-      if (Object.keys(state.sessions).length >= this.limits.maxSessions) {
+      const occupied = Object.values(state.sessions).filter(session =>
+        !["completed", "failed", "cancelled"].includes(session.status) || session.cleanupFence !== null);
+      if (occupied.length >= this.limits.maxSessions) {
         throw executorError("SESSION_LIMIT", "代码执行会话数量已达上限");
       }
       const at = this.#now();
@@ -2113,7 +2200,9 @@ export class ControlledCodeExecutor {
         await this.broker.createExecution(reference),
         reference,
       );
+      throwIfPreparationAborted();
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(request.sessionId, claimed.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId: request.sessionId,
         workspaceId: request.workspaceId,
@@ -2133,6 +2222,7 @@ export class ControlledCodeExecutor {
     }
     try {
       await this.#mutateState((state) => {
+        throwIfPreparationAborted();
         const session = this.#requireSession(state, request.sessionId);
         const attempt = currentAttempt(session);
         if (
@@ -2155,6 +2245,7 @@ export class ControlledCodeExecutor {
         return {};
       });
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(request.sessionId, claimed.executionId, error);
       this.runtimeFences.add(request.sessionId);
       await this.#discardWorkspaceAttempt({
         sessionId: request.sessionId,
@@ -2165,6 +2256,35 @@ export class ControlledCodeExecutor {
       throw error;
     }
     return this.#readProjectedSession(request.sessionId);
+  }
+
+  async #abortPreparation(sessionId, executionId, error) {
+    return withoutPreparationCancellation(async () => {
+      await this.#discardWorkspaceAttempt({ sessionId,
+        workspaceId: (await this.#readProjectedSession(sessionId)).workspaceId, executionId,
+        message: "中断准备后的隔离工作区清理尚未确认" });
+      try {
+        await this.#mutateState(state => {
+          const session = this.#requireSession(state, sessionId), attempt = currentAttempt(session);
+          if (attempt.executionId !== executionId || !["preparing", "replaying"].includes(session.status)) {
+            throw executorError("EXECUTION_FENCED", "准备生命周期已变化，中断结果不能提交");
+          }
+          const at = this.#now();
+          session.status = "interrupted";
+          attempt.status = "interrupted";
+          attempt.finishedAt = at;
+          for (const replay of attempt.replays) if (replay.status === "running") {
+            replay.status = "interrupted"; replay.finishedAt = at;
+            replay.error = { code: "RESULT_UNKNOWN", message: "准备中断，恢复副本已清理" };
+            appendEvent(session, "replay_interrupted", at, replay.sourceActionId);
+          }
+          appendEvent(session, "session_interrupted", at);
+          touchSession(session, at);
+          return {};
+        });
+      } catch (stateError) { this.runtimeFences.add(sessionId); throw stateError; }
+      throw error;
+    });
   }
 
   async #markSessionFailed(
@@ -2210,7 +2330,7 @@ export class ControlledCodeExecutor {
     message,
   }) {
     try {
-      await this.broker.discardExecution({ workspaceId, executionId });
+      await withoutPreparationCancellation(() => this.broker.discardExecution({ workspaceId, executionId }));
     } catch {
       this.runtimeFences.add(sessionId);
       throw executorError("WORKSPACE_DISPOSAL_PENDING", message);
@@ -2399,7 +2519,7 @@ export class ControlledCodeExecutor {
             attemptNumber: storedAction.attemptNumber,
             workspaceRevision: outcome.workspaceRevision,
             configDigest: profile.configDigest,
-            imageId: outcome.profileResult.imageId,
+            ...executionIdentityFields(outcome.profileResult),
           };
         }
         if (action.type === "complete" && outcome.succeeded) {
@@ -2472,6 +2592,7 @@ export class ControlledCodeExecutor {
             executionId: context.executionId,
             actionId: action.actionId,
             signal,
+            ...(isWindowsTestProfile(this.profileDefinitions[action.profileId]) ? { workspaceRevision } : {}),
           });
         },
       );
@@ -2495,19 +2616,39 @@ export class ControlledCodeExecutor {
         locked.result,
         profile.configDigest,
       );
-      const succeeded = result.exitCode === 0;
+      const definition = this.profileDefinitions[action.profileId];
+      if (isWindowsTestProfile(definition) ? (
+        !result.runtimeIdentity || result.workspaceRevision !== action.expectedWorkspaceRevision ||
+        result.assetVersion !== definition.asset.version || result.verificationKind !== (definition.kind === "windows-test" ? "test" : "build") ||
+        result.runtimeIdentity.executionId !== context.executionId || result.runtimeIdentity.actionId !== action.actionId ||
+        result.runtimeIdentity.executableSha256 !== definition.nodeSha256
+      ) : Object.hasOwn(result, "runtimeIdentity")) {
+        throw executorError("SANDBOX_RESULT_INVALID", "测试执行身份或源码版本绑定无效");
+      }
+      const requiresTestCount = ["node-test", "windows-test"].includes(definition.kind);
+      const summary = requiresTestCount
+        ? nodeTestSummary(result.stdout)
+        : null;
+      const succeeded = result.exitCode === 0 && (
+        !requiresTestCount ||
+        (summary !== null && summary.passed > 0 && summary.failed === 0 && summary.cancelled === 0)
+      );
+      const auditedResult = {
+        ...result,
+        ...(summary === null ? {} : { testSummary: summary }),
+      };
       return {
         succeeded,
         workspaceRevision: locked.afterWorkspaceRevision,
-        profileResult: result,
+        profileResult: auditedResult,
         error: succeeded
           ? null
-          : { code: "TESTS_FAILED", message: "测试未通过" },
+          : { code: "TESTS_FAILED", message: "测试未通过或缺少有效通过用例" },
         result: succeeded
-          ? result
+          ? auditedResult
           : {
-              ...result,
-              error: { code: "TESTS_FAILED", message: "测试未通过" },
+              ...auditedResult,
+              error: { code: "TESTS_FAILED", message: "测试未通过或缺少有效通过用例" },
             },
       };
     }
@@ -2585,8 +2726,7 @@ export class ControlledCodeExecutor {
         proof.attemptNumber !== context.attemptNumber ||
         proof.workspaceRevision !== workspaceRevision ||
         proof.configDigest !== profile.configDigest ||
-        typeof proof.imageId !== "string" ||
-        !IMAGE_ID.test(proof.imageId)
+        !isExecutionIdentityProof(proof)
       ) {
         throw executorError("CHECKS_NOT_PASSED", "当前代码版本尚未通过全部测试");
       }
@@ -2665,8 +2805,23 @@ export class ControlledCodeExecutor {
     } catch {
       throw executorError("EXECUTION_AUDIT_INVALID", "测试证明审计产物无效");
     }
-    if (validatedOutput.imageId !== proof.imageId) {
-      throw executorError("EXECUTION_AUDIT_INVALID", "测试镜像证明不匹配");
+    if (digestValue(executionIdentityFields(validatedOutput)) !== digestValue(executionIdentityFields(proof)) ||
+      (proof.runtimeIdentity && (validatedOutput.workspaceRevision !== proof.workspaceRevision || proof.runtimeIdentity.actionId !== proof.actionId ||
+        proof.runtimeIdentity.executionId !== attemptExecutionId(context.sessionId, proof.attemptNumber)))) {
+      throw executorError("EXECUTION_AUDIT_INVALID", "测试执行身份或源码版本证明不匹配");
+    }
+    if (["node-test", "windows-test"].includes(this.profileKinds.get(profile.id))) {
+      const summary = nodeTestSummary(stdout);
+      if (
+        summary === null ||
+        summary.passed < 1 ||
+        summary.failed !== 0 ||
+        summary.cancelled !== 0 ||
+        !isNodeTestSummary(validatedOutput.testSummary) ||
+        digestValue(validatedOutput.testSummary) !== digestValue(summary)
+      ) {
+        throw executorError("EXECUTION_AUDIT_INVALID", "有效测试数证明无效");
+      }
     }
   }
 
@@ -2694,9 +2849,11 @@ export class ControlledCodeExecutor {
             exitCode: result.exitCode,
             signal: result.signal,
             durationMs: result.durationMs,
-            imageId: result.imageId,
+            ...executionIdentityFields(result),
+            ...(result.runtimeIdentity ? { workspaceRevision: result.workspaceRevision } : {}),
             profileFingerprint: result.profileFingerprint,
             timedOut: Boolean(result.timedOut),
+            ...(result.testSummary ? { testSummary: result.testSummary } : {}),
             ...(result.error ? { error: result.error } : {}),
           },
         }),
@@ -3021,7 +3178,7 @@ export class ControlledCodeExecutor {
         workspaceRevision: proof.workspaceRevision,
         actionId: proof.actionId,
         attemptNumber: proof.attemptNumber,
-        imageId: proof.imageId,
+        ...executionIdentityFields(proof),
         artifacts: {
           output: packageArtifact(action.outputArtifacts.output),
           stdout: packageArtifact(action.outputArtifacts.stdout),
@@ -3575,7 +3732,9 @@ export class ControlledCodeExecutor {
         await this.broker.createExecution(reference),
         reference,
       );
+      throwIfPreparationAborted();
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId,
         workspaceId: prepared.workspaceId,
@@ -3697,6 +3856,7 @@ export class ControlledCodeExecutor {
 
     try {
       for (const write of prepared.writes) {
+        throwIfPreparationAborted();
         const storedInput = await this.journal.readJson(write.inputArtifact);
         let action;
         try {
@@ -3789,6 +3949,7 @@ export class ControlledCodeExecutor {
           throw error;
         }
       }
+      throwIfPreparationAborted();
       const revision = await this.broker.getWorkspaceRevision({
         workspaceId: prepared.workspaceId,
         executionId: prepared.executionId,
@@ -3796,8 +3957,10 @@ export class ControlledCodeExecutor {
       if (revision !== prepared.targetWorkspaceRevision) {
         throw executorError("REPLAY_DIVERGED", "恢复后的工作区版本不一致");
       }
+      throwIfPreparationAborted();
     } catch (error) {
       if (this.runtimeFences.has(sessionId)) throw error;
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       await this.#discardWorkspaceAttempt({
         sessionId,
         workspaceId: prepared.workspaceId,
@@ -3833,6 +3996,7 @@ export class ControlledCodeExecutor {
             "执行生命周期已变化，恢复结果不能提交",
           );
         }
+        throwIfPreparationAborted();
         const at = this.#now();
         session.status = "active";
         attempt.status = "active";
@@ -3841,6 +4005,7 @@ export class ControlledCodeExecutor {
         return {};
       });
     } catch (error) {
+      if (isPreparationAbort(error)) return this.#abortPreparation(sessionId, prepared.executionId, error);
       this.runtimeFences.add(sessionId);
       await this.#discardWorkspaceAttempt({
         sessionId,

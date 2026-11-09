@@ -57,7 +57,7 @@ function parseStringToken(state, decode) {
 
 function consumeValueBudget(state, depth) {
   state.nodes += 1;
-  if (depth > MAXIMUM_DEPTH || state.nodes > MAXIMUM_NODES) {
+  if (depth > MAXIMUM_DEPTH || state.nodes > state.maximumNodes) {
     throw invalidJson();
   }
 }
@@ -73,7 +73,7 @@ function parseObject(state, depth) {
   while (state.index < state.text.length) {
     const key = parseStringToken(state, true);
     state.keys += 1;
-    if (state.keys > MAXIMUM_KEYS || keys.has(key)) throw invalidJson();
+    if (state.keys > state.maximumKeys || keys.has(key)) throw invalidJson();
     keys.add(key);
     skipWhitespace(state);
     if (state.text[state.index] !== ":") throw invalidJson();
@@ -133,9 +133,9 @@ function parseValue(state, depth) {
   state.index = NUMBER_PATTERN.lastIndex;
 }
 
-export function parseJsonWithUniqueKeys(text) {
+function parseJson(text, maximumNodes, maximumKeys) {
   if (typeof text !== "string") throw invalidJson();
-  const state = { text, index: 0, nodes: 0, keys: 0 };
+  const state = { text, index: 0, nodes: 0, keys: 0, maximumNodes, maximumKeys };
   skipWhitespace(state);
   parseValue(state, 0);
   skipWhitespace(state);
@@ -145,4 +145,15 @@ export function parseJsonWithUniqueKeys(text) {
   } catch {
     throw invalidJson();
   }
+}
+
+export function parseJsonWithUniqueKeys(text) {
+  return parseJson(text, MAXIMUM_NODES, MAXIMUM_KEYS);
+}
+
+// App-server metadata includes inherited tool schemas, unlike a model result.
+// Keep its frame budget separate so result validation remains equally strict.
+export function parseProtocolJsonWithUniqueKeys(text) {
+  if (typeof text !== "string" || Buffer.byteLength(text) > 8 * 1024 * 1024) throw invalidJson();
+  return parseJson(text, 200_000, 200_000);
 }

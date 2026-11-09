@@ -168,10 +168,19 @@ export function cloneLedgerValue(value) {
 }
 
 export function boundedLedgerString(value, name, maximumBytes = 256) {
+  return boundedLedgerTextValue(value, name, maximumBytes, CONTROL_CHARACTERS);
+}
+
+// Task prose uses the same whitespace contract as orchestration intents.
+export function boundedLedgerText(value, name, maximumBytes) {
+  return boundedLedgerTextValue(value, name, maximumBytes, /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/);
+}
+
+function boundedLedgerTextValue(value, name, maximumBytes, invalidControl) {
   if (
     typeof value !== "string" ||
     !value.trim() ||
-    CONTROL_CHARACTERS.test(value) ||
+    invalidControl.test(value) ||
     Buffer.byteLength(value, "utf8") > maximumBytes
   ) {
     throw workLedgerError("WORK_LEDGER_VALUE_INVALID", `${name} 无效`);

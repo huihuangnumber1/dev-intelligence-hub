@@ -1,3 +1,4 @@
+import { authorityLifecycleMemoryRecord } from "../domain/memory-authority-lifecycle.js";
 import { createHash } from "node:crypto";
 import {
   createWorkGraphSourceAuthority,
@@ -26,6 +27,7 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 const INVALID_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const GRAPH_BATCH_LIMIT = 100;
+const AUTHORITY_SNAPSHOT_ATTEMPTS = 2;
 const CONFIRMATION_PAGE_LIMIT = 100;
 const CONFIRMATION_MAXIMUM_ITEMS = 1_000;
 const AUTHORITY_VERIFICATION_MAXIMUM_BINDINGS = 100_000;
@@ -537,7 +539,7 @@ function normalizeMemoryAction(value, kind, message) {
     );
     const parents = strictProjectionList(commit.parents, 2, message);
     if (
-      parents.length !== 2 ||
+      ![1, 2].includes(parents.length) ||
       !SHA256.test(controlled.evidenceDigest) ||
       controlled.evidenceId !==
         `controlled-git-commit-${controlled.evidenceDigest}` ||
@@ -545,7 +547,7 @@ function normalizeMemoryAction(value, kind, message) {
       remote.repository !== inputBinding.gitTarget.headRepository ||
       remote.refName !== inputBinding.gitTarget.headRefName ||
       parents[0] !== inputBinding.gitTarget.headRefOid ||
-      parents[1] !== inputBinding.gitTarget.baseRefOid ||
+      (parents.length === 2 && parents[1] !== inputBinding.gitTarget.baseRefOid) ||
       !GIT_OID.test(commit.oid) ||
       !GIT_OID.test(commit.treeOid)
     ) {
@@ -1464,54 +1466,6 @@ function authorityProjectionEntry({
   };
 }
 
-function authorityLifecycleMemoryRecord(entry) {
-  const binding = entry.binding;
-  const authority = binding === null
-    ? {
-        applies: false,
-        current: false,
-        bindingDigest: null,
-        inputBinding: null,
-      }
-    : authorityContent(binding, false);
-  const content = {
-    memoryType: entry.sourceKind,
-    lifecycleOnly: true,
-    priorRecordId: entry.recordId,
-    reason: binding === null
-      ? "projection_state_migrated"
-      : "input_authority_superseded",
-    authority,
-  };
-  const sourceKey = `${entry.key}:authority-obsolete:${digestValue({
-    priorRecordId: entry.recordId,
-    authority,
-  })}`;
-  return {
-    schemaVersion: 1,
-    source: {
-      kind: entry.sourceKind,
-      id: `${sourceKey}:${digestValue({
-        sourceKind: entry.sourceKind,
-        sourceKey,
-        content,
-      })}`,
-    },
-    occurredAt: entry.occurredAt,
-    roleId: null,
-    repository: binding?.repository ?? null,
-    eventType: `${entry.sourceKind.replaceAll("-", "_")}.authority_obsolete`,
-    title: `${entry.sourceKind} 权威已失效`,
-    summary: binding === null
-      ? "旧投影状态已安全失效"
-      : `${binding.repository}#${binding.pullRequestNumber} · ${binding.headRefOid}`,
-    content: JSON.stringify(content),
-    evidence: [`supersedes:${entry.recordId}`],
-    tags: [entry.sourceKind, "authority_obsolete", "obsolete"],
-    sourceUrl: null,
-    subjectNumber: binding?.pullRequestNumber ?? null,
-  };
-}
 
 function normalizeGraphProjectionBatch(value) {
   const message = "task graph memory projection source batch is invalid";
@@ -1897,7 +1851,7 @@ export async function planAuthorityBoundProjectionCandidate(value) {
   for (const [key, entry] of entries) {
     if (observedKeys.has(key)) continue;
     if (entry.current !== true || entry.binding === null) {
-      if (entry.current === null) {
+      if (entry.current !== false) {
         records.push(authorityLifecycleMemoryRecord(entry));
         lifecycleInvalidations += 1;
       }
@@ -2195,14 +2149,30 @@ export class MemoryProjector {
           })
         );
     added += Number(workResult?.added) || 0;
-    const confirmationSnapshot = confirmationPreflight === null
-      ? null
-      : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
-    const authorityBound = await this.#projectAuthorityBoundRecords(
-      finalSnapshot,
-      confirmationSnapshot,
-      signal,
-    );
+    let authorityBound = null;
+    if (this.#verifyInputAuthority === null) {
+      authorityBound = await this.#projectAuthorityBoundRecords(finalSnapshot, null, signal);
+    } else {
+      for (let attempt = 1; attempt <= AUTHORITY_SNAPSHOT_ATTEMPTS; attempt++) {
+        const confirmationSnapshot = confirmationPreflight === null ? null
+          : await readConfirmationMemorySnapshot(this.#readConfirmationPage, signal);
+        // History/work projection may be long. Capture authority immediately
+        // before verification; a retry must rebuild bindings from a new read.
+        const authoritySnapshot = normalizeMemoryAuthoritySnapshot(
+          await runProjectionPort(signal, () => this.#readSnapshot({ limit: GRAPH_BATCH_LIMIT })),
+        );
+        try {
+          authorityBound = await this.#projectAuthorityBoundRecords(authoritySnapshot, confirmationSnapshot, signal);
+          break;
+        } catch (error) {
+          throwIfProjectionAborted(signal);
+          if (error?.code !== "WORK_LEDGER_MEMORY_AUTHORITY_SNAPSHOT_STALE") throw error;
+          if (attempt === AUTHORITY_SNAPSHOT_ATTEMPTS) authorityBound = {
+            status: "deferred", code: error.code, attempts: attempt, observed: 0, added: 0,
+          };
+        }
+      }
+    }
     throwIfProjectionAborted(signal);
     added += authorityBound?.added ?? 0;
     return {

@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { admissionEntityKeyForRequest, normalizeAdmissionEntityKey } from "../lib/model-admission-identity.js";
 import { normalizeSessionKey } from "../lib/session-key.js";
+import { isCodeReadContext } from "../lib/code-read-context.js";
+import { isCodeExecutionContext } from "../lib/code-execution-context.js";
 
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
 const DATA_CLASSES = Object.freeze(["requirements", "code", "memory"]);
+const EXTENDED_DATA_CLASSES = Object.freeze([...DATA_CLASSES, "dingtalk"]);
 const REASONING_EFFORTS = new Set([
   "low",
   "medium",
@@ -79,12 +84,22 @@ function safeModel(value) {
 }
 
 function normalizeRemoteData(value) {
-  const normalized = exactData(value, DATA_CLASSES, "brain.remoteData");
-  if (DATA_CLASSES.some((name) => typeof normalized[name] !== "boolean")) {
+  const entries = dataEntries(value, "brain.remoteData");
+  const keys = new Set(entries.map(([key]) => key));
+  const isLegacyShape = DATA_CLASSES.length === keys.size && DATA_CLASSES.every((key) => keys.has(key));
+  const isExtendedShape = EXTENDED_DATA_CLASSES.length === keys.size && EXTENDED_DATA_CLASSES.every((key) => keys.has(key));
+  if (!isLegacyShape && !isExtendedShape) {
+    throw new TypeError("brain.remoteData is invalid");
+  }
+  const normalized = {
+    ...Object.fromEntries(entries),
+    dingtalk: isExtendedShape ? Object.fromEntries(entries).dingtalk : false,
+  };
+  if (EXTENDED_DATA_CLASSES.some((name) => typeof normalized[name] !== "boolean")) {
     throw new TypeError("brain.remoteData is invalid");
   }
   return Object.freeze(
-    Object.fromEntries(DATA_CLASSES.map((name) => [name, normalized[name]])),
+    Object.fromEntries(EXTENDED_DATA_CLASSES.map((name) => [name, normalized[name]])),
   );
 }
 
@@ -121,7 +136,7 @@ function normalizeDataClasses(value = []) {
     !Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Array.prototype ||
     Reflect.ownKeys(value).length !== value.length + 1 ||
-    value.some((entry) => !DATA_CLASSES.includes(entry)) ||
+    value.some((entry) => !EXTENDED_DATA_CLASSES.includes(entry)) ||
     new Set(value).size !== value.length
   ) {
     throw new TypeError("dataClasses are invalid");
@@ -145,6 +160,10 @@ function normalizeProvider(value) {
     "singleAttempt",
   );
   const availability = value.checkAvailability;
+  const admission = value.withAdmission;
+  const quiescence = value.withEntityQuiescence;
+  if (quiescence !== undefined && typeof quiescence !== 'function') throw new TypeError('brain provider quiescence is invalid');
+  if (admission !== undefined && typeof admission !== 'function') throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -161,16 +180,51 @@ function normalizeProvider(value) {
   ) {
     throw new TypeError("brain provider is invalid");
   }
+  if (
+    value.supportsEntitySessions === true &&
+    (typeof value.sessionIsolationKey !== "string" ||
+      !value.sessionIsolationKey.trim() ||
+      INVALID_CONTROL.test(value.sessionIsolationKey) ||
+      Buffer.byteLength(value.sessionIsolationKey, "utf8") > 128)
+  ) {
+    throw new TypeError("brain provider session isolation key is invalid");
+  }
   return Object.freeze({
     id,
     remote: value.remote,
     singleAttempt: attemptDescriptor?.value === true,
     supportsEntitySessions: value.supportsEntitySessions === true,
+    supportsReviewReading: value.supportsReviewReading === true,
+    supportsCodeReading: value.supportsCodeReading === true,
+    supportsCodeExecution: value.supportsCodeExecution === true,
+    supportsNativeReviewSkills: value.supportsNativeReviewSkills === true,
+    ...(value.supportsEntitySessions === true
+      ? { sessionIsolationKey: value.sessionIsolationKey }
+      : {}),
     generate: value.generate.bind(value),
+    ...(admission ? {withAdmission:admission.bind(value)} : {}),
+    ...(quiescence ? {withEntityQuiescence:quiescence.bind(value)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(value) }
       : {}),
   });
+}
+
+function authorizedSessionKey(entityKey, provider, brain, dataClasses) {
+  // Every turn under this key has the same authorization and classified input
+  // set. Thus the union of all prior turns' classes remains authorized. A
+  // versioned key also leaves older, unattested entity archives untouched.
+  const scope = JSON.stringify([
+    normalizeSessionKey(entityKey),
+    provider.id,
+    provider.sessionIsolationKey,
+    brain.model,
+    brain.reasoningEffort ?? null,
+    provider.remote,
+    DATA_CLASSES.map((name) => brain.remoteData[name]),
+    EXTENDED_DATA_CLASSES.filter((name) => dataClasses.includes(name)),
+  ]);
+  return `auth-v2:${createHash("sha256").update(scope, "utf8").digest("hex")}`;
 }
 
 function frozenDescription(provider, brain) {
@@ -181,8 +235,17 @@ function frozenDescription(provider, brain) {
       ? { reasoningEffort: brain.reasoningEffort }
       : {}),
     remote: provider.remote,
-    remoteData: Object.freeze({ ...brain.remoteData }),
+    remoteData: Object.freeze({
+      requirements: brain.remoteData.requirements,
+      code: brain.remoteData.code,
+      memory: brain.remoteData.memory,
+      ...(brain.remoteData.dingtalk ? { dingtalk: true } : {}),
+    }),
     ...(provider.singleAttempt ? { singleAttempt: true } : {}),
+    ...(provider.supportsReviewReading ? { supportsReviewReading: true } : {}),
+    ...(provider.supportsCodeReading ? { supportsCodeReading: true } : {}),
+    ...(provider.supportsCodeExecution ? { supportsCodeExecution: true } : {}),
+    ...(provider.supportsNativeReviewSkills ? { supportsNativeReviewSkills: true } : {}),
   });
 }
 
@@ -213,11 +276,32 @@ export class BrainRouter {
     schema,
     dataClasses = [],
     sessionKey: sessionKeyValue = null,
+    admissionEntityKey: admissionEntityKeyValue = null,
     signal = null,
+    reviewTarget = null,
+    codeReadContext = null,
+    codeExecutionContext = null,
   } = {}) {
     const brain = normalizeBrainConfig(brainValue);
     const provider = this.#provider(brain.provider);
     const classes = normalizeDataClasses(dataClasses);
+    if (reviewTarget !== null && !classes.includes("code")) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "PR reading requires code classification", 403);
+    }
+    if (codeReadContext !== null &&
+        (!isCodeReadContext(codeReadContext) || !classes.includes("code"))) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "Code reading requires trusted code classification", 403);
+    }
+    if (codeExecutionContext !== null &&
+        (!isCodeExecutionContext(codeExecutionContext) || !classes.includes("code") || reviewTarget !== null || codeReadContext !== null)) {
+      throw routerError("REMOTE_DATA_CLASSIFICATION_REQUIRED", "Code execution requires a trusted isolated code context", 403);
+    }
+    if (codeReadContext !== null && !provider.supportsCodeReading) {
+      throw routerError("CODE_READING_UNAVAILABLE", "Brain does not support controlled code reading", 503);
+    }
+    if (codeExecutionContext !== null && !provider.supportsCodeExecution) {
+      throw routerError("CODE_EXECUTION_UNAVAILABLE", "Brain does not support continuous controlled code execution", 503);
+    }
     const requestSignal = normalizeAbortSignal(signal);
     if (requestSignal?.aborted) {
       throw routerError(
@@ -243,6 +327,9 @@ export class BrainRouter {
         );
       }
     }
+    const admissionEntityKey = provider.withAdmission ? admissionEntityKeyForRequest({
+      admissionEntityKey: admissionEntityKeyValue, sessionKey: sessionKeyValue, reviewTarget,
+    }) : null;
     return provider.generate({
       model: brain.model,
       ...(brain.reasoningEffort
@@ -250,9 +337,13 @@ export class BrainRouter {
         : {}),
       messages,
       schema,
+      ...(reviewTarget !== null && provider.supportsReviewReading ? { reviewTarget } : {}),
+      ...(codeReadContext === null ? {} : { codeReadContext }),
+      ...(codeExecutionContext === null ? {} : { codeExecutionContext }),
+      ...(admissionEntityKey === null ? {} : { admissionEntityKey }),
       ...(sessionKeyValue === null || !provider.supportsEntitySessions
         ? {}
-        : { sessionKey: normalizeSessionKey(sessionKeyValue) }),
+        : { sessionKey: authorizedSessionKey(sessionKeyValue, provider, brain, classes) }),
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
   }
@@ -272,6 +363,27 @@ export class BrainRouter {
     await provider.checkAvailability({
       ...(requestSignal ? { signal: requestSignal } : {}),
     });
+  }
+
+  async withAdmission(brainValue, {entityKey, signal = null, waitForCapacity = false} = {}, operation) {
+    const brain = normalizeBrainConfig(brainValue);
+    const provider = this.#provider(brain.provider);
+    const requestSignal = normalizeAbortSignal(signal);
+    requestSignal?.throwIfAborted();
+    if (typeof operation !== 'function') throw new TypeError('admission operation is invalid');
+    if (typeof waitForCapacity !== 'boolean') throw new TypeError('admission wait option is invalid');
+    return provider.withAdmission ? provider.withAdmission({entityKey:normalizeAdmissionEntityKey(entityKey),signal:requestSignal,
+      ...(waitForCapacity ? {waitForCapacity:true} : {})},operation) : operation();
+  }
+
+  async withEntityQuiescence(brainValue, { entityKey, signal = null } = {}, operation) {
+    const brain = normalizeBrainConfig(brainValue), provider = this.#provider(brain.provider);
+    const requestSignal = normalizeAbortSignal(signal);
+    requestSignal?.throwIfAborted();
+    if (typeof operation !== 'function') throw new TypeError('quiescence operation is invalid');
+    return provider.withEntityQuiescence
+      ? provider.withEntityQuiescence({ entityKey: normalizeAdmissionEntityKey(entityKey), signal: requestSignal }, operation)
+      : { executed: false };
   }
 
   describe(brainValue) {

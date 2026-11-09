@@ -6,9 +6,99 @@ import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
 import { WorkflowRoutingService } from "../src/services/workflow-routing-service.js";
 import { MAX_WORKFLOW_STATE_BYTES } from "../src/services/workflow-routing-state.js";
 import { prettySerializedWorkflowBytes } from "../src/services/workflow-routing-values.js";
+import { AutomaticReviewReentryReader } from "../src/services/automatic-review-reentry-reader.js";
+import { withPrLifecycleRoutes } from "../src/domain/pr-lifecycle-routing.js";
+import { AutomaticHeadAncestryReader } from "../src/services/automatic-head-ancestry-reader.js";
+import { createWorkLedgerRuntime } from "../src/work-ledger-runtime.js";
+import { createLocalWorkLedgerCandidateProcessor } from "../src/services/work-ledger-candidate-processor.js";
 
 const STATE_KEY = "workflow-routing-state";
 const MAX_PAGE_SIZE = 100;
+
+test("returning own PR preserves a verified descendant target after a created-event causal gap", async () => {
+  const account = "runtime-user", a = "a".repeat(40), b = "b".repeat(40), c = "c".repeat(40);
+  const target = headRefOid => ({ schemaVersion: 1, provider: "github", sourceAccountId: account,
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "d".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid });
+  const item = head => pullRequest(42, { state: "open", author: account, assignees: [account], relation: "authored",
+    isDraft: false, actionState: "action_now", nextAction: "address_review", headRefOid: head,
+    gitTargetAvailable: true, gitTarget: target(head) });
+  let ledger, ancestryReader, reader, currentHead = a;
+  const github = { async isCommitAncestor({ ancestorOid, headRefOid }) {
+    assert.equal(ancestorOid, a); assert.equal(headRefOid, currentHead); return true;
+  }, async readPullRequestRoleHandoffFacts() {
+    return { state: "open", isDraft: false, author: account, assignees: [account], gitTarget: target(currentHead) };
+  } };
+  const routing = new WorkflowRoutingService({ store: new MemoryStore(), router: createWorkflowRouter(),
+    exclusiveLease: new ExclusiveLease(), clock: incrementingClock(), scopeReentryReader: {
+      async read(options) { return ledger ? reader.read(options) : []; }
+    }, headAncestryReader: {
+      async read(options) { return ledger ? ancestryReader.read(options) : []; }
+    } });
+  await routing.recover();
+  const definition = workflowConfig(); definition.rules[0].targets = [{ type: "role", id: "developer" }];
+  await configure(routing, withPrLifecycleRoutes(definition));
+  const ledgerStore = new MemoryStore();
+  let id = 0;
+  const boot = async () => {
+    const lease = new ExclusiveLease();
+    const runtime = await createWorkLedgerRuntime({ store: ledgerStore, assignmentSource: routing, clock: incrementingClock(),
+      idFactory: () => `bridge-lease-${++id}`,
+      createGuard: () => ({ acquire: async () => {}, run: action => lease.run(action), close: async () => {} }),
+      attachHostHeadAncestry: ports => { ancestryReader = new AutomaticHeadAncestryReader({ ledger: ports,
+        github, account, clock: incrementingClock(), record: ports.record }); } });
+    reader = new AutomaticReviewReentryReader({ ledger: runtime, github, account, automaticReview: false, automaticOwnPrRepair: true });
+    return runtime;
+  };
+  ledger = await boot();
+  assert.equal(ledger.recordHostHeadAncestry, undefined, "the host writer is absent from every runtime facade");
+  assert.equal(ledger.readHostHeadAncestryCandidates, undefined);
+  const ingest = async (head, time) => {
+    if (head) currentHead = head;
+    const snapshot = workflowSnapshot({ refreshedAt: time, items: head ? [item(head)] : [] });
+    snapshot.sourceStatus.githubPullRequests.complete = true;
+    await routing.ingestSnapshot({ snapshot }); await ledger.intake();
+  };
+  await ingest(a, "2026-08-02T01:00:00.000Z");
+  await ingest(null, "2026-08-02T01:01:00.000Z");
+  await ingest(b, "2026-08-02T01:02:00.000Z");
+  await ingest(c, "2026-08-02T01:03:00.000Z");
+  const roots = (await ledger.listItems()).items.filter(row => row.kind === "source_root");
+  assert.equal(roots.length, 1, "reentry must not create another execution root");
+  const root = roots[0];
+  assert.equal(root.source.revisions.some(row => row.headRefOid === b && row.previousHeadRefOid === null), true,
+    "created events correctly carry no invented previous Head");
+  assert.equal([root.source.current.headRefOid, root.source.pending?.headRefOid].includes(c), true,
+    "a host-verified ordinary descendant must become current or pending without rewriting old events");
+  assert.equal(root.status, "queued", "safe reentry remains naturally claimable through the original task");
+  const receipt = root.source.revisions.find(row => row.headAncestryProof).headAncestryProof;
+  assert.equal(Object.hasOwn(receipt.event.payload, "previousHeadRefOid"), false);
+  await ledger.close();
+  ledger = await boot();
+  assert.equal((await ledger.listItems()).items.find(row => row.kind === "source_root").source.current.headRefOid, c);
+  await ledger.close();
+  const good = ledgerStore.stored("work-ledger-state"), damaged = clone(good);
+  damaged.items.find(row => row.kind === "source_root").source.revisions.find(row => row.headAncestryProof)
+    .headAncestryProof.event.payload.gitTarget.baseRefOid = "f".repeat(40);
+  ledgerStore.replaceStored("work-ledger-state", damaged);
+  await assert.rejects(boot(), { code: "WORK_LEDGER_STATE_CORRUPTED" }, "restart detects altered protected proof content");
+  ledgerStore.replaceStored("work-ledger-state", good);
+  await assert.rejects(routing.ingest({ event: { schemaVersion: 1, eventType: "pull_request.updated", occurredAt: receipt.event.occurredAt,
+    source: receipt.event.source, subject: receipt.event.subject, payload: { ...receipt.event.payload, headAncestryProof: receipt.receiptId } } }),
+  { code: "WORKFLOW_EVENT_HOST_ONLY" }, "ordinary and historical client ingestion cannot manufacture a trusted receipt reference");
+  const historical = (await routing.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items
+    .find(row => row.event.payload.headAncestryProof);
+  const lease = new ExclusiveLease();
+  const injected = await createWorkLedgerRuntime({ store: new MemoryStore(), clock: incrementingClock(), idFactory: () => "injected-lease",
+    createCandidateProcessor: createLocalWorkLedgerCandidateProcessor,
+    createGuard: () => ({ acquire: async () => {}, run: action => lease.run(action), close: async () => {} }),
+    assignmentSource: { readAssignmentBatch: async ({ afterSequence }) => ({
+      items: afterSequence === 0 ? [{ ...historical, sequence: 1 }] : [], nextSequence: 1, highWatermark: 1, oldestAvailableSequence: 1 }) } });
+  assert.equal((await injected.intake()).received, 1);
+  assert.equal((await injected.listItems()).items.some(row => row.kind === "source_root"), false,
+    "an injected historical proof reference cannot create a root without its protected host receipt");
+  await injected.close();
+});
 
 function clone(value) {
   return value === undefined ? undefined : structuredClone(value);
@@ -103,6 +193,34 @@ class MemoryStore {
 
   replaceStored(name, value) {
     this.values.set(name, clone(value));
+  }
+}
+
+class ContentVersionMemoryStore extends MemoryStore {
+  constructor(entries = {}) {
+    super(entries);
+    this.versions = new Map();
+    this.valueReads = 0;
+  }
+
+  async readVersioned(name, fallback = null, { ifVersion } = {}) {
+    if (!this.versions.has(name)) this.versions.set(name, Object.freeze({}));
+    const version = this.versions.get(name);
+    if (ifVersion === version) return { changed: false, version };
+    this.valueReads += 1;
+    return { changed: true, version, value: await super.read(name, fallback) };
+  }
+
+  async write(name, value) {
+    await super.write(name, value);
+    const version = Object.freeze({});
+    this.versions.set(name, version);
+    return version;
+  }
+
+  replaceStored(name, value) {
+    super.replaceStored(name, value);
+    this.versions.set(name, Object.freeze({}));
   }
 }
 
@@ -341,6 +459,135 @@ function assertPage(page) {
     true,
   );
 }
+
+test("versioned routing reads reuse validated state after committed writes", async () => {
+  const store = new ContentVersionMemoryStore();
+  const { service } = await createFixture({ store });
+  await configure(service);
+  const ingested = await service.ingest({ event: workflowEvent() });
+  const valueReads = store.valueReads;
+  const writes = store.writes.length;
+  store.read = async () => { throw new Error("unversioned read is forbidden"); };
+
+  const first = await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+  const second = await service.readAssignmentBatch({ afterSequence: 1, limit: 100 });
+
+  assert.equal(first.items[0].assignment.assignmentId, ingested.assignments[0].assignmentId);
+  first.items[0].assignment.target.id = "mutated-projection";
+  assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 }))
+    .items[0].assignment.target.id, "pr-reviewer");
+  assert.equal(second.items.length, 0);
+  assert.equal(store.valueReads, valueReads);
+  assert.equal(store.writes.length, writes);
+});
+
+test("versioned routing reads observe another writer before reusing state", async () => {
+  const store = new ContentVersionMemoryStore();
+  const { service } = await createFixture({ store });
+  await configure(service);
+  const { service: writer } = await createFixture({ store });
+  const ingested = await writer.ingest({ event: workflowEvent() });
+  const valueReads = store.valueReads;
+
+  const batch = await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+  await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+
+  assert.equal(batch.items[0].assignment.assignmentId, ingested.assignments[0].assignmentId);
+  assert.equal(store.valueReads, valueReads + 1);
+});
+
+test("versioned routing reads keep rejecting changed invalid or conflicting content", async () => {
+  for (const [change, expectedCode] of [
+    [(state) => { state.events.push(clone(state.events[0])); state.revision += 1; },
+      "WORKFLOW_STATE_CORRUPTED"],
+    [(_state, older) => older, "WORKFLOW_STATE_REVISION_CONFLICT"],
+    [(state) => {
+      state.currentConfig.changedBy = "another-owner";
+      state.configHistory.at(-1).changedBy = "another-owner";
+    }, "WORKFLOW_STATE_REVISION_CONFLICT"],
+    [() => null, "WORKFLOW_STATE_CORRUPTED"],
+    [(state) => {
+      state.schemaVersion = 1;
+      delete state.assignmentFeed;
+      delete state.assignmentHighWatermark;
+      delete state.assignmentOldestAvailableSequence;
+    }, "WORKFLOW_STATE_REVISION_CONFLICT"],
+  ]) {
+    const store = new ContentVersionMemoryStore();
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const older = store.stored(STATE_KEY);
+    await service.ingest({ event: workflowEvent() });
+    const original = store.stored(STATE_KEY);
+    const changed = clone(original);
+    const replacement = change(changed, older);
+    store.replaceStored(STATE_KEY, replacement === undefined ? changed : replacement);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(service.readAssignmentBatch({ afterSequence: 0, limit: 100 }),
+        (error) => error.code === expectedCode);
+    }
+    const readsAfterFailure = store.valueReads;
+    store.replaceStored(STATE_KEY, original);
+    assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items.length, 1);
+    assert.equal(store.valueReads, readsAfterFailure + 1);
+  }
+});
+
+test("versioned routing reads fail closed on malformed or unknown content versions", async () => {
+  const malformedResults = [
+    { changed: false, version: Object.freeze({}) },
+    { changed: false, version: undefined },
+    { changed: true, version: "unknown", value: null },
+    { changed: true, version: {}, value: null },
+    { changed: true, version: Object.freeze({ unexpected: true }), value: null },
+    { changed: true, version: Object.freeze(new Date()), value: null },
+    { changed: true, version: Object.freeze({}) },
+  ];
+  for (const result of malformedResults) {
+    const store = new ContentVersionMemoryStore();
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const writes = store.writes.length;
+    store.readVersioned = async () => result;
+    await assert.rejects(service.readAssignmentBatch({ afterSequence: 0, limit: 100 }),
+      /StateStore versioned read result is invalid/);
+    assert.equal(store.writes.length, writes);
+  }
+});
+
+test("versioned routing migration records the committed upgrade content version", async () => {
+  const { service: original, store: originalStore } = await createFixture();
+  await configure(original);
+  await original.ingest({ event: workflowEvent() });
+  const legacy = originalStore.stored(STATE_KEY);
+  legacy.schemaVersion = 1;
+  delete legacy.assignmentFeed;
+  delete legacy.assignmentHighWatermark;
+  delete legacy.assignmentOldestAvailableSequence;
+  const store = new ContentVersionMemoryStore({ [STATE_KEY]: legacy });
+  const { service } = await createFixture({ store });
+  const valueReads = store.valueReads;
+
+  assert.equal((await service.readAssignmentBatch({ afterSequence: 0, limit: 100 })).items.length, 1);
+  assert.equal(store.valueReads, valueReads);
+  assert.equal(store.stored(STATE_KEY).schemaVersion, 2);
+});
+
+test("versioned routing writes without a trustworthy version force a full reread", async () => {
+  for (const writtenVersion of [undefined, "unknown", {}, Object.freeze({ invalid: true })]) {
+    const store = new ContentVersionMemoryStore();
+    const write = store.write.bind(store);
+    store.write = async (...args) => { await write(...args); return writtenVersion; };
+    const { service } = await createFixture({ store });
+    await configure(service);
+    const valueReads = store.valueReads;
+
+    await service.readAssignmentBatch({ afterSequence: 0, limit: 100 });
+
+    assert.equal(store.valueReads, valueReads + 1);
+  }
+});
 
 test("an explicit invalid workflow admission gate never degrades to direct mode", async () => {
   await assert.rejects(

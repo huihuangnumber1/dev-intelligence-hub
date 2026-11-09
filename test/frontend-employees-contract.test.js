@@ -71,7 +71,7 @@ test("employee cards expose workload counts, current tasks, and a role ledger li
 test("PR engineer work exposes the review stage and next owner", () => {
   for (const value of [
     "PR Review 工作方式",
-    "Approve 不会自动发布，也不会自动合并",
+    "自动 Review 和后续分配可在配置中心关闭；记录在下方查看",
     "Review 建议已生成，等待你确认发布",
     "下一责任人：",
     "data-role-confirmations",

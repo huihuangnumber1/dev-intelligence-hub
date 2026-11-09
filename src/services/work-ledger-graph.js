@@ -13,6 +13,13 @@ import {
   workLedgerError,
 } from "./work-ledger-values.js";
 import { currentWorkItemInputBinding } from "./work-ledger-pr-source.js";
+import { isRecoveredRepairEvidence } from "./work-ledger-inspection-continuation.js";
+import { unstartedConflictDispatchFailure } from "./work-ledger-conflict-failure.js";
+import { unstartedDeliveryContractFailure, unstartedCodePolicyBindingFailure, recordedDeliveryFailure } from "./work-ledger-delivery-failure.js";
+import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
+import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
+import { indexParentCoordinationReturns } from './work-ledger-graph-responsibility.js';
+import { currentCoordinationReturnReport } from './work-ledger-role-handoff-evidence.js';
 
 export const WORK_LEDGER_GRAPH_ID = "work-ledger";
 
@@ -378,6 +385,14 @@ export function projectWorkLedgerGraphView(state, options) {
   const graph = projectWorkLedgerGraphSnapshot(state, options);
   const stateEntries = ledgerDataEntries(state);
   const fields = new Map(stateEntries);
+  const latestTimelineByItem = new Map();
+  const deliveryFailureIds = new Set();
+  const outboxesByItemId = new Map();
+  for (const outbox of fields.get("outbox") ?? []) {
+    const siblings = outboxesByItemId.get(outbox.itemId) ?? [];
+    siblings.push(outbox);
+    outboxesByItemId.set(outbox.itemId, siblings);
+  }
   const itemsById = new Map(
     denseProjectionArray(fields.get("items")).map((item) => {
       const entries = ledgerDataEntries(item);
@@ -388,9 +403,32 @@ export function projectWorkLedgerGraphView(state, options) {
         );
       }
       const itemFields = new Map(entries);
+      if (itemFields.get("status") === "blocked" && itemFields.get("statusReason") === "delivery_attempts_exhausted") {
+        deliveryFailureIds.add(itemFields.get("itemId"));
+      }
       return [itemFields.get("itemId"), itemFields];
     }),
   );
+  const timeline = fields.get("timeline") ?? [];
+  const coordinationReturns = indexParentCoordinationReturns(state);
+  const coordinationTimelineByItem = new Map(), timelineBySequence = new Map();
+  if (coordinationReturns.size > 0) for (const entry of timeline) {
+    // Preserve global find-first adjacency and original record identity while
+    // restricting each report's history searches to its own task.
+    if (!timelineBySequence.has(entry.sequence)) timelineBySequence.set(entry.sequence, entry);
+    if (!coordinationReturns.has(entry.itemId)) continue;
+    const history = coordinationTimelineByItem.get(entry.itemId) ?? [];
+    history.push(entry);
+    coordinationTimelineByItem.set(entry.itemId, history);
+  }
+  for (let index = timeline.length - 1; index >= 0 && latestTimelineByItem.size < deliveryFailureIds.size; index--) {
+    const entry = timeline[index];
+    if (deliveryFailureIds.has(entry.itemId) && !latestTimelineByItem.has(entry.itemId)) {
+      latestTimelineByItem.set(entry.itemId, entry);
+    }
+  }
+  const decisionFailures = indexRecordedDecisionFailures(state);
+  const proposalFailures = indexRecordedProposalFailures(state);
   const taskStates = graph.tasks.map((task) => {
     const item = itemsById.get(task.taskId);
     if (!item || item.get("revision") !== task.revision) {
@@ -400,6 +438,21 @@ export function projectWorkLedgerGraphView(state, options) {
       );
     }
     workLedgerStatusToGraphStatus(item.get("status"));
+    let dispatchFailure = null;
+    const deliveryFailure = deliveryFailureIds.has(task.taskId)
+      ? recordedDeliveryFailure(Object.fromEntries(item), latestTimelineByItem.get(task.taskId)) : null;
+    if (item.get("statusReason") === "intent_failed") {
+      const failedItem = Object.fromEntries(item), outboxes = outboxesByItemId.get(task.taskId) ?? [];
+      dispatchFailure = unstartedConflictDispatchFailure(failedItem, outboxes) ?? unstartedDeliveryContractFailure(failedItem, outboxes) ??
+        unstartedCodePolicyBindingFailure(failedItem, outboxes);
+    }
+    const coordinationRootTaskId = coordinationReturns.get(task.taskId);
+    const coordinationReturn = coordinationRootTaskId === undefined ? null : {
+      kind: 'parent_coordination', rootTaskId: coordinationRootTaskId,
+      handoff: currentCoordinationReturnReport(state, Object.fromEntries(item), {
+        outboxes: outboxesByItemId.get(task.taskId) ?? [], timeline: coordinationTimelineByItem.get(task.taskId) ?? [], timelineBySequence,
+      }),
+    };
     return {
       taskId: task.taskId,
       taskRevision: task.revision,
@@ -408,6 +461,11 @@ export function projectWorkLedgerGraphView(state, options) {
       leaseUntil: item.get("leaseUntil"),
       availableAt: item.get("availableAt"),
       statusReason: item.get("statusReason"),
+      ...(dispatchFailure === null ? {} : { dispatchFailure }),
+      ...(deliveryFailure === null ? {} : { deliveryFailure }),
+      ...(decisionFailures.has(task.taskId) ? { decisionFailure: decisionFailures.get(task.taskId) } : {}),
+      ...(proposalFailures.has(task.taskId) ? { proposalFailure: proposalFailures.get(task.taskId) } : {}),
+      ...(coordinationReturn === null ? {} : { coordinationReturn }),
       updatedAt: item.get("updatedAt"),
       work: projectedItemWork(item),
     };
@@ -522,6 +580,26 @@ function isCompletedPullRequestRootRetiredAfterAdvance(previous, next, nextItems
   return false;
 }
 
+function isCompletedInactivePullRequestRootAdvanced(previous, next) {
+  // Fresh facts can advance an inactive source after its sealed action settles.
+  // Retire the old completion without reopening work or changing its deliveries.
+  return previous.kind === "source_root" && previous.source?.kind === "pull_request" &&
+    previous.status === "completed" && previous.source.scope.kind === "automatic" &&
+    previous.source.scope.active === false && next?.kind === "source_root" &&
+    next.source?.kind === "pull_request" &&
+    next.status === "blocked" && next.statusReason === "pr_source_left_scope" &&
+    next.revision === previous.revision + 1 && next.ownerId === null &&
+    next.leaseId === null && next.leaseUntil === null && next.activeIntentId === null &&
+    next.decisionContext === null && next.availableAt === null &&
+    next.source.pendingRevision === null &&
+    next.source.activeRevision > previous.source.activeRevision &&
+    next.source.authorityEpoch >= previous.source.authorityEpoch &&
+    next.source.current.sourceSequence > previous.source.current.sourceSequence &&
+    ledgerDigest(next.source.scope) === ledgerDigest(previous.source.scope) &&
+    ledgerDigest(next.source.identity) === ledgerDigest(previous.source.identity) &&
+    ledgerDigest(next.graph) === ledgerDigest(previous.graph);
+}
+
 function isCompletedPullRequestRootPendingCutover(previous, next, previousItems, nextItems) {
   const prefix = "pr_source_cross_root_cutover_pending:";
   if (
@@ -603,7 +681,9 @@ export function validateWorkLedgerGraphTransition(previousState, nextState) {
         (
           (nextItem.status === "queued" &&
             nextItem.source.activeRevision > item.source.activeRevision) ||
+          isRecoveredRepairEvidence(previousState, item, nextItem) ||
           isCompletedPullRequestRootScopeExit(item, nextItem) ||
+          isCompletedInactivePullRequestRootAdvanced(item, nextItem) ||
           isCompletedPullRequestRootRetiredAfterAdvance(item, nextItem, nextItemsById) ||
           isCompletedPullRequestRootPendingCutover(
             item, nextItem, previousItemsById, nextItemsById,

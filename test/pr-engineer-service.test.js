@@ -227,7 +227,10 @@ test("fresh observations are idempotent and survive a service restart", async ()
   assert.deepEqual(await restarted.observe(fixture.input), facts);
 });
 
-test("task context includes exact-Head review material within its byte budget", async () => {
+for (const [kind, patch] of [
+  ["plain", "x".repeat(120 * 1024)],
+  ["escaped-source", '+ QStringLiteral("中文🙂\\\\path");\n'.repeat(12_000)],
+]) test(`task context includes exact-Head review material within its byte budget (${kind})`, async () => {
   const store = new MemoryStore();
   const fixture = executionFixture();
   const facts = factsFixture(fixture);
@@ -246,7 +249,7 @@ test("task context includes exact-Head review material within its byte budget", 
           { path: "src/codec.cpp", additions: 10, deletions: 3 },
           { path: "test/codec.test.cpp", additions: 2, deletions: 0 },
         ],
-        patch: "x".repeat(120 * 1024),
+        patch,
         patchTruncated: false,
       };
     },
@@ -263,7 +266,9 @@ test("task context includes exact-Head review material within its byte budget", 
   );
   assert.equal(context.reviewMaterial.changedFiles, 2);
   assert.equal(context.reviewMaterial.patchTruncated, true);
-  assert.equal(context.reviewMaterial.patch.length < 120 * 1024, true);
+  assert.equal(context.reviewMaterial.patch.length < patch.length, true);
+  assert.equal(patch.startsWith(context.reviewMaterial.patch), true);
+  assert.equal(context.reviewMaterial.patch.isWellFormed(), true);
   assert.equal(
     Buffer.byteLength(JSON.stringify(context), "utf8") <= 96 * 1024,
     true,
@@ -665,4 +670,21 @@ test("constructor and recovery reject accessor or proxy boundaries without execu
     (error) => error.code === "PR_FACT_STATE_CORRUPTED",
   );
   assert.equal(getterCalls, 0);
+});
+
+
+test("review reading can force fresh facts while concurrent refreshes share one read", async () => {
+  const fixture = executionFixture(); const store = new MemoryStore();
+  let calls = 0; const gate = deferred();
+  const old = factsFixture(fixture); const current = factsFixture(fixture, { observedAt: NOW });
+  const engineer = service({ store, load: async () => { calls++; if (calls > 1) await gate.promise; return calls === 1 ? old : current; } });
+  assert.deepEqual(await engineer.observe(fixture.input), old);
+  assert.deepEqual(await engineer.observe(fixture.input), old);
+  assert.equal(calls, 1);
+  const first = engineer.refresh(fixture.input); const second = engineer.refresh(fixture.input);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 2);
+  gate.resolve();
+  assert.deepEqual(await first, current); assert.deepEqual(await second, current);
+  assert.deepEqual(await engineer.get(fixture.input), current);
 });

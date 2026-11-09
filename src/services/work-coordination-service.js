@@ -1,6 +1,8 @@
 import { MAX_WORK_LEDGER_QUERY_PAGE } from "./work-ledger-records.js";
 import { MAX_WORK_LEDGER_ITEMS } from "./work-ledger-state.js";
 import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
+import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget } from "./work-continuation-state.js";
 
 const SAFE_TRIGGER = /^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,126}[A-Za-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -50,7 +52,7 @@ function cycleOptions(value = {}) {
     Array.isArray(value) ||
     Object.getPrototypeOf(value) !== Object.prototype ||
     Object.keys(value).some(
-      (key) => !["trigger", "includeWork", "roleId", "signal"].includes(key),
+      (key) => !["trigger", "includeWork", "roleId", "signal", "continuationTarget"].includes(key),
     )
   ) {
     throw new TypeError("runCycle options are invalid");
@@ -60,6 +62,8 @@ function cycleOptions(value = {}) {
     throw new TypeError("includeWork is invalid");
   }
   const roleId = value.roleId == null ? null : safeRoleId(value.roleId);
+  const continuationTarget = normalizeContinuationTarget(value.continuationTarget);
+  if (continuationTarget !== null && (!includeWork || roleId === null)) throw new TypeError('target requires a work role');
   if (!includeWork && roleId !== null) {
     throw new TypeError("roleId requires includeWork");
   }
@@ -67,6 +71,7 @@ function cycleOptions(value = {}) {
     trigger: safeTrigger(value.trigger ?? "scheduled"),
     includeWork,
     roleId,
+    continuationTarget,
     signal: normalizeAbortSignal(value.signal ?? null),
   });
 }
@@ -204,36 +209,54 @@ function optionalPullRequestSourceReconciler(ledger) {
       conflicted: 0,
     };
     if (reconcileBatch !== null && pendingRoots.length > 0) {
-      const summary = await getSummary();
-      throwIfAborted(signal);
-      const batch = await reconcileBatch({
-        expectedGraphRevision: summary.revision,
-        items: pendingRoots.slice(0, limit).map((root) => ({
-          itemId: root.itemId,
-          expectedRevision: root.revision,
-          expectedPendingRevision:
-            root.source.pendingRevision ?? root.source.activeRevision,
-        })),
-      });
-      throwIfAborted(signal);
-      if (!batch || !Array.isArray(batch.outcomes)) {
-        throw new TypeError(
-          "ledger reconcilePullRequestSourceBatch returned an invalid result",
-        );
-      }
-      result.scanned = batch.outcomes.length;
-      for (const outcome of batch.outcomes) {
-        if (outcome?.status === "applied") result.applied += 1;
-        else if (outcome?.status === "blocked") result.blocked += 1;
-        else if (
-          outcome?.status === "conflicted" ||
-          outcome?.status === "unchanged"
-        ) {
-          result.conflicted += 1;
-        } else {
+      // A blocked first page must not hide later roots. Each batch stops after
+      // its first write; limit counts applied roots, as in the single-item path.
+      for (let offset = 0; offset < pendingRoots.length && result.applied < limit;) {
+        const summary = await getSummary();
+        throwIfAborted(signal);
+        const roots = pendingRoots.slice(offset, offset + limit);
+        let batch;
+        try {
+          batch = await reconcileBatch({
+            expectedGraphRevision: summary.revision,
+            items: roots.map((root) => ({
+              itemId: root.itemId,
+              expectedRevision: root.revision,
+              expectedPendingRevision:
+                root.source.pendingRevision ?? root.source.activeRevision,
+            })),
+          });
+        } catch (error) {
+          throwIfAborted(signal);
+          if (!SOURCE_RECONCILIATION_CONFLICTS.has(error?.code)) throw error;
+          // Another lane changed the ledger. Keep CAS intact and defer these
+          // roots to a fresh cycle instead of failing housekeeping or spinning.
+          result.scanned += roots.length;
+          result.conflicted += roots.length;
+          offset += roots.length;
+          continue;
+        }
+        throwIfAborted(signal);
+        if (!batch || !Array.isArray(batch.outcomes) || batch.outcomes.length < 1 || batch.outcomes.length > roots.length) {
           throw new TypeError(
             "ledger reconcilePullRequestSourceBatch returned an invalid result",
           );
+        }
+        result.scanned += batch.outcomes.length;
+        offset += batch.outcomes.length;
+        for (const outcome of batch.outcomes) {
+          if (outcome?.status === "applied") result.applied += 1;
+          else if (outcome?.status === "blocked") result.blocked += 1;
+          else if (
+            outcome?.status === "conflicted" ||
+            outcome?.status === "unchanged"
+          ) {
+            result.conflicted += 1;
+          } else {
+            throw new TypeError(
+              "ledger reconcilePullRequestSourceBatch returned an invalid result",
+            );
+          }
         }
       }
       return result;
@@ -355,10 +378,15 @@ function stageFailure(stage, error) {
 export class WorkCoordinationService {
   #intake;
   #runCodeJobs;
+  #recoverCodeJobPauses;
   #dispatchCodeJobChangePackages;
   #reconcileChangePackageApplicationResults;
   #projectCodeJobMemory;
   #runProposals;
+  #runReviewProposals;
+  #runOwnPrRepairs;
+  #runOwnPrRecoveries;
+  #refreshOwnerPullRequestSources;
   #reconcileProposals;
   #reconcileAttention;
   #wakeConditions;
@@ -368,14 +396,19 @@ export class WorkCoordinationService {
   #defaults;
   #inFlightByScope = new Map();
   #cycleTail = Promise.resolve();
+  #targetedCycles = new TargetedCycleQueue();
 
   constructor({
     ledger,
     codeJobRunner,
+    codeJobPauseRecovery = null,
     codeJobChangePackageDispatcher,
     changePackageApplicationResultReconciler,
     codeJobMemoryProjector,
     proposalRunner,
+    reviewProposalRunner = null,
+    automaticOwnPrRepair = null,
+    ownerPullRequestSourceRefresher = null,
     proposalResultReconciler,
     attentionResultReconciler,
     conditionWaker,
@@ -391,6 +424,12 @@ export class WorkCoordinationService {
     codeJobMemoryLimit = 50,
   } = {}) {
     this.#intake = requirePort(ledger, "intake", "ledger");
+    this.#recoverCodeJobPauses = codeJobPauseRecovery === null ? null : requirePort(codeJobPauseRecovery, "runCycle", "codeJobPauseRecovery");
+    this.#runOwnPrRepairs = automaticOwnPrRepair === null ? null : requirePort(automaticOwnPrRepair, "runCycle", "automaticOwnPrRepair");
+    this.#runOwnPrRecoveries = typeof automaticOwnPrRepair?.runRecoveryCycle === "function"
+      ? requirePort(automaticOwnPrRepair, "runRecoveryCycle", "automaticOwnPrRepair") : null;
+    this.#refreshOwnerPullRequestSources = ownerPullRequestSourceRefresher === null ? null :
+      requirePort(ownerPullRequestSourceRefresher, "runCycle", "ownerPullRequestSourceRefresher");
     this.#runCodeJobs = codeJobRunner == null
       ? skipCodeJobs
       : requirePort(codeJobRunner, "runCycle", "codeJobRunner");
@@ -420,6 +459,9 @@ export class WorkCoordinationService {
     this.#runProposals = proposalRunner == null
       ? skipProposalExecution
       : requirePort(proposalRunner, "runCycle", "proposalRunner");
+    this.#runReviewProposals = reviewProposalRunner === null
+      ? null
+      : requirePort(reviewProposalRunner, "runCycle", "reviewProposalRunner");
     this.#reconcileProposals = requirePort(
       proposalResultReconciler,
       "runCycle",
@@ -469,6 +511,15 @@ export class WorkCoordinationService {
     const scope = options.includeWork
       ? `work:${options.roleId ?? NO_ROLE_SCOPE}`
       : "housekeeping";
+    if (options.continuationTarget !== null) return this.#targetedCycles.run(
+      JSON.stringify([scope, options.continuationTarget]), {
+        signal: options.signal, current: () => this.#inFlightByScope.get(scope),
+        execute: () => this.#startCycle(options, scope),
+      });
+    return this.#startCycle(options, scope);
+  }
+
+  #startCycle(options, scope) {
     const running = this.#inFlightByScope.get(scope);
     if (running) return running;
     const serialized = options.roleId === null;
@@ -489,22 +540,25 @@ export class WorkCoordinationService {
     throwIfAborted(options.signal);
     const stages = options.roleId === null
       ? [
+          ["proposal_execution", () =>
+            this.#runProposals({
+              limit: this.#defaults.proposalLimit,
+              ...(options.signal === null ? {} : { signal: options.signal }),
+            })],
           ["code_jobs", () =>
-            this.#runCodeJobs({ limit: this.#defaults.codeJobLimit })],
+            this.#runCodeJobs({ limit: this.#defaults.codeJobLimit, ...(options.signal === null ? {} : { signal: options.signal }) })],
           ["code_job_change_packages", () =>
             this.#dispatchCodeJobChangePackages({
               limit: this.#defaults.codeJobLimit,
             })],
+          ...(this.#runOwnPrRepairs === null ? [] : [["own_pr_repairs", () =>
+            this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,
+              ...(this.#runOwnPrRecoveries === null ? {} : { includeRecovery: false }) })]]),
           ["change_package_application_results", () =>
             this.#reconcileChangePackageApplicationResults()],
           ["code_job_memory", () =>
             this.#projectCodeJobMemory({
               limit: this.#defaults.codeJobMemoryLimit,
-            })],
-          ["proposal_execution", () =>
-            this.#runProposals({
-              limit: this.#defaults.proposalLimit,
-              ...(options.signal === null ? {} : { signal: options.signal }),
             })],
           ["proposal_results", () =>
             this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
@@ -518,7 +572,33 @@ export class WorkCoordinationService {
               signal: options.signal,
             })],
         ]
-      : [];
+      : options.roleId === "developer" && this.#runOwnPrRepairs !== null
+        // Housekeeping owns long code execution and global memory projection.
+        // Developer intake must not wait for another PR's model or build.
+        ? [
+            ["proposal_execution", () => this.#runProposals({ limit: this.#defaults.proposalLimit,
+              ...(options.signal === null ? {} : { signal: options.signal }) })],
+            ["code_job_change_packages", () => this.#dispatchCodeJobChangePackages({ limit: this.#defaults.codeJobLimit })],
+            ["proposal_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
+            ["own_pr_repairs", () => this.#runOwnPrRepairs({ limit: this.#defaults.codeJobLimit,
+              ...(this.#runOwnPrRecoveries === null ? {} : { includeRecovery: false }) })],
+          ]
+      : options.roleId === "pr-engineer"
+        ? [["attention_results", () =>
+            this.#reconcileAttention({ limit: this.#defaults.attentionLimit })]]
+        : [];
+    if (this.#runOwnPrRecoveries !== null && (options.roleId === null || options.roleId === "developer")) {
+      stages.unshift(["own_pr_material_recovery", () => this.#runOwnPrRecoveries({ limit: this.#defaults.codeJobLimit })]);
+    }
+    if (this.#recoverCodeJobPauses !== null && (options.roleId === null || options.roleId === "developer")) {
+      stages.unshift(["code_job_pause_recovery", () => this.#recoverCodeJobPauses({ limit: this.#defaults.codeJobLimit, signal: options.signal })]);
+    }
+    // Source refresh can read many historical requests and wait for GitHub.
+    // Housekeeping owns that global sweep; role work must have an independent lane.
+    if (this.#refreshOwnerPullRequestSources !== null && options.roleId === null) {
+      stages.unshift(["owner_pull_request_source_refresh", () => this.#refreshOwnerPullRequestSources({
+        limit: this.#defaults.codeJobLimit, signal: options.signal })]);
+    }
     if (options.includeWork) {
       stages.push([
         "work",
@@ -526,16 +606,30 @@ export class WorkCoordinationService {
           this.#runWork({
             trigger: options.trigger,
             intakeLimit: this.#defaults.intakeLimit,
-            workLimit: this.#defaults.workLimit,
+            workLimit: options.continuationTarget === null ? this.#defaults.workLimit : 1,
             ...(options.roleId === null ? {} : { roleId: options.roleId }),
+            ...(options.continuationTarget === null ? {} : { continuationTarget: options.continuationTarget }),
             ...(options.signal === null ? {} : { signal: options.signal }),
           }),
       ]);
     }
     stages.push([
       "dispatch",
-      () => this.#dispatch({ limit: this.#defaults.dispatchLimit }),
+      () => this.#dispatch({
+        limit: this.#defaults.dispatchLimit,
+        ...(["pr-engineer", "orchestrator", "tester"].includes(options.roleId)
+          ? { roleId: options.roleId } : {}),
+      }),
     ]);
+    if (options.roleId === "pr-engineer" && this.#runReviewProposals !== null) {
+      stages.push(
+        ["review_publication", () => this.#runReviewProposals({
+          limit: this.#defaults.proposalLimit,
+          ...(options.signal === null ? {} : { signal: options.signal }),
+        })],
+        ["review_results", () => this.#reconcileProposals({ limit: this.#defaults.proposalLimit })],
+      );
+    }
     const result = {
       trigger: options.trigger,
       includeWork: options.includeWork,

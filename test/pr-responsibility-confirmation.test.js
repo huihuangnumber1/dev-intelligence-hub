@@ -25,6 +25,7 @@ function uncertainPullRequest(overrides = {}) {
     relation: "review_requested",
     author: "someone-else",
     currentUser: "me",
+    assignees: ['me'],
     state: "open",
     updatedAt: new Date().toISOString(),
     reviewFactsAvailable: false,

@@ -46,6 +46,12 @@ function queuePort(events = []) {
     get(id) {
       return ["get", id];
     },
+    readSettlement(input) {
+      return ["readSettlement", input];
+    },
+    readSettlements(input) {
+      return ["readSettlements", input];
+    },
     approve(id, input) {
       return ["approve", id, input];
     },
@@ -98,6 +104,28 @@ function runtimeDependencies(overrides = {}) {
     ...overrides,
   };
 }
+
+test("automatic mode exposes human selection without changing publisher and producer access", async () => {
+  const port = queuePort();
+  port.nextForHuman = options => ["human", options];
+  const runtime = await createConfirmationRuntime({ ...enabledConfig({ automaticReview: true }),
+    workCoordination: { enabled: true } },
+    runtimeDependencies({ createQueue: () => port }));
+  assert.deepEqual(runtime.queue.next(), ["human", undefined]);
+  assert.deepEqual(runtime.queue.nextForAction("kind", "action"), ["nextForAction", "kind", "action"]);
+  assert.deepEqual(runtime.producerQueue.get("review-id"), ["get", "review-id"]);
+  assert.deepEqual(runtime.queue.approve("review-id", {}), ["approve", "review-id", {}]);
+  await runtime.close();
+});
+
+test("automatic Review settings cannot hide manual work while coordination is disabled", async () => {
+  for (const coordination of [undefined, { enabled: false }]) {
+    const runtime = await createConfirmationRuntime({ ...enabledConfig({ automaticReview: true }),
+      ...(coordination ? { workCoordination: coordination } : {}) }, runtimeDependencies());
+    assert.equal(runtime.queue.next(), "next");
+    await runtime.close();
+  }
+});
 
 function memoryStore() {
   let value = null;
@@ -305,6 +333,7 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
     "applicationResultSource",
     "memoryProjectionSource",
     "recoveryStatusReader",
+    "confirmationSettlementReader",
     "close",
   ]);
   assert.equal(Object.isFrozen(runtime.queue), true);
@@ -314,6 +343,15 @@ test("enabled runtime composes private ports, acquires, then recovers", async ()
   assert.equal(Object.isFrozen(runtime.applicationResultSource), true);
   assert.equal(Object.isFrozen(runtime.memoryProjectionSource), true);
   assert.equal(Object.isFrozen(runtime.recoveryStatusReader), true);
+  assert.equal(Object.isFrozen(runtime.confirmationSettlementReader), true);
+  assert.deepEqual(runtime.confirmationSettlementReader.read({ confirmationId: "item-1" }),
+    ["readSettlement", { confirmationId: "item-1" }]);
+  assert.equal("readSettlement" in runtime.queue, false);
+  assert.equal("readSettlement" in runtime.producerQueue, false);
+  assert.deepEqual(runtime.confirmationSettlementReader.readMany({ confirmationIds: ["item-1"] }),
+    ["readSettlements", { confirmationIds: ["item-1"] }]);
+  assert.equal("readSettlements" in runtime.queue, false);
+  assert.equal("readSettlements" in runtime.producerQueue, false);
   assert.notEqual(runtime.queue, rawQueue);
   assert.notEqual(runtime.historyReader, rawQueue);
   assert.notEqual(runtime.producerQueue, rawQueue);

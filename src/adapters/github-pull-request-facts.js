@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import { createPullRequestReadFacts } from "../domain/pull-request-read-facts.js";
 import { normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { githubCurrentPullRequestGitTarget } from "./github-current-pull-request-target.js";
 
 export const GITHUB_PULL_REQUEST_FACTS_QUERY = String.raw`
 query MyDashboardPullRequestFacts(
@@ -21,8 +22,10 @@ query MyDashboardPullRequestFacts(
       reviewDecision
       baseRefName
       baseRefOid
+      baseRef { name repository { nameWithOwner } target { ... on Commit { oid } } }
       headRefName
       headRefOid
+      headRef { name repository { nameWithOwner } target { ... on Commit { oid } } }
       headRepository { nameWithOwner }
       comments(last: $commentCount) {
         nodes { id author { login } body createdAt updatedAt url }
@@ -95,8 +98,10 @@ const GRAPH_PULL_REQUEST_KEYS = Object.freeze([
   "reviewDecision",
   "baseRefName",
   "baseRefOid",
+  "baseRef",
   "headRefName",
   "headRefOid",
+  "headRef",
   "headRepository",
   "comments",
   "reviews",
@@ -330,7 +335,7 @@ function requiredTimestamp(value, name) {
   return timestamp;
 }
 
-function optionalUrl(value, name) {
+function optionalUrl(value, name, { allowHttp = false } = {}) {
   if (value === null || value === "") return "";
   const url = remoteText(value, name, 2_048);
   let parsed;
@@ -339,7 +344,7 @@ function optionalUrl(value, name) {
   } catch {
     throw invalid(`${name} is invalid`);
   }
-  if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+  if ((parsed.protocol !== "https:" && !(allowHttp && parsed.protocol === 'http:')) || parsed.username || parsed.password) {
     throw invalid(`${name} is invalid`);
   }
   return parsed.href;
@@ -347,7 +352,7 @@ function optionalUrl(value, name) {
 
 function safeCheckUrl(value, name) {
   try {
-    return optionalUrl(value, name);
+    return optionalUrl(value, name, { allowHttp: true });
   } catch (error) {
     if (error instanceof GitHubPullRequestFactsError) return "";
     throw error;
@@ -688,6 +693,13 @@ export function githubGraphPullRequestTarget(response, identity) {
     ["nameWithOwner"],
     "pullRequest.headRepository",
   );
+  let currentTarget;
+  try {
+    currentTarget = githubCurrentPullRequestGitTarget(Object.fromEntries(fields), {
+      baseRepository: binding.repository, sourceAccountId: binding.gitTarget.sourceAccountId,
+    });
+  } catch { throw invalid("pullRequest current Git target is invalid"); }
+  fields.set("baseRefOid", currentTarget.baseRefOid);
   return targetFromFields(
     fields,
     {

@@ -7,6 +7,18 @@ import {
   samePullRequestExecutionBinding,
 } from "./pull-request-execution-binding.js";
 import { normalizeStoredWorkflowEvent } from "./workflow-events.js";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+
+export function pullRequestReviewFeedbackDigest(value) {
+  try {
+    const facts = normalizePullRequestReadFacts(value);
+    if (["comments", "reviews", "reviewThreads", "byteBudget"].some(key => facts.truncation[key]) ||
+        facts.comments.some(comment => comment.bodyTruncated) || facts.reviews.some(review => review.bodyTruncated) ||
+        facts.reviewThreads.some(thread => thread.commentsTruncated || thread.comments.some(comment => comment.bodyTruncated))) return null;
+    return canonicalJsonDigest({ domain: "review-publication-feedback/v1", identity: facts.identity,
+      reviewDecision: facts.reviewDecision, comments: facts.comments, reviews: facts.reviews, reviewThreads: facts.reviewThreads });
+  } catch { return null; }
+}
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_OID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
@@ -130,6 +142,7 @@ const CHECK_CONCLUSIONS = new Set([
 ]);
 const CHECK_REQUIREMENTS = new Set(["required", "optional", "unknown"]);
 const MAX_COLLECTION_ENTRIES = 100;
+export const PULL_REQUEST_READ_BODY_BYTES = 64 * 1024;
 const MAX_THREAD_COMMENTS = 20;
 const MAX_FACT_BYTES = 512 * 1024;
 const MAX_CONTEXT_BYTES = 64 * 1024;
@@ -349,7 +362,7 @@ function nullableBoolean(value, name) {
   throw invalid(`${name} is invalid`);
 }
 
-function httpsUrl(value, name) {
+function httpsUrl(value, name, { allowHttp = false } = {}) {
   if (value === "") return "";
   const normalized = text(value, name, 2_048);
   let parsed;
@@ -359,7 +372,7 @@ function httpsUrl(value, name) {
     throw invalid(`${name} is invalid`);
   }
   if (
-    parsed.protocol !== "https:" ||
+    (parsed.protocol !== "https:" && !(allowHttp && parsed.protocol === 'http:')) ||
     parsed.username ||
     parsed.password
   ) {
@@ -471,8 +484,8 @@ export function createPullRequestReadIdentity(value) {
   }
   const source = event.source.provider === "github"
     ? event.source
-    : event.source.provider === "local-owner" &&
-        event.eventType === "pull_request.owner_requested" &&
+    : ((event.source.provider === "local-owner" && event.eventType === "pull_request.owner_requested") ||
+        (event.source.provider === "internal-review-repair" && event.eventType === "pull_request.internal_review_requested")) &&
         binding.gitTarget.provider === "github"
       ? {
           provider: "github",
@@ -520,7 +533,7 @@ function normalizeComment(value, name, keys = COMMENT_KEYS) {
     author: displayText(fields.get("author"), `${name}.author`, 64, {
       empty: true,
     }),
-    body: text(fields.get("body"), `${name}.body`, 16 * 1024, { empty: true }),
+    body: text(fields.get("body"), `${name}.body`, PULL_REQUEST_READ_BODY_BYTES, { empty: true }),
     bodyTruncated: booleanValue(
       fields.get("bodyTruncated"),
       `${name}.bodyTruncated`,
@@ -543,7 +556,7 @@ function normalizeReview(value, name) {
       nullable: true,
     }),
     commitOid: optionalOid(fields.get("commitOid"), `${name}.commitOid`),
-    body: text(fields.get("body"), `${name}.body`, 16 * 1024, { empty: true }),
+    body: text(fields.get("body"), `${name}.body`, PULL_REQUEST_READ_BODY_BYTES, { empty: true }),
     bodyTruncated: booleanValue(
       fields.get("bodyTruncated"),
       `${name}.bodyTruncated`,
@@ -617,7 +630,7 @@ function normalizeCheck(value, name) {
       CHECK_CONCLUSIONS,
       `${name}.conclusion`,
     ),
-    url: httpsUrl(fields.get("url"), `${name}.url`),
+    url: httpsUrl(fields.get("url"), `${name}.url`, { allowHttp: true }),
     startedAt: timestamp(fields.get("startedAt"), `${name}.startedAt`, {
       nullable: true,
     }),
@@ -908,6 +921,7 @@ function projectedCheck(check, nameBytes) {
   return {
     kind: check.kind,
     name: name.value,
+    url: check.url,
     status: check.status,
     conclusion: check.conclusion,
     requirement: check.requirement,
@@ -991,6 +1005,17 @@ function projectedContext(facts, selected, profile) {
 
 export function projectPullRequestReadFactsContext(value) {
   const facts = normalizePullRequestReadFacts(value);
+  // Observation receipts keep their historical digest. Only complete source
+  // material can prove that a later observation contains the same PR inputs.
+  const complete = !Object.values(facts.truncation).some(Boolean) &&
+    !facts.comments.some(({ bodyTruncated }) => bodyTruncated) &&
+    !facts.reviews.some(({ bodyTruncated }) => bodyTruncated) &&
+    !facts.reviewThreads.some(({ commentsTruncated, comments }) =>
+      commentsTruncated || comments.some(({ bodyTruncated }) => bodyTruncated));
+  const { observedAt, contentDigest, ...material } = facts;
+  const materialDigest = complete
+    ? digest({ domain: "mydashboard-pull-request-read-material/v1", material })
+    : null;
   const reviewThreads = [...facts.reviewThreads]
     .sort((left, right) => {
       const priority = threadPriority(left) - threadPriority(right);
@@ -1010,7 +1035,10 @@ export function projectPullRequestReadFactsContext(value) {
     .slice(0, MAX_CONTEXT_CHECKS);
   const selected = { reviewThreads, checks };
   for (const profile of CONTEXT_PROFILES) {
-    const context = projectedContext(facts, selected, profile);
+    const context = {
+      ...projectedContext(facts, selected, profile),
+      ...(materialDigest === null ? {} : { materialDigest }),
+    };
     if (Buffer.byteLength(JSON.stringify(context), "utf8") <= MAX_CONTEXT_BYTES) {
       return deepFreeze(context);
     }

@@ -164,6 +164,18 @@ function graphChildCommand(parent, graphRevision) {
   };
 }
 
+test("runtime graph reads preserve context cancellation through both graph facades", async () => {
+  const runtime = await createWorkLedgerRuntime({ store: new MemoryStore(), assignmentSource: emptySource(),
+    createGuard: guardFactory([]) });
+  const controller = new AbortController();
+  const reason = new Error("role context expired");
+  controller.abort(reason);
+  try {
+    await assert.rejects(runtime.graphReader.getSnapshot({ signal: controller.signal }), error => error === reason);
+    assert.ok((await runtime.graphReader.getSnapshot()).graph);
+  } finally { await runtime.close(); }
+});
+
 test("runtime owns one named process guard and exposes least-authority graph ports", async () => {
   const events = [];
   const runtime = await createWorkLedgerRuntime({
@@ -179,11 +191,16 @@ test("runtime owns one named process guard and exposes least-authority graph por
     "getSummary",
     "getRoleWorkloads",
     "listItems",
+    "readItemProgress",
+    "readRepairDecisionBudget",
     "listClaimCandidates",
     "listPendingPullRequestSources",
     "listTimeline",
     "listOutbox",
     "readItemForReconciliation",
+    "canRecoverUnstartedReviewProposal",
+    "readAutomaticRoleHandoffCandidates",
+    "canReconnectOwnPullRequest",
     "verifyPullRequestExecutionBindings",
     "reconcilePullRequestSourceBatch",
     "intake",
@@ -203,6 +220,11 @@ test("runtime owns one named process guard and exposes least-authority graph por
     assert.equal(typeof runtime[method], "function", method);
   }
   assert.equal(Object.isFrozen(runtime.graphReader), true);
+  assert.deepEqual(await runtime.readAutomaticRoleHandoffCandidates({ events: [] }), []);
+  const beforeReviewPreflight = await runtime.getSummary();
+  assert.equal(await runtime.readRepairDecisionBudget({ itemId: "unused", expectedRevision: 1 }), null);
+  assert.equal(await runtime.canRecoverUnstartedReviewProposal({ itemId: "unused", expectedRevision: 1 }), false);
+  assert.deepEqual(await runtime.getSummary(), beforeReviewPreflight);
   assert.equal(Object.isFrozen(runtime.graphBrowserReader), true);
   assert.equal(Object.isFrozen(runtime.graphPlanner), true);
   assert.equal(Object.isFrozen(runtime.scopedGraphPlannerFactory), true);
@@ -394,6 +416,29 @@ test("runtime factories bind scoped orchestrator and exact claim authority", asy
       }),
     (error) => error.code === "WORK_LEDGER_RUNTIME_CLOSED",
   );
+});
+
+test("graph child descriptions preserve multiline prose through creation and restart", async () => {
+  const store = new MemoryStore();
+  const options = { store, assignmentSource: oneAssignmentSource(),
+    clock: () => "2026-08-02T02:00:00.000Z", createGuard: guardFactory([]) };
+  let runtime = await createWorkLedgerRuntime(options);
+  await runtime.intake();
+  const parent = (await runtime.listItems()).items[0];
+  const planner = runtime.scopedGraphPlannerFactory.forRoot({ scopeRootTaskId: parent.itemId });
+  const command = graphChildCommand(parent, (await runtime.graphReader.getSnapshot()).graph.revision);
+  for (const description of ["   ", "a\u0000b", "a\u0007b", "中".repeat(6000)]) {
+    await assert.rejects(planner.createChild({ ...command, work: { ...command.work, description } }));
+  }
+  await assert.rejects(planner.createChild({ ...command, work: { ...command.work, title: "unsafe\ntitle" } }));
+  const description = "核验当前 Head。\n原始要求：\r\n\t逐项检查并保留证据。\n完成后自动复审。";
+  const created = await planner.createChild({ ...command, work: { ...command.work, description } });
+  const readChild = async () => (await runtime.listItems()).items.find(item => item.itemId === created.taskId);
+  assert.equal((await readChild()).assignment.work.description, description);
+  await runtime.close();
+  runtime = await createWorkLedgerRuntime(options);
+  assert.equal((await readChild()).assignment.work.description, description);
+  await runtime.close();
 });
 
 test("runtime drains an accepted graph write before closing its sole guard", async () => {

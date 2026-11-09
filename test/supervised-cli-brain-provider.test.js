@@ -21,6 +21,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { observePrivateDirectoryHelpers } from './support/private-directory-helper-diagnostics.mjs';
+import { controlledProviderTime, withinRealTime, CONTROLLED_PROVIDER_TEST_TIMEOUT_MS } from './support/controlled-provider-time.mjs';
 
 import {
   createProductionSupervisedCliBrainProvider,
@@ -29,6 +31,10 @@ import {
 } from "../src/adapters/supervised-cli-brain-provider.js";
 import { createTestSupervisedProcessRunner } from "../src/lib/supervised-process-runner.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import {TaskRunRegistry} from '../src/services/task-run-registry.js';
+import { GitHubReviewReader } from "../src/adapters/github-review-reader.js";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { createOriginalRepairFeedbackSnapshot } from "../src/domain/original-repair-feedback.js";
 
 const SCHEMA = Object.freeze({
   type: "object",
@@ -40,9 +46,46 @@ const SCHEMA = Object.freeze({
   },
 });
 const PRIVATE_PROMPT = "PRIVATE_PROMPT_MUST_STAY_IN_STDIN";
-const HOST_TEST_SKIP = process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
-  ? "requires native Windows ACL timing guarantees"
-  : false;
+
+for(const cliKind of ['codex-cli','claude-cli'])test(`legacy ${cliKind} reports running at its model launch boundary`,async t=>{
+  const parent=await temporaryDirectory(t,'legacy-cli-model-lifecycle-'),entered=deferred(),finish=deferred();
+  const runner=recordingRunner(async call=>{
+    entered.resolve();await finish.promise;
+    if(cliKind==='codex-cli'){await writeFile(argumentValue(call.args,'--output-last-message'),codexOutput({ok:true}));return successfulProcess();}
+    return successfulProcess(Buffer.from(JSON.stringify(claudeEnvelope('{"ok":true}'))));
+  });
+  const provider=createTestSupervisedCliBrainProvider(providerOptions(cliKind),{processRunner:runner,commandLocator:recordingLocator(testDescriptor(cliKind)),
+    environment:{OPENAI_API_KEY:'synthetic-key',ANTHROPIC_API_KEY:'synthetic-key'},temporaryRoot:path.join(parent,'runtime')});
+  const records=new Map(),store={async read(key,fallback){return structuredClone(records.get(key)??fallback);},async write(key,value){records.set(key,structuredClone(value));}};
+  const registry=new TaskRunRegistry({store,receiptStore:store,settleControl:async()=>{}});
+  const task={kind:'work-item',taskId:'legacy-1',roleId:'analyst',title:'Synthetic model task',subject:'fixture',revision:1};
+  const operation=registry.run(task,()=>provider.generate(brainRequest()));await entered.promise;
+  try{
+    const current=await registry.get(task.kind,task.taskId);
+    assert.equal(current.phase,'running');assert.notEqual(current.receipt.modelStartedAt,null);
+    assert.deepEqual((await registry.list()).counts,{active:1,queued:0,preparing:0});
+  }finally{finish.resolve();await operation;await provider.close();}
+});
+
+test("supervised factory routes native login without exposing the legacy credential broker", async (t) => {
+  const temporaryRoot = await temporaryDirectory(t, "native-cli-factory-");
+  const options = { id: "native", cliKind: "codex-cli", credentialMode: "codex-native-login" };
+  assert.throws(() => createProductionSupervisedCliBrainProvider(options, {}), /lexical composition grant/u);
+  const provider = createTestSupervisedCliBrainProvider(options, {
+    environment: { CODEX_HOME: path.join(temporaryRoot, "home") },
+    temporaryRoot: path.join(temporaryRoot, "runtime"),
+    processRunner: { async run() { throw new Error("not invoked by construction"); } },
+    commandLocator: { async resolve() { throw new Error("not invoked by construction"); } },
+    codexLoginCredentialBroker: { async acquire() { throw new Error("legacy broker must stay unused"); } },
+  });
+  assert.equal(provider.kind, "codex-cli");
+  assert.equal(provider.remote, true);
+  assert.equal(provider.singleAttempt, true);
+  assert.equal(provider.supportsEntitySessions, true);
+  assert.equal(provider.supportsReviewReading, true);
+  assert.equal(provider instanceof SupervisedCliBrainProvider, false);
+  await provider.close();
+});
 
 async function temporaryDirectory(t, prefix) {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
@@ -396,6 +439,29 @@ function recordingCodexLoginBroker(events, options = {}) {
   });
 }
 
+function fencingCodexLoginBroker(events) {
+  const recording = recordingCodexLoginBroker(events);
+  let blocked = false;
+  return Object.freeze({
+    readStatus: recording.readStatus,
+    async acquire(request) {
+      if (blocked) {
+        throw Object.assign(new Error("fictional credential fence"), {
+          code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+        });
+      }
+      const lease = await recording.acquire(request);
+      return Object.freeze({
+        ...lease,
+        release({ safe }) {
+          blocked ||= !safe;
+          lease.release({ safe });
+        },
+      });
+    },
+  });
+}
+
 test("Codex runs once with fixed no-authority flags and an isolated environment", async (t) => {
   const parent = await temporaryDirectory(t, "supervised-codex-provider-");
   const temporaryRoot = path.join(parent, "runtime");
@@ -458,6 +524,7 @@ test("Codex runs once with fixed no-authority flags and an isolated environment"
       argumentValue(invocation.args, "-c"),
       'model_reasoning_effort="high"',
     );
+    assert.ok(invocation.args.includes('service_tier="default"'));
     assert.equal(argumentValue(invocation.args, "-C"), invocation.cwd);
     assert.equal(invocation.args.at(-1), "-");
     for (const forbidden of [
@@ -833,6 +900,213 @@ test("Codex login mode stages one isolated profile and omits every API credentia
     "capture",
     "release:true",
   ]);
+});
+
+test("settled login session preparation failure releases the broker for an independent task", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-failure-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const events = [];
+  let stageCalls = 0;
+  const sessionStore = {
+    async stage() {
+      stageCalls += 1;
+      if (stageCalls === 1) throw new Error("fictional session preparation failure");
+      return { sessionId: null };
+    },
+    async capture() {
+      events.push("session-capture");
+    },
+  };
+  const runner = recordingRunner(async (invocation) => {
+    events.push("run");
+    await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput({ ok: true }));
+    return successfulProcess(Buffer.from(`${JSON.stringify({ type: "thread.started", thread_id: "fixture-next-task" })}\n`));
+  });
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot,
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: sessionStore,
+  });
+
+  await assert.rejects(provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+  })), { code: "STRUCTURED_PROVIDER_UNAVAILABLE" });
+  assert.equal(runner.calls.length, 0);
+  assert.deepEqual(await readdir(temporaryRoot), []);
+  assert.equal(events.at(-1), "release:true");
+
+  assert.equal(await provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#2",
+  })), '{"ok":true}');
+  assert.equal(runner.calls.length, 1);
+  assert.deepEqual(events, [
+    "acquire", "stage", "release:true",
+    "acquire", "stage", "run", "session-capture", "capture", "release:true",
+  ]);
+});
+
+test("cancelled login preparation waits for pending session writes before cleanup and safe release", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-cancel-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const events = [];
+  const controller = new AbortController();
+  const stageEntered = deferred();
+  const continueStage = deferred();
+  let codexHome;
+  let settled = false;
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot,
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: {
+      async stage(input) {
+        codexHome = input.codexHome;
+        stageEntered.resolve();
+        await continueStage.promise;
+        // Model a filesystem operation that cannot stop immediately on abort.
+        await writeFile(path.join(codexHome, "pending-session.json"), "fixture history");
+        return { sessionId: null };
+      },
+      async capture() { assert.fail("no process was started"); },
+    },
+  });
+  const generation = provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+    signal: controller.signal,
+  }));
+  void generation.then(() => { settled = true; }, () => { settled = true; });
+  await stageEntered.promise;
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  try {
+    assert.equal(settled, false);
+    assert.equal(events.some((event) => event.startsWith("release:")), false);
+    assert.equal(await readFile(path.join(codexHome, "auth.json"), "utf8"), "fictional-login-credential");
+  } finally {
+    continueStage.resolve();
+  }
+  await assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CANCELLED" });
+  assert.equal(runner.calls.length, 0);
+  assert.equal(events.at(-1), "release:true");
+  assert.deepEqual(await readdir(temporaryRoot), []);
+});
+
+test("unsettled login preparation stays fenced after its recovery deadline", async (t) => {
+  for (const scenario of ["credential-stage", "session-stage"]) {
+    await t.test(scenario, async (child) => {
+      const parent = await temporaryDirectory(child, `supervised-login-pending-${scenario}-`);
+      const temporaryRoot = path.join(parent, "runtime");
+      const events = [];
+      const controller = new AbortController();
+      const stageEntered = deferred();
+      const continueStage = deferred();
+      const stageSettled = deferred();
+      let codexHome;
+      const waitForStage = async (home) => {
+        codexHome = home;
+        stageEntered.resolve();
+        await continueStage.promise;
+        try {
+          await writeFile(path.join(codexHome, "pending-stage.json"), "fixture state");
+        } finally {
+          stageSettled.resolve();
+        }
+      };
+      const broker = fencingCodexLoginBroker(events);
+      const runner = recordingRunner(async () => successfulProcess());
+      const provider = createTestSupervisedCliBrainProvider({
+        ...providerOptions("codex-cli"),
+        credentialMode: "codex-login",
+        timeoutMs: 1_000,
+      }, {
+        processRunner: runner,
+        commandLocator: recordingLocator(testDescriptor("codex-cli")),
+        environment: {},
+        temporaryRoot,
+        codexLoginCredentialBroker: scenario === "session-stage" ? broker : {
+          ...broker,
+          async acquire(input) {
+            const lease = await broker.acquire(input);
+            return Object.freeze({
+              ...lease,
+              async stage(request) {
+                const staged = await lease.stage(request);
+                await waitForStage(staged.codexHome);
+                return staged;
+              },
+            });
+          },
+        },
+        codexSessionStore: {
+          async stage(input) {
+            await waitForStage(input.codexHome);
+            return { sessionId: null };
+          },
+          async capture() { assert.fail("no process was started"); },
+        },
+      });
+      const generation = provider.generate(brainRequest({
+        ...(scenario === "session-stage" ? { sessionKey: "github:pull_request:example/software#1" } : {}),
+        signal: controller.signal,
+      }));
+      const rejected = assert.rejects(generation, { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+      await stageEntered.promise;
+      controller.abort();
+      try {
+        await within(3_000, rejected);
+        assert.equal(runner.calls.length, 0);
+        assert.equal(events.at(-1), "release:false");
+        assert.equal(await readFile(path.join(codexHome, "auth.json"), "utf8"), "fictional-login-credential");
+        await assert.rejects(provider.generate(brainRequest()), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+      } finally {
+        continueStage.resolve();
+        await stageSettled.promise;
+      }
+      assert.equal(runner.calls.length, 0);
+    });
+  }
+});
+
+test("login preparation failure cannot release a credential lease after failed cleanup", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-login-preparation-cleanup-");
+  const events = [];
+  const runner = recordingRunner(async () => successfulProcess());
+  const provider = createTestSupervisedCliBrainProvider({
+    ...providerOptions("codex-cli"),
+    credentialMode: "codex-login",
+  }, {
+    processRunner: runner,
+    commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: {},
+    temporaryRoot: path.join(parent, "runtime"),
+    codexLoginCredentialBroker: fencingCodexLoginBroker(events),
+    codexSessionStore: {
+      async stage() { throw new Error("fictional preparation failure"); },
+      async capture() { assert.fail("no process was started"); },
+    },
+    cleanupFileSystem: cleanupFileSystem({
+      async unlink() { throw new Error("fictional cleanup failure"); },
+    }),
+  });
+
+  await assert.rejects(provider.generate(brainRequest({
+    sessionKey: "github:pull_request:example/software#1",
+  })), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  assert.equal(events.at(-1), "release:false");
+  await assert.rejects(provider.generate(brainRequest()), { code: "STRUCTURED_PROVIDER_CLEANUP_FAILED" });
+  assert.equal(runner.calls.length, 0);
 });
 
 test("credential mode combinations fail at construction without touching a broker", async (t) => {
@@ -1718,9 +1992,7 @@ test("protected roots reject equality and both ancestor directions before discov
   }
 });
 
-test("Windows rejects a weak owner or DACL before CLI discovery", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows rejects a weak owner or DACL before CLI discovery", async (t) => {
   if (process.platform !== "win32") {
     t.skip("Windows owner and DACL semantics are platform-specific");
     return;
@@ -1750,9 +2022,7 @@ test("Windows rejects a weak owner or DACL before CLI discovery", {
   assert.equal(runner.calls.length, 0);
 });
 
-test("Windows production root creation allows only supported non-mutating broad ACEs", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production root creation allows only supported non-mutating broad ACEs", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
@@ -1766,19 +2036,18 @@ test("Windows production root creation allows only supported non-mutating broad 
       "(A;OICI;0x1200A9;;;BU)",
   );
 
-  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  const identity = await diagnostics.run(() => managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
     directory: root,
     signal: new AbortController().signal,
     validateLocation: async () => {},
-  });
+  }));
 
   assert.equal(path.resolve(identity.path), path.resolve(root));
   assert.equal((await lstat(root)).isDirectory(), true);
 });
 
-test("Windows production directory preparation accepts an omitted optional signal", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production directory preparation accepts an omitted optional signal", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
@@ -1791,10 +2060,11 @@ test("Windows production directory preparation accepts an omitted optional signa
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
   );
 
-  const identity = await managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  const identity = await diagnostics.run(() => managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
     directory: root,
     validateLocation: async () => {},
-  });
+  }));
 
   assert.equal(path.resolve(identity.path), path.resolve(root));
   assert.equal((await lstat(root)).isDirectory(), true);
@@ -1813,32 +2083,27 @@ async function assertProductionRootAclRejected(t, name, extraAce) {
     "(A;OICI;FA;;;{SID})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" + extraAce,
   );
 
-  await assert.rejects(
+  const diagnostics = observePrivateDirectoryHelpers(t);
+  await diagnostics.run(() => assert.rejects(
     managerModule.PRODUCTION_PRIVATE_DIRECTORY_MANAGER.prepare({
       directory: root,
       signal: AbortSignal.timeout(30_000),
       validateLocation: async () => {},
     }),
     { code: "STRUCTURED_PROVIDER_UNAVAILABLE" },
-  );
+  ));
   await assert.rejects(lstat(root), { code: "ENOENT" });
 }
 
-test("Windows production root creation rejects broad child mutation rights", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production root creation rejects broad child mutation rights", async (t) => {
   await assertProductionRootAclRejected(t, "child-create", "(A;OICI;0x6;;;BU)");
 });
 
-test("Windows production root creation rejects unsupported deny ACE shapes", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production root creation rejects unsupported deny ACE shapes", async (t) => {
   await assertProductionRootAclRejected(t, "deny-shape", "(D;OICI;0x2;;;BU)");
 });
 
-test("Windows production root creation binds parent ACL trust to its creation handle across ABA", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production root creation binds parent ACL trust to its creation handle across ABA", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI roots are Windows x64 only");
     return;
@@ -2638,7 +2903,44 @@ test("cleanup retains an invocation whose aggregate regular-file bytes exceed th
   );
 });
 
-test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", async (t) => {
+test("an unresolved cleanup operation is deadline-bounded and blocks providers sharing the root", { timeout: CONTROLLED_PROVIDER_TEST_TIMEOUT_MS }, async (t) => {
+  const time = controlledProviderTime(t);
+  const cleanupEntered = time.phase('cleanup-unlink');
+  const releaseCleanup = deferred();
+  const cleanupSettled = deferred();
+  let cleanupWasEntered = false;
+  let cleanupDidSettle = false;
+  let generationDidSettle = false;
+  let pendingGenerations = 0;
+  const generations = [];
+  const abortGenerations = new AbortController();
+  const generate = provider => {
+    const result = provider.generate(brainRequest({ signal: abortGenerations.signal }));
+    generations.push(result); pendingGenerations += 1;
+    const settled = () => { pendingGenerations -= 1; };
+    void result.then(settled, settled);
+    return result;
+  };
+  let completed = false;
+  let generation = null;
+  t.after(async () => {
+    releaseCleanup.resolve();
+    abortGenerations.abort();
+    try {
+      // A failed assertion may leave the virtual recovery deadline one tick
+      // short. Expire it and release the real operation before waiting.
+      time.advance(1_000);
+      await withinRealTime(3_000, Promise.all([
+        cleanupWasEntered ? cleanupSettled.promise : Promise.resolve(),
+        ...generations.map(result => result.catch(() => {})),
+      ]));
+      await new Promise(resolve => setImmediate(resolve));
+    } finally {
+      const clockRestored = time.restore();
+      if (!completed) t.diagnostic(JSON.stringify({ fixture: 'cleanup-watchdog-teardown',
+        cleanupReleased: true, cleanupWasEntered, cleanupDidSettle, generationDidSettle, pendingGenerations, clockRestored }));
+    }
+  });
   const parent = await temporaryDirectory(t, "supervised-cli-cleanup-hang-");
   const temporaryRoot = path.join(parent, "runtime");
   let invocationDirectory;
@@ -2646,6 +2948,7 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
     invocationDirectory = invocation.cwd;
     const resultFile = argumentValue(invocation.args, "--output-last-message");
     await writeFile(resultFile, codexOutput({ ok: true }), "utf8");
+    time.advance(200);
     return successfulProcess();
   });
   const first = createTestSupervisedCliBrainProvider(
@@ -2655,19 +2958,36 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
       commandLocator: recordingLocator(testDescriptor("codex-cli")),
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
+      monotonicClock: time.monotonicClock,
       cleanupFileSystem: cleanupFileSystem({
-        async unlink() {
-          return new Promise(() => {});
+        async unlink(file) {
+          cleanupWasEntered = true;
+          cleanupEntered.enter();
+          await releaseCleanup.promise;
+          try { return await unlink(file); } finally { cleanupDidSettle = true; cleanupSettled.resolve(); }
         },
       }),
     },
   );
 
-  await within(
+  generation = generate(first);
+  void generation.then(() => { generationDidSettle = true; }, () => { generationDidSettle = true; });
+  let settled = false;
+  const rejected = assert.rejects(generation, {
+    code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
+  });
+  void rejected.then(() => { settled = true; }, () => { settled = true; });
+  await cleanupEntered.waitFor(rejected);
+  assert.equal(firstRunner.calls.length, 1);
+  assert.equal(typeof invocationDirectory, 'string');
+  time.advance(999);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(firstRunner.calls[0].signal.aborted, true, 'the earlier request deadline has expired');
+  assert.equal(settled, false, 'cleanup owns its full original 1000ms budget');
+  time.advance(1);
+  await withinRealTime(
     3_000,
-    assert.rejects(first.generate(brainRequest()), {
-      code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
-    }),
+    rejected,
   );
   await assert.rejects(lstat(invocationDirectory), { code: "ENOENT" });
   assert.equal(
@@ -2676,7 +2996,10 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
   );
 
   const secondLocator = recordingLocator(testDescriptor("codex-cli"));
-  const secondRunner = recordingRunner(async () => successfulProcess());
+  const secondRunner = recordingRunner(async invocation => {
+    await writeFile(argumentValue(invocation.args, '--output-last-message'), codexOutput({ ok: true }), 'utf8');
+    return successfulProcess();
+  });
   const second = createTestSupervisedCliBrainProvider(
     providerOptions("codex-cli"),
     {
@@ -2684,13 +3007,26 @@ test("an unresolved cleanup operation is deadline-bounded and blocks providers s
       commandLocator: secondLocator,
       environment: { OPENAI_API_KEY: "credential" },
       temporaryRoot,
+      monotonicClock: time.monotonicClock,
     },
   );
-  await assert.rejects(second.generate(brainRequest()), {
+  await assert.rejects(generate(second), {
     code: "STRUCTURED_PROVIDER_CLEANUP_FAILED",
   });
   assert.equal(secondLocator.calls.length, 0);
   assert.equal(secondRunner.calls.length, 0);
+  releaseCleanup.resolve();
+  await cleanupSettled.promise;
+  // Let the already admitted unlink settle before a fresh recovery inspects
+  // the retained quarantine. The original timeout must not fake completion.
+  await new Promise(resolve => setImmediate(resolve));
+  await assert.rejects(first.close(), { code: 'STRUCTURED_PROVIDER_CLEANUP_FAILED' });
+  assert.equal(await generate(second), '{"ok":true}');
+  assert.deepEqual(await readdir(temporaryRoot), []);
+  assert.equal(secondRunner.calls.length, 1);
+  await first.close();
+  await second.close();
+  completed = true;
 });
 
 test("cancellation uses an independent cleanup budget after safe process settlement", async (t) => {
@@ -2900,9 +3236,7 @@ test("cleanup rejects a parent swap after a file check without deleting the repl
   assert.equal(await readFile(victimFile, "utf8"), "retain-me");
 });
 
-test("Windows production cleanup pins checked entries until same-handle deletion", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production cleanup pins checked entries until same-handle deletion", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2937,9 +3271,7 @@ test("Windows production cleanup pins checked entries until same-handle deletion
   assert.equal(await readFile(victim, "utf8"), "retain-me");
 });
 
-test("Windows production cleanup cancellation settles after native handles close", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production cleanup cancellation settles after native handles close", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -2968,9 +3300,7 @@ test("Windows production cleanup cancellation settles after native handles close
   assert.equal(await readFile(moved, "utf8"), "private");
 });
 
-test("provider cancellation after native READY completes verified cleanup before releasing the lease", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("provider cancellation after native READY completes verified cleanup before releasing the lease", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -3037,9 +3367,7 @@ test("provider cancellation after native READY completes verified cleanup before
   assert.equal(secondLocator.calls.length, 1);
 });
 
-test("Windows production cleanup preflights every stale tree before deleting any", {
-  skip: HOST_TEST_SKIP,
-}, async (t) => {
+test("Windows production cleanup preflights every stale tree before deleting any", async (t) => {
   if (process.platform !== "win32" || process.arch !== "x64") {
     t.skip("production supervised CLI cleanup is Windows x64 only");
     return;
@@ -3933,3 +4261,223 @@ test("stale scavenging fails closed before mutation when the root exceeds 128 en
     129,
   );
 });
+
+
+test("PR review can read complete file artifacts through a scoped MCP reader", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-complete-review-");
+  const target = { pullRequestNumber: 42, gitTarget: {
+    schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+    headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40),
+  } };
+  let closed = false;
+  let checked = false;
+  const diffText = "complete diff\n".repeat(10_000);
+  const manifestText = JSON.stringify({ files: Array.from({ length: 117 }, (_, i) => ({ path: `src/${i}.js` })) });
+  const runner = recordingRunner(async (invocation) => {
+    assert.equal(await readFile(path.join(invocation.cwd, "review.diff"), "utf8"), diffText);
+    assert.equal(await readFile(path.join(invocation.cwd, "review-manifest.json"), "utf8"), manifestText);
+    const marker = JSON.parse(await readFile(path.join(invocation.cwd, ".mydashboard-invocation.json"), "utf8"));
+    assert.equal(marker.schemaVersion, 3);
+    assert.equal(marker.stagedReviewBytes, Buffer.byteLength(diffText) + Buffer.byteLength(manifestText));
+    assert.ok(invocation.args.includes('mcp_servers.pr_review.url="http://127.0.0.1:12345/read-only-fixture"'));
+    for (const tool of ["read_document", "read_source", "list_directory"]) {
+      assert.ok(invocation.args.includes(`mcp_servers.pr_review.tools.${tool}.approval_mode="approve"`));
+      assert.ok(invocation.args.includes(`mcp_servers.pr_review.tools.${tool}.output_token_limit=65536`));
+    }
+    assert.ok(invocation.args.includes("shell_tool"));
+    assert.match(Buffer.from(invocation.input).toString("utf8"), /pr_review/);
+    await writeFile(argumentValue(invocation.args, "--output-last-message"), JSON.stringify({ result: JSON.stringify({ intent: { type: "propose_github_review" } }) }));
+    return successfulProcess();
+  });
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: runner, commandLocator: recordingLocator(testDescriptor("codex-cli")),
+    environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot: path.join(parent, "runtime"),
+    reviewReaderFactory: async (observed) => {
+      assert.deepEqual(observed, target);
+      return { url: "http://127.0.0.1:12345/read-only-fixture", diffText, manifestText,
+        assertComplete() { checked = true; }, async close() { closed = true; } };
+    },
+  });
+  await provider.generate(brainRequest({ reviewTarget: target }));
+  assert.equal(checked, true);
+  assert.equal(closed, true);
+  await provider.close();
+});
+
+test("a complete staged diff beyond the transient cleanup budget is removed after review", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-large-review-");
+  const temporaryRoot = path.join(parent, "runtime");
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: recordingRunner(async (invocation) => {
+      await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput({ ok: true }));
+      return successfulProcess();
+    }), commandLocator: recordingLocator(testDescriptor("codex-cli")), environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot,
+    reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "d".repeat(65 * 1024 * 1024), manifestText: "{}", async assertComplete() {}, async close() {} }),
+  });
+  assert.deepEqual(JSON.parse(await provider.generate(brainRequest({ reviewTarget: { gitTarget, pullRequestNumber: 42 } }))), { ok: true });
+  assert.equal((await readdir(temporaryRoot)).filter((name) => name.startsWith("invocation-") || name.startsWith(".cleanup-")).length, 0);
+  await provider.close();
+});
+
+
+test("an incomplete CLI review is rejected before its proposal can reach GitHub", async (t) => {
+  const parent = await temporaryDirectory(t, "supervised-incomplete-review-");
+  let closed = false;
+  const provider = createTestSupervisedCliBrainProvider(providerOptions("codex-cli"), {
+    processRunner: recordingRunner(async (invocation) => {
+      await writeFile(argumentValue(invocation.args, "--output-last-message"), JSON.stringify({ result: JSON.stringify({ intent: { type: "propose_github_review", verdict: "comment" } }) }));
+      return successfulProcess();
+    }), commandLocator: recordingLocator(testDescriptor("codex-cli")), environment: { OPENAI_API_KEY: "fixture-key" }, temporaryRoot: path.join(parent, "runtime"),
+    reviewReaderFactory: async () => ({ url: "http://127.0.0.1:12345/fixture", diffText: "complete", manifestText: "{}", async assertComplete() { throw Object.assign(new Error("incomplete"), { code: "PR_REVIEW_READ_INCOMPLETE" }); }, async close() { closed = true; } }),
+  });
+  const gitTarget = { schemaVersion: 1, provider: "github", sourceAccountId: "reviewer", baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40), headRepository: "acme/repo", headRefName: "feature", headRefOid: "b".repeat(40) };
+  await assert.rejects(provider.generate(brainRequest({ reviewTarget: { gitTarget, pullRequestNumber: 42 } })), { code: "PR_REVIEW_READ_INCOMPLETE" });
+  assert.equal(closed, true);
+  await provider.close();
+});
+
+function internalRepairReviewFixture() {
+  const gitTarget = {
+    schemaVersion: 1, provider: "github", sourceAccountId: "reviewer",
+    baseRepository: "acme/repo", baseRefName: "main", baseRefOid: "a".repeat(40),
+    headRepository: "contributor/repo", headRefName: "feature", headRefOid: "b".repeat(40),
+  };
+  const originalHeadRefOid = "c".repeat(40);
+  const feedback = {
+    changeRequests: [{ id: "review-1", author: "reviewer", body: "Fix the original defect." }],
+    threads: [{ id: "thread-1", comments: [{ id: "comment-1", author: "reviewer", body: "Original defect details. ".repeat(3_000) }] }],
+  };
+  const feedbackDigest = ownReviewFeedbackDigest(feedback);
+  const snapshot = createOriginalRepairFeedbackSnapshot({
+    repository: gitTarget.baseRepository, number: 42,
+    context: { schemaVersion: 1, headRefOid: originalHeadRefOid, reviewFeedbackDigest: feedbackDigest, feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: originalHeadRefOid, observedAt: "2026-10-10T03:00:00.000Z" },
+  });
+  const target = { pullRequestNumber: 42, gitTarget, repairFeedback: {
+    snapshotId: snapshot.snapshotId, feedbackDigest, originalHeadRefOid, reviewHeadRefOid: gitTarget.headRefOid,
+  } };
+  const diffText = `diff --git a/src/fix.js b/src/fix.js\n--- a/src/fix.js\n+++ b/src/fix.js\n@@ -1 +1 @@\n-old\n+${"fixed ".repeat(10_000)}\n`;
+  const reader = new GitHubReviewReader({
+    async run(command, args) {
+      assert.equal(command, "gh");
+      assert.deepEqual(args.slice(0, 3), ["api", "--hostname", "github.com"]);
+      if (args[3] === "user") return { login: gitTarget.sourceAccountId };
+      if (args[3] === "graphql") return { data: { repository: {
+        nameWithOwner: gitTarget.baseRepository,
+        pullRequest: {
+          number: 42, url: "https://github.com/acme/repo/pull/42", state: "OPEN", author: { login: "contributor" }, changedFiles: 1,
+          baseRefName: gitTarget.baseRefName, baseRefOid: gitTarget.baseRefOid,
+          baseRef: { name: gitTarget.baseRefName, repository: { nameWithOwner: gitTarget.baseRepository }, target: { oid: gitTarget.baseRefOid } },
+          headRefName: gitTarget.headRefName, headRefOid: gitTarget.headRefOid,
+          headRef: { name: gitTarget.headRefName, repository: { nameWithOwner: gitTarget.headRepository }, target: { oid: gitTarget.headRefOid } },
+          headRepository: { nameWithOwner: gitTarget.headRepository },
+        },
+      } } };
+      assert.equal(args[3], "repos/acme/repo/pulls/42/files?per_page=100");
+      assert.ok(args.includes("--paginate"));
+      return [[{ filename: "src/fix.js", status: "modified", additions: 1, deletions: 1 }]];
+    },
+    async runText(command, args) {
+      assert.equal(command, "gh");
+      assert.equal(args[3], `repos/acme/repo/compare/${gitTarget.baseRefOid}...${gitTarget.headRefOid}`);
+      assert.ok(args.includes("Accept: application/vnd.github.diff"));
+      return diffText;
+    },
+    originalRepairFeedbackReader: {
+      async read(request) {
+        assert.deepEqual(request, { snapshotId: snapshot.snapshotId, repository: gitTarget.baseRepository,
+          number: 42, feedbackDigest, originalHeadRefOid });
+        return snapshot;
+      },
+    },
+  });
+  return { reader, target, snapshot };
+}
+
+async function readReviewDocument(url, document, coverage = "all-pages") {
+  let text = "";
+  let offset = 0;
+  let pages = 0;
+  do {
+    const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++pages, method: "tools/call",
+        params: { name: "read_document", arguments: { document, offset, length: 24_000 } } }) });
+    assert.equal(response.status, 200);
+    const result = (await response.json()).result;
+    assert.notEqual(result.isError, true);
+    const page = JSON.parse(result.content[0].text);
+    assert.equal(page.offset, offset);
+    text += page.text;
+    offset = page.nextOffset;
+    if (coverage === "first-page") {
+      assert.notEqual(offset, null, `${document} must exercise partial pagination`);
+      break;
+    }
+  } while (offset !== null);
+  return { text, pages };
+}
+
+for (const credentialMode of ["api-key", "codex-login"]) {
+  test(`${credentialMode} internal review enforces complete paginated reads`, async (t) => {
+    const cases = ["complete", "handoff"].flatMap((type) =>
+      ["unread", "partial-diff", "unread-feedback", "partial-feedback", "all-pages"].map((coverage) => ({ type, coverage })));
+    cases.push({ type: "wait_condition", coverage: "unread" });
+    for (const { type, coverage } of cases) {
+      await t.test(`${type} with ${coverage}`, async (child) => {
+        const parent = await temporaryDirectory(child, "supervised-internal-review-");
+        const temporaryRoot = path.join(parent, "runtime");
+        const { reader, target, snapshot } = internalRepairReviewFixture();
+        const events = [];
+        let readerUrl;
+        const intent = type === "handoff"
+          ? { type, capability: "development", brief: "The original defect remains in src/fix.js." }
+          : { type };
+        const decision = { intent, evidence: [`head:${target.gitTarget.headRefOid}`, "controlled-commit:fixture", "publication:fixture"] };
+        const runner = recordingRunner(async (invocation) => {
+          const endpoint = invocation.args.find((value) => value.startsWith("mcp_servers.pr_review.url="));
+          assert.ok(endpoint);
+          assert.equal(JSON.parse(endpoint.slice("mcp_servers.pr_review.url=".length)), readerUrl);
+          if (coverage !== "unread") {
+            await readReviewDocument(readerUrl, "review-manifest.json");
+            const diff = await readReviewDocument(readerUrl, "review.diff", coverage === "partial-diff" ? "first-page" : "all-pages");
+            if (coverage !== "partial-diff") assert.ok(diff.pages > 1);
+            await readReviewDocument(readerUrl, "repair-feedback-manifest.json");
+            if (coverage !== "unread-feedback") {
+              const original = await readReviewDocument(readerUrl, "repair-feedback.json", coverage === "partial-feedback" ? "first-page" : "all-pages");
+              if (coverage !== "partial-feedback") {
+                assert.ok(original.pages > 1);
+                assert.deepEqual(JSON.parse(original.text), snapshot);
+              }
+            }
+          }
+          await writeFile(argumentValue(invocation.args, "--output-last-message"), codexOutput(decision));
+          return successfulProcess();
+        });
+        const provider = createTestSupervisedCliBrainProvider({ ...providerOptions("codex-cli"), credentialMode }, {
+          processRunner: runner, commandLocator: recordingLocator(testDescriptor("codex-cli")), temporaryRoot,
+          environment: credentialMode === "api-key" ? { OPENAI_API_KEY: "fixture-key" } : {},
+          ...(credentialMode === "codex-login" ? { codexLoginCredentialBroker: recordingCodexLoginBroker(events) } : {}),
+          async reviewReaderFactory(observed, options) {
+            assert.deepEqual(observed, target);
+            const session = await reader.open(observed, options);
+            readerUrl = session.url;
+            return session;
+          },
+        });
+        child.after(() => provider.close());
+        const generation = provider.generate(brainRequest({ reviewTarget: target }));
+        if (type !== "wait_condition" && coverage !== "all-pages") {
+          await assert.rejects(generation, { code: "PR_REVIEW_READ_INCOMPLETE" });
+        } else {
+          assert.deepEqual(JSON.parse(await generation), decision);
+        }
+        assert.equal(runner.calls.length, 1);
+        assert.deepEqual(await readdir(temporaryRoot), []);
+        await assert.rejects(fetch(readerUrl, { method: "POST" }));
+        if (credentialMode === "codex-login") assert.deepEqual(events, ["acquire", "stage", "capture", "release:true"]);
+      });
+    }
+  });
+}

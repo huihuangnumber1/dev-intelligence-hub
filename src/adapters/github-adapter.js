@@ -1,16 +1,27 @@
 import { types as utilTypes } from "node:util";
+import { isPersonalPullRequest } from '../domain/pr-responsibility.js';
 
 import { runCommand, runJson } from "../lib/command-runner.js";
+import { INCOMING_REVIEW_QUERY, projectIncomingReview } from "./github-incoming-review.js";
+import { readOwnReviewFeedback, readOwnPullRequestConflict, readOwnPullRequestHandoff, readPullRequestLocalWorkFacts, readPullRequestRoleHandoffFacts } from "./github-own-review-feedback.js";
+import {
+  applyGitHubCurrentPullRequestTarget,
+  currentPullRequestTargetView,
+  readGitHubCurrentPullRequestTarget,
+  readGitHubCurrentPullRequestTargetBatch,
+} from "./github-current-pull-request-target.js";
 import {
   normalizePullRequestGitTarget,
   samePullRequestGitTarget,
 } from "../domain/git-tool-contract.js";
 import {
   createPullRequestReadIdentity,
+  PULL_REQUEST_READ_BODY_BYTES,
 } from "../domain/pull-request-read-facts.js";
 import { normalizeEffectivePullRequestUpdatedWindow } from "../domain/pull-request-updated-window.js";
 import {
   GITHUB_PULL_REQUEST_FACTS_QUERY,
+  GitHubPullRequestFactsError,
   githubGraphPullRequestTarget,
   githubViewPullRequestTargetState,
   projectGitHubPullRequestFacts,
@@ -18,7 +29,7 @@ import {
 
 const GITHUB_HOST = "github.com";
 const SEARCH_LIMIT = 1_000;
-const ISSUE_DETAIL_BATCH_SIZE = 100;
+const ISSUE_DETAIL_BATCH_SIZE = 25;
 const MILESTONE_PAGE_SIZE = 100;
 const MILESTONES_PER_REPOSITORY = 10;
 const SECOND_MS = 1_000;
@@ -33,14 +44,11 @@ const PR_DETAIL_FIELDS =
   "number,url,body,additions,deletions,changedFiles,reviewDecision,statusCheckRollup,mergeStateStatus,isDraft,labels,assignees,milestone,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,reviews";
 const PR_REVIEW_CONTEXT_FIELDS =
   "number,url,title,body,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner,additions,deletions,changedFiles,files";
-const PR_TARGET_FIELDS =
-  "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner";
 const PR_OWNER_CONTEXT_FIELDS = `${PR_REVIEW_CONTEXT_FIELDS},state`;
-const PR_OPEN_TARGET_FIELDS = `${PR_TARGET_FIELDS},state`;
 const ISSUE_FIELDS =
   "id,number,title,body,url,repository,updatedAt,createdAt,author,state,labels,assignees,commentsCount";
 const ISSUE_DETAIL_QUERY =
-  "query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number body milestone{title} comments(last:1){totalCount nodes{author{login} body createdAt updatedAt url}}}}}";
+  "query($ids:[ID!]!){nodes(ids:$ids){... on Issue{id number body milestone{title} comments(last:1){totalCount nodes{author{login} body createdAt updatedAt url}} closedByPullRequestsReferences(first:20,includeClosedPrs:true){pageInfo{hasNextPage} nodes{number title state mergedAt repository{nameWithOwner}}} timelineItems(last:20,itemTypes:[CROSS_REFERENCED_EVENT]){pageInfo{hasPreviousPage} nodes{... on CrossReferencedEvent{source{... on PullRequest{number title state mergedAt repository{nameWithOwner}}}}}}}}}";
 const GITHUB_DESCRIPTION_MAXIMUM_BYTES = 12 * 1024;
 const ISSUE_COMMENT_MAXIMUM_BYTES = 4 * 1024;
 const PULL_REQUEST_GIT_FACT_FIELDS = Object.freeze([
@@ -127,6 +135,39 @@ function issueLatestComment(connection) {
           url: typeof comment.url === "string" ? comment.url : "",
         }
       : null,
+  };
+}
+
+function issuePullRequestLinks(detail) {
+  const formal = detail.closedByPullRequestsReferences;
+  const mentions = detail.timelineItems;
+  if (!formal || !mentions) return null;
+  const links = new Map();
+  const add = (node, relation) => {
+    const repo = node?.repository?.nameWithOwner;
+    const number = node?.number;
+    if (
+      typeof repo !== "string" ||
+      !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repo) ||
+      !Number.isSafeInteger(number) || number < 1
+    ) return;
+    const key = `${repo.toLowerCase()}#${number}`;
+    if (links.has(key) && relation !== "formal") return;
+    links.set(key, {
+      repo,
+      number,
+      title: boundedGitHubText(node.title, 512),
+      state: node.mergedAt ? "merged" : String(node.state || "").toLowerCase(),
+      relation,
+      url: `https://github.com/${repo}/pull/${number}`,
+    });
+  };
+  for (const node of mentions.nodes || []) add(node?.source, "mention");
+  for (const node of formal.nodes || []) add(node, "formal");
+  return {
+    links: [...links.values()],
+    complete: formal.pageInfo?.hasNextPage === false &&
+      mentions.pageInfo?.hasPreviousPage === false,
   };
 }
 
@@ -254,6 +295,25 @@ function staleReviewContext() {
     code: "PR_CONTEXT_STALE",
     statusCode: 409,
   });
+}
+
+function currentContextDetail(detail, observation) {
+  if (observation.state !== "OPEN") throw staleReviewContext();
+  try { return applyGitHubCurrentPullRequestTarget(detail, observation); }
+  catch (error) {
+    if (error.code === "GITHUB_CURRENT_PR_TARGET_INVALID") throw staleReviewContext();
+    throw error;
+  }
+}
+
+function currentContextTargetView(observation) {
+  if (observation.state !== "OPEN") throw staleReviewContext();
+  return currentPullRequestTargetView(observation);
+}
+
+function invalidCurrentFacts(error) {
+  if (error.code === "GITHUB_CURRENT_PR_TARGET_INVALID") throw new GitHubPullRequestFactsError();
+  throw error;
 }
 
 function staleReadFacts() {
@@ -541,7 +601,7 @@ export function combinePullRequestRecords(assigned, authored, currentUser) {
       return {
         ...record,
         relation,
-        assignmentSource: relation === "authored" ? "author" : "assignee",
+        assignmentSource: relation === "authored" ? "author" : record.relationSources.includes("assignee") ? "assignee" : "reviewer",
       };
     })
     .sort(
@@ -580,6 +640,9 @@ export function summarizeReviewFacts(reviews = [], currentUser) {
   );
   const myReview =
     myDecision || latestReview(reviews, authoredByCurrentUser);
+  const myLatestPublishedReview = latestReview(reviews, review => authoredByCurrentUser(review) &&
+    ["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(review.state) &&
+    Number.isFinite(Date.parse(review.submittedAt)));
   const latestOtherDecision = latestReview(
     reviews,
     (review) =>
@@ -614,6 +677,7 @@ export function summarizeReviewFacts(reviews = [], currentUser) {
   const latestChangeRequest = outstandingChangeRequests[0];
   return {
     ...reviewFields("myReview", myReview),
+    ...reviewFields("myLatestPublishedReview", myLatestPublishedReview),
     ...reviewFields("latestOtherDecision", latestOtherDecision),
     ...reviewFields("latestChangeRequest", latestChangeRequest),
     outstandingChangeRequestCommitOids: [
@@ -679,7 +743,7 @@ async function mapWithConcurrency(items, limit, transform) {
     while (!firstError && cursor < items.length) {
       const index = cursor++;
       try {
-        result[index] = await transform(items[index]);
+        result[index] = await transform(items[index], index);
       } catch (error) {
         firstError ??= error;
       }
@@ -708,6 +772,8 @@ export class GitHubAdapter {
     maxReadChecks,
     maxReadBodyBytes,
     maxReadFactBytes,
+    readIncomingReviews = false,
+    readOwnReviewFeedback: readOwnReviewFeedbackEnabled = true,
     clock = () => new Date(),
   } = {}) {
     const commandEnvironment = Object.freeze({ ...env, GH_HOST: GITHUB_HOST });
@@ -717,6 +783,8 @@ export class GitHubAdapter {
       Number.isFinite(maxPatchCharacters) && maxPatchCharacters > 0
         ? maxPatchCharacters
         : 24_000;
+    this.readIncomingReviews = readIncomingReviews;
+    this.readOwnReviewFeedbackEnabled = readOwnReviewFeedbackEnabled;
     if (typeof clock !== "function") {
       throw new TypeError("GitHubAdapter clock is invalid");
     }
@@ -754,8 +822,8 @@ export class GitHubAdapter {
       ),
       bodyBytes: boundedPositiveInteger(
         maxReadBodyBytes,
-        4_096,
-        16 * 1024,
+        PULL_REQUEST_READ_BODY_BYTES,
+        PULL_REQUEST_READ_BODY_BYTES,
         "maxReadBodyBytes",
       ),
       factBytes: boundedPositiveInteger(
@@ -782,6 +850,7 @@ export class GitHubAdapter {
     const filter = {
       assigned: "--assignee=@me",
       authored: "--author=@me",
+      requested: "--review-requested=@me",
     }[relation];
     return [
       "search",
@@ -871,14 +940,16 @@ export class GitHubAdapter {
     );
   }
 
-  async #enrichPullRequest(record, currentUser, options) {
-    const detail = await this.run("gh", [
+  async #enrichPullRequest(record, currentUser, options, observation) {
+    const rawDetail = await this.run("gh", [
       "pr",
       "view",
       record.url,
       "--json",
       PR_DETAIL_FIELDS,
     ], options);
+    const targetAvailable = observation.gitTarget !== null;
+    const detail = targetAvailable ? applyGitHubCurrentPullRequestTarget(rawDetail, observation) : rawDetail;
     const recordIdentity = pullRequestIdentity(record.url);
     const detailIdentity = pullRequestIdentity(detail.url);
     const repo = repositoryName(record);
@@ -894,10 +965,39 @@ export class GitHubAdapter {
       throw new Error("GitHub PR identity changed during refresh");
     }
     const author = record.author?.login || "";
-    const gitFacts = pullRequestGitFacts(detail, {
+    if (!Array.isArray(detail.assignees) || detail.assignees.some(user => typeof user?.login !== 'string' || !user.login)) {
+      throw new Error('GitHub PR assignment facts are incomplete');
+    }
+    const gitFacts = pullRequestGitFacts(targetAvailable ? detail : {}, {
       repository: repo,
       account: currentUser,
     });
+    let incoming = {};
+    let ownFeedback = {};
+    if (this.readOwnReviewFeedbackEnabled && author.toLowerCase() === currentUser.toLowerCase()) {
+      try {
+        ownFeedback = await readOwnReviewFeedback(this.run, { repository: repo, number: record.number, account: currentUser }, options);
+        if (ownFeedback.headRefOid !== detail.headRefOid || ownFeedback.state !== (record.state?.toLowerCase() || "open")) throw new Error("GitHub own PR feedback changed during refresh");
+        const { feedback, reviewFeedbackIds, ...summary } = ownFeedback;
+        ownFeedback = summary;
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        ownFeedback = { reviewFeedbackAvailable: false };
+      }
+    }
+    if (this.readIncomingReviews && author.toLowerCase() !== currentUser.toLowerCase()) {
+      try {
+        // The enclosing discovery verifies the account before and after the
+        // whole batch. Each PR needs only one additional facts read here.
+        incoming = await this.#readIncomingReviewRequest({ repository: repo, number: record.number, account: currentUser }, options);
+        if (incoming.headRefOid !== detail.headRefOid) throw new Error("GitHub incoming Review head changed");
+        const { myReviewState, myReviewAt, myReviewCommitOid, raw } = incoming;
+        incoming = { ...projectIncomingReview(raw, currentUser), myReviewState, myReviewAt, myReviewCommitOid };
+      } catch (error) {
+        options.signal?.throwIfAborted();
+        incoming = { incomingReviewFactsAvailable: false };
+      }
+    }
     return {
       id: `github:pr:${repo}#${record.number}`,
       kind: "pull_request",
@@ -910,7 +1010,7 @@ export class GitHubAdapter {
       url: record.url,
       author,
       currentUser,
-      state: record.state?.toLowerCase() || "open",
+      state: observation.state.toLowerCase(),
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       reviewDecision: detail.reviewDecision || "",
@@ -931,11 +1031,16 @@ export class GitHubAdapter {
       milestone: detail.milestone?.title || "",
       headRefOid: detail.headRefOid || "",
       gitTargetAvailable: completePullRequestGitFacts(gitFacts),
+      ...(observation.gitTargetUnavailableReason
+        ? { gitTargetUnavailableReason: observation.gitTargetUnavailableReason }
+        : {}),
       ...(completePullRequestGitFacts(gitFacts)
         ? { ...gitFacts, gitTarget: gitTargetFromFacts(gitFacts) }
         : {}),
       reviewFactsAvailable: true,
       ...summarizeReviewFacts(detail.reviews, currentUser),
+      ...incoming,
+      ...ownFeedback,
     };
   }
 
@@ -962,14 +1067,93 @@ export class GitHubAdapter {
       authored,
       currentUser,
     );
-    const items = await mapWithConcurrency(records, 4, (record) =>
-      this.#enrichPullRequest(record, currentUser, commandOptions),
+    const targets = await this.#currentDiscoveryTargets(records, currentUser, commandOptions);
+    const items = await mapWithConcurrency(records, 4, (record, index) =>
+      this.#enrichPullRequest(record, currentUser, commandOptions, targets[index]),
     );
     const finalUser = await this.currentUser(commandOptions);
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }
-    return items;
+    return items.filter(isPersonalPullRequest);
+  }
+
+  async readIncomingReviewRequest({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1) throw new TypeError("Invalid incoming Review target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await this.#readIncomingReviewRequest({ repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readOwnPullRequestFeedback({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR feedback target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readOwnReviewFeedback(this.run, { repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readOwnPullRequestHandoff({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR handoff target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readOwnPullRequestHandoff(this.run, { repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readOwnPullRequestConflict({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 || typeof account !== "string" || !account) throw new TypeError("Invalid own PR conflict target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readOwnPullRequestConflict(this.run, { repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readPullRequestLocalWorkFacts({ repository, number, account, authorAccountId }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 ||
+        typeof account !== "string" || !account || (authorAccountId !== null &&
+        (typeof authorAccountId !== "string" || !/^[A-Za-z0-9-]+$/.test(authorAccountId)))) throw new TypeError("Invalid local PR work target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readPullRequestLocalWorkFacts(this.run, { repository, number, account, authorAccountId }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async readPullRequestRoleHandoffFacts({ repository, number, account }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number < 1 ||
+        typeof account !== "string" || !/^[A-Za-z0-9-]+$/.test(account)) throw new TypeError("Invalid role handoff target");
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    const facts = await readPullRequestRoleHandoffFacts(this.run, { repository, number, account }, options);
+    if ((await this.currentUser(options)).toLowerCase() !== account.toLowerCase()) throw new Error("GitHub account changed");
+    return facts;
+  }
+
+  async isCommitAncestor({ repository, ancestorOid, headRefOid }, options = {}) {
+    if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+        !/^[a-f0-9]{40,64}$/.test(ancestorOid) || !/^[a-f0-9]{40,64}$/.test(headRefOid)) {
+      throw new TypeError("Invalid fixed commit ancestry target");
+    }
+    const result = await this.run("gh", ["api", "--hostname", GITHUB_HOST,
+      `repos/${repository}/compare/${ancestorOid}...${headRefOid}`], { timeoutMs: 15_000, ...options });
+    return ["ahead", "identical"].includes(result?.status) && result.behind_by === 0 &&
+      result.merge_base_commit?.sha === ancestorOid;
+  }
+
+  async #readIncomingReviewRequest({ repository, number, account }, options) {
+    const [owner, name] = repository.split("/");
+    const result = await this.run("gh", ["api", "graphql", "-f", `query=${INCOMING_REVIEW_QUERY}`, "-f", `owner=${owner}`, "-f", `name=${name}`, "-F", `number=${number}`], options);
+    const pr = result?.data?.repository?.pullRequest;
+    if (result?.errors?.length || pr?.number !== number || pr?.url?.toLowerCase() !== `https://github.com/${repository}/pull/${number}`.toLowerCase()) throw new Error("GitHub incoming Review target changed");
+    return {
+      ...projectIncomingReview(pr, account), kind: "pull_request", state: pr.state.toLowerCase(),
+      author: pr.author?.login || "", currentUser: account, headRefOid: pr.headRefOid,
+      assignees: pr.assignees.nodes.map(user => user.login),
+      isDraft: pr.isDraft, title: pr.title, repo: repository, labels: pr.labels?.nodes?.map((label) => label.name) || [],
+      ciStatus: pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state || "NONE",
+      gitTarget: { baseRefName: pr.baseRefName, headRefName: pr.headRefName },
+      ...summarizeReviewFacts(pr.reviews?.nodes || [], account), raw: pr,
+    };
   }
 
   async searchPullRequests(relation, currentUser, options = {}) {
@@ -979,7 +1163,8 @@ export class GitHubAdapter {
       effectiveUpdatedWindow,
       commandOptions,
     );
-    const items = await mapWithConcurrency(records, 4, (record) =>
+    const targets = await this.#currentDiscoveryTargets(records, currentUser, commandOptions);
+    const items = await mapWithConcurrency(records, 4, (record, index) =>
       this.#enrichPullRequest(
         {
           ...record,
@@ -996,13 +1181,41 @@ export class GitHubAdapter {
         },
         currentUser,
         commandOptions,
+        targets[index],
       ),
     );
     const finalUser = await this.currentUser(commandOptions);
     if (finalUser.toLowerCase() !== currentUser.toLowerCase()) {
       throw new Error("GitHub account changed during PR refresh");
     }
-    return items;
+    return items.filter(isPersonalPullRequest);
+  }
+
+  async #currentDiscoveryTargets(records, currentUser, options) {
+    const batches = [];
+    for (let index = 0; index < records.length; index += 25) batches.push(records.slice(index, index + 25));
+    const observations = await mapWithConcurrency(batches, 4, (batch) =>
+      readGitHubCurrentPullRequestTargetBatch(this.run, batch.map((record) => ({
+        repository: repositoryName(record), number: record.number, sourceAccountId: currentUser,
+      })), options));
+    return observations.flat();
+  }
+
+  async #currentTarget(url, account, options) {
+    const identity = pullRequestIdentity(url);
+    if (!identity) throw staleReviewContext();
+    try {
+      return await readGitHubCurrentPullRequestTarget(this.run, { ...identity, sourceAccountId: account }, options);
+    } catch (error) {
+      if (error.code === "GITHUB_CURRENT_PR_TARGET_INVALID") throw staleReviewContext();
+      throw error;
+    }
+  }
+
+  async #currentFactTarget(identity, options) {
+    const observation = await readGitHubCurrentPullRequestTarget(this.run, identity, options).catch(invalidCurrentFacts);
+    if (observation.state !== "OPEN") throw terminalReadFacts(observation.state);
+    return currentPullRequestTargetView(observation);
   }
 
   async searchIssues(options = {}) {
@@ -1087,6 +1300,7 @@ export class GitHubAdapter {
         milestone: detail.milestone?.title || "",
         commentsCount: discussion.commentsCount,
         latestComment: discussion.latestComment,
+        pullRequestLinks: issuePullRequestLinks(detail),
       };
     });
   }
@@ -1119,13 +1333,15 @@ export class GitHubAdapter {
     ) {
       throw staleReviewContext();
     }
-    const metadata = await this.run("gh", [
+    let metadata = await this.run("gh", [
       "pr",
       "view",
       item.url,
       "--json",
       PR_REVIEW_CONTEXT_FIELDS,
     ], commandOptions);
+    if (expectedTarget) metadata = currentContextDetail(metadata,
+      await this.#currentTarget(item.url, observedAccount, commandOptions));
     const contextGitFacts = pullRequestGitFacts(metadata, {
       repository: canonicalBaseRepository(item, metadata, expectedTarget),
       account: observedAccount,
@@ -1160,13 +1376,7 @@ export class GitHubAdapter {
     if (!includePatch) {
       if (expectedTarget) {
         const [latest, latestAccount] = await Promise.all([
-          this.run("gh", [
-            "pr",
-            "view",
-            item.url,
-            "--json",
-            "number,url,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner",
-          ], commandOptions),
+          this.#currentTarget(item.url, observedAccount, commandOptions).then(currentContextTargetView),
           this.currentUser(commandOptions),
         ]);
         const latestFacts = pullRequestGitFacts(latest, {
@@ -1197,7 +1407,7 @@ export class GitHubAdapter {
       { timeoutMs: 60_000, ...commandOptions },
     );
     const [latest, latestAccount] = await Promise.all([
-      this.run("gh", [
+      expectedTarget ? this.#currentTarget(item.url, observedAccount, commandOptions).then(currentContextTargetView) : this.run("gh", [
         "pr",
         "view",
         item.url,
@@ -1256,7 +1466,7 @@ export class GitHubAdapter {
       throw new TypeError("pull request target is invalid");
     }
     const commandOptions = signal === null ? {} : { signal };
-    const [initialAccount, initial] = await Promise.all([
+    const [initialAccount, rawInitial] = await Promise.all([
       this.currentUser(commandOptions),
       this.run(
         "gh",
@@ -1264,6 +1474,8 @@ export class GitHubAdapter {
         commandOptions,
       ),
     ]);
+    const initial = currentContextDetail(rawInitial,
+      await this.#currentTarget(url, initialAccount, commandOptions));
     const initialIdentity = pullRequestIdentity(initial.url);
     const facts = pullRequestGitFacts(initial, {
       repository: value.repository,
@@ -1282,11 +1494,7 @@ export class GitHubAdapter {
     const gitTarget = gitTargetFromFacts(facts);
     const [finalAccount, final] = await Promise.all([
       this.currentUser(commandOptions),
-      this.run(
-        "gh",
-        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
-        commandOptions,
-      ),
+      this.#currentTarget(url, initialAccount, commandOptions).then(currentContextTargetView),
     ]);
     const finalIdentity = pullRequestIdentity(final.url);
     const finalFacts = pullRequestGitFacts(final, {
@@ -1321,15 +1529,9 @@ export class GitHubAdapter {
     const binding = identity.executionBinding;
     const target = binding.gitTarget;
     const [owner, name] = binding.repository.split("/");
-    const url = `https://${GITHUB_HOST}/${binding.repository}/pull/${binding.pullRequestNumber}`;
-
     const [initialAccount, initialResponse] = await Promise.all([
       this.currentUser(commandOptions),
-      this.run(
-        "gh",
-        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
-        commandOptions,
-      ),
+      this.#currentFactTarget({ repository: binding.repository, number: binding.pullRequestNumber, sourceAccountId: target.sourceAccountId }, commandOptions),
     ]);
     const initial = githubViewPullRequestTargetState(initialResponse, identity);
     if (initial.state !== "OPEN") throw terminalReadFacts(initial.state);
@@ -1380,11 +1582,7 @@ export class GitHubAdapter {
     });
 
     const [latestResponse, finalAccount] = await Promise.all([
-      this.run(
-        "gh",
-        ["pr", "view", url, "--json", PR_OPEN_TARGET_FIELDS],
-        commandOptions,
-      ),
+      this.#currentFactTarget({ repository: binding.repository, number: binding.pullRequestNumber, sourceAccountId: target.sourceAccountId }, commandOptions),
       this.currentUser(commandOptions),
     ]);
     const latest = githubViewPullRequestTargetState(latestResponse, identity);

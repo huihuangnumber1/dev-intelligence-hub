@@ -1,3 +1,4 @@
+import { maintenanceAttentionCode } from "../domain/maintenance-attention.js";
 import {
   assertAttentionAllowedKeys,
   attentionDigest,
@@ -15,6 +16,7 @@ import { OperationQueue } from "../lib/operation-queue.js";
 import {
   ATTENTION_INBOX_STATE_KEY,
   ATTENTION_STATE_LIMITS,
+  archiveAttentionItem,
   attentionStateBytes,
   createAttentionItem,
   defaultAttentionState,
@@ -114,6 +116,14 @@ export class AttentionInbox {
     this.operationQueue = operationQueue;
     this.clock = clock;
     this.isCurrent = currentAuthority(authority);
+    this.areCurrent = typeof authority?.areAttentionRequestsCurrent === "function"
+      ? authority.areAttentionRequestsCurrent.bind(authority)
+      : (bindings) => Promise.all(bindings.map((binding) => this.isCurrent(binding)));
+    this.readRetirement = typeof authority?.readAttentionRequestRetirement === "function"
+      ? authority.readAttentionRequestRetirement.bind(authority)
+      : async () => null;
+    this.retryMaintenance = typeof authority?.retrySystemMaintenanceQuestions === "function"
+      ? authority.retrySystemMaintenanceQuestions.bind(authority) : async () => ({ retried: 0 });
     this.state = defaultAttentionState();
     this.ready = false;
   }
@@ -179,6 +189,16 @@ export class AttentionInbox {
     });
   }
 
+  readStatus(input) {
+    return this.#query(() => {
+      const error = inboxError("INVALID_ATTENTION_REQUEST", "内部请示状态查询无效");
+      assertAttentionAllowedKeys(input, ["requestId"], ["requestId"], error);
+      if (!/^attention-[a-f0-9]{64}$/.test(input.requestId)) throw error;
+      const item = this.state.items.find(entry => entry.requestId === input.requestId);
+      return item ? { requestId: item.requestId, status: item.status } : null;
+    });
+  }
+
   next(options) {
     return this.#query(async () => {
       const { deferred } = normalizeInternalDeferredOptions(options);
@@ -191,6 +211,7 @@ export class AttentionInbox {
         .filter(
           (entry) =>
             entry.status === "pending" &&
+            maintenanceAttentionCode(entry) === null &&
             !deferredBindings.has(
               `${entry.requestId}\u0000${entry.contentDigest}`,
             ),
@@ -212,6 +233,20 @@ export class AttentionInbox {
       return Promise.reject(responsePortError("text 或 choice"));
     }
     return this.#resolve(response);
+  }
+
+  listMaintenance() {
+    return this.#query(async () => {
+      const candidates = this.state.items.filter((item) => item.status === "pending" && maintenanceAttentionCode(item) !== null);
+      const current = await this.areCurrent(candidates.map((item) => ({
+        requestKey: item.requestKey, producer: cloneAttentionValue(item.producer),
+      })));
+      const visible = candidates.filter((_item, index) => current[index] === true);
+      return {
+        items: visible.slice(0, 100).map((item) => ({ ...projectAttentionRequest(item), maintenanceCode: maintenanceAttentionCode(item) })),
+        total: visible.length,
+      };
+    });
   }
 
   reject(value) {
@@ -239,6 +274,41 @@ export class AttentionInbox {
       await this.#requireCurrent(item);
       return projectAttentionReceipt(item);
     });
+  }
+
+  archiveRetired() {
+    return this.#mutate(async (state) => {
+      let candidate = state;
+      let archived = 0;
+      for (const item of state.items) {
+        if (item.status !== "pending") continue;
+        const retirement = await this.readRetirement({
+          requestKey: item.requestKey,
+          producer: cloneAttentionValue(item.producer),
+        });
+        if (retirement === null) continue;
+        const revision = candidate.revision + 1;
+        const retired = archiveAttentionItem(item, retirement, revision, this.#nextTimestamp(candidate));
+        candidate = {
+          ...candidate, revision,
+          items: candidate.items.map((entry) => entry.requestId === item.requestId ? retired : entry),
+        };
+        archived += 1;
+      }
+      if (archived > 0) this.#assertCapacity(candidate);
+      return { state: candidate, value: { archived }, write: archived > 0 };
+    });
+  }
+
+  retrySystemQuestions(options = {}) {
+    const { limit } = normalizeCursor(options);
+    // Keep answer persistence and automatic retirement mutually exclusive.
+    // The ledger never calls the inbox while holding its mutation lease.
+    return this.#mutate(async state => ({ state, write: false,
+      value: await this.retryMaintenance({ limit,
+        requestKeys: state.items.filter(item => item.status === "pending" && /^work-intent-[a-f0-9]{64}$/.test(item.requestKey))
+          .map(item => item.requestKey) }),
+    }));
   }
 
   readOutbox(options = {}) {
@@ -337,6 +407,9 @@ export class AttentionInbox {
         "内部请示不存在",
         404,
       );
+    }
+    if (item.status === "archived") {
+      throw inboxError("ATTENTION_REQUEST_STALE", "原任务已经结束，该请示已归档", 409);
     }
     if (item.contentDigest !== response.contentDigest) {
       throw inboxError(

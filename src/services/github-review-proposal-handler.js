@@ -55,6 +55,8 @@ const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
   "confirmationProducer",
+  "automaticReviewPublisher",
+  "publicationAdopter",
   "inputAuthorityVerifier",
   "pullRequestContextReader",
   "actorAccountId",
@@ -306,6 +308,8 @@ export class GitHubReviewProposalHandler {
   #actorAccountId;
   #clock;
   #pollIntervalMs;
+  #automaticReviewPublisher;
+  #adoptPublication;
 
   constructor({
     confirmationProducer,
@@ -314,6 +318,8 @@ export class GitHubReviewProposalHandler {
     actorAccountId,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
+    automaticReviewPublisher = null,
+    publicationAdopter = null,
   } = {}) {
     const producer = requirePort(
       confirmationProducer,
@@ -343,10 +349,19 @@ export class GitHubReviewProposalHandler {
       "pollIntervalMs",
       MAX_POLL_INTERVAL_MS,
     );
+    this.#automaticReviewPublisher = automaticReviewPublisher;
+    this.#adoptPublication = publicationAdopter === null ? null : requirePort(publicationAdopter, ["handle"], "publicationAdopter").handle;
   }
 
-  async handle(value) {
+  async handle(value, options = {}) {
     const input = normalizeHandlerInput(value);
+    if (Object.hasOwn(input.proposal.payload, "publicationReuse")) {
+      if (this.#adoptPublication === null) throw workProposalError("REVIEW_PUBLICATION_REUSE_UNAVAILABLE", "既有 Review 复用验证器不可用");
+      if (!input.proposal.binding.evidenceTarget && input.proposal.payload.publicationReuse.readProofId) {
+        return this.#handleAutomaticResultReuse(input, options);
+      }
+      return this.#adoptPublication(input, options);
+    }
     const initialPlan = createGitHubReviewProposalConfirmationPlan(input.proposal, {
       actorAccountId: this.#actorAccountId,
       legacyRecovery: true,
@@ -424,6 +439,30 @@ export class GitHubReviewProposalHandler {
           throw error;
         }
       }
+    } else if (input.attempt > 1 || authority === null) {
+      // The queue may have completed publication before the proposal runner
+      // persisted its downstream reference. Recover the exact historical plan;
+      // current assignment changes cannot erase an observed external result.
+      const candidates = [initialExpected, selfExpected, legacySelfExpected, legacyUnversionedSelfExpected];
+      for (const id of new Set(candidates.map((candidate) => candidate.id))) {
+        let stored;
+        try { stored = await this.#get(id); }
+        catch (error) {
+          if (error?.code === "CONFIRMATION_NOT_FOUND") continue;
+          throw error;
+        }
+        for (const candidate of candidates.filter((candidate) => candidate.id === id)) {
+          try {
+            item = normalizeConfirmationItem(stored, candidate);
+            referencedExpected = candidate;
+            break;
+          } catch (error) {
+            if (error?.code !== "INVALID_GITHUB_REVIEW_CONFIRMATION") throw error;
+          }
+        }
+        if (item === null) throw invalidConfirmation();
+        break;
+      }
     }
     const migratesLegacySelfReview =
       selfAuthored &&
@@ -469,6 +508,37 @@ export class GitHubReviewProposalHandler {
     if (item === null) {
       item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
     }
+    if (this.#automaticReviewPublisher !== null && item.status === "pending") {
+      const published = await this.#automaticReviewPublisher.publish(item, { publicationAllowed: !selfAuthored });
+      if (published !== item) item = normalizeConfirmationItem(published, expected);
+    }
+    return transitionFor(item, this.#clock, this.#pollIntervalMs);
+  }
+
+  async #handleAutomaticResultReuse(input, options) {
+    const plan = createGitHubReviewProposalConfirmationPlan(input.proposal, { actorAccountId: this.#actorAccountId,
+      publishedReviewReuse: { proposalId: input.proposal.proposalId, proposalDigest: input.proposal.contentDigest,
+        publicationReuse: input.proposal.payload.publicationReuse } });
+    const expected = normalizeConfirmationPlan(plan);
+    if (input.downstreamRef !== null && input.downstreamRef !== expected.id) throw invalidConfirmation();
+    let item = null;
+    try { item = normalizeConfirmationItem(await this.#get(expected.id), expected); }
+    catch (error) { if (error?.code !== "CONFIRMATION_NOT_FOUND") throw error; }
+    // An exact completed confirmation is historical proof even after its own
+    // current handoff removes the assignment. Never create another handoff.
+    if (item && ["completed", "rejected", "stale"].includes(item.status)) return transitionFor(item, this.#clock, this.#pollIntervalMs);
+    const adoption = await this.#adoptPublication(input, options);
+    if (!adoption.automaticSettlement) throw invalidProposal("Automatic result reuse needs its current source settlement target");
+    const authority = await this.#currentAuthority(input.proposal.binding.inputBinding);
+    if (authority === null || authority.author?.toLowerCase() === this.#actorAccountId.toLowerCase()) {
+      if (item) return this.#invalidateChangedAuthorization(item, expected, input.proposal);
+      return { status: "stale", summary: "Review 复用的本轮授权已变化", evidence: ["authorization_changed"] };
+    }
+    if (item === null) item = normalizeConfirmationItem(await this.#enqueue(plan), expected);
+    if (this.#automaticReviewPublisher !== null && item.status === "pending") {
+      const published = await this.#automaticReviewPublisher.publish(item);
+      if (published !== item) item = normalizeConfirmationItem(published, expected);
+    }
     return transitionFor(item, this.#clock, this.#pollIntervalMs);
   }
 
@@ -480,7 +550,8 @@ export class GitHubReviewProposalHandler {
         verified = await this.#verifyInputAuthority(
           cloneWorkProposalValue(inputBinding),
         );
-      } catch {
+      } catch (error) {
+        if (error?.code === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE") throw error;
         return null;
       }
       return sameValue(verified, inputBinding) ? { author: null } : null;
@@ -490,7 +561,8 @@ export class GitHubReviewProposalHandler {
       context = await this.#readPullRequestContext(
         cloneWorkProposalValue(inputBinding),
       );
-    } catch {
+    } catch (error) {
+      if (error?.code === "OWNER_REVIEW_ASSIGNMENT_UNAVAILABLE") throw error;
       return null;
     }
     if (
@@ -498,9 +570,11 @@ export class GitHubReviewProposalHandler {
       typeof context !== "object" ||
       Array.isArray(context) ||
       Object.getPrototypeOf(context) !== Object.prototype ||
-      Reflect.ownKeys(context).length !== 2 ||
+      Reflect.ownKeys(context).some(key => !["inputBinding", "author", "reviewFeedbackDigest"].includes(key)) ||
       !Object.hasOwn(context, "inputBinding") ||
       !Object.hasOwn(context, "author") ||
+      (Object.hasOwn(context, "reviewFeedbackDigest") &&
+        (typeof context.reviewFeedbackDigest !== "string" || !/^[a-f0-9]{64}$/.test(context.reviewFeedbackDigest))) ||
       !sameValue(context.inputBinding, inputBinding) ||
       (context.author !== null &&
         (typeof context.author !== "string" || !GITHUB_LOGIN.test(context.author)))
@@ -627,6 +701,8 @@ export function createGitHubReviewProposalRunnerService(value = {}) {
     actorAccountId: options.actorAccountId,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,
+    automaticReviewPublisher: options.automaticReviewPublisher,
+    publicationAdopter: options.publicationAdopter,
   });
   return new WorkProposalRunnerService({
     runner: options.runner,

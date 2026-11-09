@@ -84,19 +84,17 @@ function readinessStatus(value) {
     throw new Error("invalid status");
   }
   const fields = Object.keys(value).sort();
+  const expectedFields = ["cliAvailable", "fileLoginAvailable", "schemaVersion", "state"];
+  if (Object.hasOwn(value, "credentialMode")) expectedFields.push("credentialMode");
   if (
-    fields.join("\0") !== [
-      "cliAvailable",
-      "fileLoginAvailable",
-      "schemaVersion",
-      "state",
-    ].join("\0")
+    fields.join("\0") !== expectedFields.sort().join("\0")
   ) {
     throw new Error("invalid status fields");
   }
   const expected = capabilities.get(value.state);
   if (
     value.schemaVersion !== 1 ||
+    (Object.hasOwn(value, "credentialMode") && value.credentialMode !== "codex-native-login") ||
     expected === undefined ||
     value.cliAvailable !== expected.cliAvailable ||
     value.fileLoginAvailable !== expected.fileLoginAvailable

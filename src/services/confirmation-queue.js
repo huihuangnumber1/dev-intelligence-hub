@@ -20,6 +20,7 @@ import {
 } from "../domain/attention-deferred-contract.js";
 import { OperationQueue } from "../lib/operation-queue.js";
 import { createReviewHandoff, normalizeReviewHandoff, reviewHandoffWorkRequest } from "../domain/review-handoff.js";
+import { isAutomaticReviewExecution, automaticReviewAssignmentSupersedes } from "../domain/automatic-review-policy.js";
 
 export const CONFIRMATION_QUEUE_STATE_KEY = "confirmation-queue";
 const STATE_KEY = CONFIRMATION_QUEUE_STATE_KEY;
@@ -178,6 +179,16 @@ function requiresRecovery(item) {
     (item.status === "failed" && item.failure?.outcome === "unknown");
 }
 
+function blocksAutomaticReview(previous, item, assignmentProof) {
+  if (previous.id === item.id || previous.action.type !== "pull_request_review" ||
+      previous.actor.accountId.toLowerCase() !== item.actor.accountId.toLowerCase() ||
+      previous.target.resourceId.toLowerCase() !== item.target.resourceId.toLowerCase() ||
+      previous.target.version !== item.target.version) return false;
+  return previous.failure?.outcome === "unknown" || previous.status === "executing" ||
+    (previous.status === "completed" && !automaticReviewAssignmentSupersedes(previous, item, assignmentProof) && (isAutomaticReviewExecution(previous) ||
+      ["APPROVE", "REQUEST_CHANGES"].includes(previous.action.reviewEvent)));
+}
+
 function permitsGitHubCredentialRecoveryActivation(item, items) {
   const unresolved = items.filter(
     (candidate) => candidate.id !== item.id && requiresRecovery(candidate),
@@ -274,6 +285,7 @@ function historyFilterDigest(filters) {
     status: filters.status ?? null,
     kind: filters.kind ?? null,
     roleId: filters.roleId ?? null,
+    ...(filters.automatic === true ? { automatic: true } : {}),
   });
 }
 
@@ -326,10 +338,14 @@ function normalizeHistoryQuery(value) {
   );
   const fields = optionalDataFields(
     value,
-    ["status", "kind", "roleId", "limit", "cursor"],
+    ["status", "kind", "roleId", "limit", "cursor", "automatic"],
     error,
   );
   const filters = {};
+  if (fields.has("automatic")) {
+    if (fields.get("automatic") !== true) throw error;
+    filters.automatic = true;
+  }
   if (fields.has("status")) {
     const status = fields.get("status");
     if (!HISTORY_STATUS_SET.has(status)) throw error;
@@ -378,6 +394,12 @@ function projectHistoryItem(item) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     retryable: Boolean(item.failure?.retryable),
+    ...(isAutomaticReviewExecution(item) ? { automaticReview: {
+      event: item.action.reviewEvent, headRefOid: item.target.version,
+      resourceId: item.target.resourceId, publishedUrl: item.receipt?.url || null,
+    } } : {}),
+    ...(/^auto-own-pr-repair-v1-[a-f0-9]{48}$/.test(item.execution?.requestId || "")
+      ? { automaticOwnPrRepair: { stage: item.kind === "github.pull-request-push" ? "push" : "code_task" } } : {}),
     ...(item.reviewHandoff ? { reviewHandoff: clone(item.reviewHandoff) } : {}),
     ...(item.failure ? { diagnosticCode: item.failure.code } : {}),
     ...(ownerDecision === null ? {} : { ownerDecision }),
@@ -519,7 +541,10 @@ function isProjectablePullRequestMemoryItem(item) {
 }
 
 export function projectConfirmationMemoryState(value) {
-  const state = normalizeConfirmationState(value);
+  return projectNormalizedConfirmationMemoryState(normalizeConfirmationState(value));
+}
+
+function projectNormalizedConfirmationMemoryState(state) {
   return structuredClone({
     highWatermark: state.revision,
     items: state.items
@@ -747,6 +772,12 @@ export class ConfirmationQueue {
     return this.#projectNext(deferred);
   }
 
+  async nextForHuman(options) {
+    this.#assertReady();
+    const { deferred } = normalizeExternalDeferredOptions(options);
+    return this.#projectNext(deferred, null, true);
+  }
+
   async nextForAction(kind, actionType, options) {
     this.#assertReady();
     const selector = normalizeActionSelector(kind, actionType);
@@ -758,6 +789,39 @@ export class ConfirmationQueue {
     this.#assertReady();
     const item = this.#requireItem(id);
     return this.#projectItem(item);
+  }
+
+  // Internal proof reader: the user projection intentionally omits execution.
+  async readSettlement(input) {
+    this.#assertReady();
+    const invalid = queueError("INVALID_CONFIRMATION_REQUEST", "确认 ID 无效", 400);
+    exactDataFields(input, ["confirmationId"], invalid);
+    if (typeof input.confirmationId !== "string" ||
+        !HISTORY_ITEM_ID.test(input.confirmationId)) throw invalid;
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      const item = this.#find(input.confirmationId);
+      return item === null ? null : deepFreeze({
+        queueRevision: this.state.revision,
+        item: clone(item),
+      });
+    }));
+  }
+
+  async readSettlements(input) {
+    this.#assertReady();
+    const invalid = queueError("INVALID_CONFIRMATION_REQUEST", "确认 ID 无效", 400);
+    exactDataFields(input, ["confirmationIds"], invalid);
+    if (!Array.isArray(input.confirmationIds) || input.confirmationIds.length > MAX_ITEMS) throw invalid;
+    const ids = Array.from(input.confirmationIds);
+    if (
+        ids.some(id => typeof id !== "string" || !HISTORY_ITEM_ID.test(id)) || new Set(ids).size !== ids.length) throw invalid;
+    const requested = new Set(ids);
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      await this.#reload();
+      return deepFreeze({ queueRevision: this.state.revision,
+        items: this.state.items.filter(item => requested.has(item.id)).map(item => clone(item)) });
+    }));
   }
 
   async list(options) {
@@ -832,8 +896,7 @@ export class ConfirmationQueue {
     const query = normalizeMemoryPageRequest(input);
     return this.operationQueue.enqueue(() =>
       this.exclusiveLease.run(async () => {
-        await this.#reload();
-        const state = normalizeConfirmationState(this.state);
+        const state = await this.#reload({ detachSnapshot: true });
         if (
           query.highWatermark !== null &&
           query.highWatermark !== state.revision
@@ -844,7 +907,7 @@ export class ConfirmationQueue {
             409,
           );
         }
-        const items = projectConfirmationMemoryState(state).items;
+        const items = projectNormalizedConfirmationMemoryState(state).items;
         if (query.cursor > items.length) {
           throw queueError(
             "INVALID_CONFIRMATION_MEMORY_QUERY",
@@ -875,11 +938,11 @@ export class ConfirmationQueue {
     );
   }
 
-  async approve(id, input) {
+  async approve(id, input, assignmentProof = null) {
     this.#assertReady();
     const request = normalizeConfirmationRequest(input);
     return this.#runIdempotent("approve", id, request, () =>
-      this.#approve(id, request),
+      this.#approve(id, request, assignmentProof),
     );
   }
 
@@ -887,7 +950,7 @@ export class ConfirmationQueue {
     this.#assertReady();
     return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
       await this.#reload();
-      const pending = this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && item.reviewHandoff.status !== "completed")
+      const pending = this.state.items.filter((item) => item.status === "completed" && item.reviewHandoff && ["pending", "retrying"].includes(item.reviewHandoff.status))
         .sort((a, b) => a.reviewHandoff.attempts - b.reviewHandoff.attempts);
       const start = pending.findIndex((item) => item.id === afterId) + 1;
       return [...pending.slice(start), ...pending.slice(0, start)].slice(0, 25)
@@ -895,6 +958,7 @@ export class ConfirmationQueue {
           id: item.id,
           actorAccountId: item.actor.accountId,
           request: reviewHandoffWorkRequest(item),
+          ...(isAutomaticReviewExecution(item) ? { automaticReview: { reviewEvent: item.action.reviewEvent, headRefOid: item.target.version } } : {}),
         }));
     }));
   }
@@ -905,7 +969,7 @@ export class ConfirmationQueue {
       await this.#reload();
       const item = this.#requireItem(id);
       if (item.status !== "completed" || item.reviewHandoff?.requestId !== requestId) throw queueError("CONFIRMATION_HANDOFF_CONFLICT", "交接绑定已变化", 409);
-      if (item.reviewHandoff.status === "completed") return this.#projectItem(item);
+      if (["completed", "stale"].includes(item.reviewHandoff.status)) return this.#projectItem(item);
       const reviewHandoff = normalizeReviewHandoff({ ...item.reviewHandoff, ...outcome, attempts: item.reviewHandoff.attempts + 1 }, item);
       await this.#replaceItem(id, { ...item, reviewHandoff, itemRevision: item.itemRevision + 1, updatedAt: this.#now() });
       return this.#projectItem(this.#requireItem(id));
@@ -987,7 +1051,7 @@ export class ConfirmationQueue {
     return promise;
   }
 
-  async #approve(id, request) {
+  async #approve(id, request, assignmentProof) {
     const item = this.#requireItem(id);
     this.#assertBinding(item, request, { revisions: item.status === "pending" });
     this.#assertHandoffBinding(item, request);
@@ -1002,7 +1066,7 @@ export class ConfirmationQueue {
         409,
       );
     }
-    return this.#execute(item, request);
+    return this.#execute(item, request, assignmentProof);
   }
 
   async #retry(id, request) {
@@ -1105,7 +1169,11 @@ export class ConfirmationQueue {
     return this.#projectItem(this.#requireItem(id));
   }
 
-  async #execute(item, request) {
+  async #execute(item, request, assignmentProof = null) {
+    if (isAutomaticReviewExecution({ ...item, execution: { requestId: request.requestId } }) &&
+        this.state.items.some((other) => blocksAutomaticReview(other, item, assignmentProof))) {
+      return this.#invalidate(item.id, { requestedBy: item.requestedBy, approvalBindingDigest: item.approvalBindingDigest, reason: "authorization_changed" });
+    }
     if (
       item.kind === CONFIGURATION_ACTIVATION_KIND &&
       this.state.items.some(
@@ -1304,7 +1372,7 @@ export class ConfirmationQueue {
     }
   }
 
-  #projectNext(deferred = [], selector = null) {
+  #projectNext(deferred = [], selector = null, automaticReviewEnabled = false) {
     const deferredBindings = new Set(
       deferred.map(
         (entry) => `${entry.id}\u0000${entry.approvalBindingDigest}`,
@@ -1340,11 +1408,15 @@ export class ConfirmationQueue {
           isVisible(item),
       )
       .sort(byCreation);
-    const actionable = [...pending, ...retryable, ...unresolved];
+    const systemManaged = automaticReviewEnabled ? pending.filter(item =>
+      item.kind === "github.work-proposal-review" && item.action.type === "pull_request_review") : [];
+    const managedIds = new Set(systemManaged.map(item => item.id));
+    const actionable = [...pending.filter(item => !managedIds.has(item.id)), ...retryable, ...unresolved];
     return {
       queueRevision: this.state.revision,
       pendingCount: actionable.length,
       item: actionable.length ? this.#projectItem(actionable[0]) : null,
+      ...(automaticReviewEnabled ? { automaticReviewEnabled: true, systemManagedCount: systemManaged.length } : {}),
     };
   }
 
@@ -1384,6 +1456,7 @@ export class ConfirmationQueue {
         (item) =>
           (!filters.status || item.status === filters.status) &&
           (!filters.kind || item.kind === filters.kind) &&
+          (!filters.automatic || isAutomaticReviewExecution(item)) &&
           (!filters.roleId || item.requestedBy.roleId === filters.roleId),
       )
       .sort(byNewestCreation);
@@ -1422,10 +1495,13 @@ export class ConfirmationQueue {
     this.state = normalized;
   }
 
-  async #reload() {
-    this.state = normalizeConfirmationState(
+  async #reload({ detachSnapshot = false } = {}) {
+    const state = normalizeConfirmationState(
       await this.store.read(STATE_KEY, defaultConfirmationState()),
     );
+    // A detached result stays private across the caller's await.
+    this.state = detachSnapshot ? structuredClone(state) : state;
+    return state;
   }
 
   #find(id) {

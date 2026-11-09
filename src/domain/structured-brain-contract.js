@@ -1,4 +1,5 @@
 import { normalizeWorkDecision } from "./work-intent.js";
+import { permitsCoordinatorCancellation } from "./work-goal-ownership.js";
 import {
   ORCHESTRATION_INTENT_JSON_SCHEMA,
   SUBMIT_DELIVERY_INTENT_JSON_SCHEMA,
@@ -209,7 +210,16 @@ const intentVariants = [
     },
     body: stringSchema(16 * 1_024),
     evidence,
-  }, { optional: ["deliverableId"] }),
+    publicationReuse: {
+      type: "object", additionalProperties: false, required: ["candidateId", "materialDigest", "coverageDigest"],
+      properties: {
+        candidateId: stringSchema(128, { ascii: true, pattern: "^review-publication-candidate-[a-f0-9]{64}$" }),
+        materialDigest: stringSchema(64, { ascii: true, pattern: "^[a-f0-9]{64}$" }),
+        coverageDigest: stringSchema(64, { ascii: true, pattern: "^[a-f0-9]{64}$" }),
+        readProofId: stringSchema(128, { ascii: true, pattern: "^review-read-proof-[a-f0-9]{64}$" }),
+      },
+    },
+  }, { optional: ["deliverableId", "publicationReuse"] }),
   intentSchema("propose_github_pull_request_action", {
     action: pullRequestExternalAction,
     evidence,
@@ -297,6 +307,78 @@ export const WORK_DECISION_JSON_SCHEMA = deepFreeze({
   },
 });
 
+const CHILD_WORK_FIELDS = ["capability", "dependsOn", "acceptanceContract"];
+const modelOrchestrationSchema = {
+  ...ORCHESTRATION_INTENT_JSON_SCHEMA,
+  oneOf: ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.map((variant) => {
+    if (variant.properties.type.const !== "decompose") return variant;
+    const { capability, dependsOn, acceptanceContract, ...properties } = variant.properties;
+    return {
+      ...variant,
+      required: variant.required.filter(key => !CHILD_WORK_FIELDS.includes(key)),
+      properties: {
+        ...properties,
+        work: {
+          ...variant.properties.work,
+          required: [...variant.properties.work.required, ...CHILD_WORK_FIELDS],
+          properties: { ...variant.properties.work.properties, capability, dependsOn, acceptanceContract },
+        },
+      },
+    };
+  }),
+};
+
+// Models describe each child in one work object and supply the reason once.
+// Persisted commands retain the exact existing domain shape and validation.
+export const MODEL_WORK_DECISION_JSON_SCHEMA = deepFreeze({
+  ...WORK_DECISION_JSON_SCHEMA,
+  properties: {
+    ...WORK_DECISION_JSON_SCHEMA.properties,
+    intent: {
+      oneOf: intentVariants.map((variant) =>
+        variant.properties?.type?.const !== "orchestrate" ? variant : {
+          ...variant,
+          required: variant.required.filter((key) => key !== "reason"),
+          properties: { ...Object.fromEntries(Object.entries(variant.properties)
+            .filter(([key]) => key !== "reason")), action: modelOrchestrationSchema },
+        }),
+    },
+  },
+});
+
+function currentGoalControl(context) {
+  const control = context?.requirements?.coordination?.goalControl;
+  if (control === undefined) return null;
+  if (control === null || control.owner !== "local-owner" || typeof control.rootTaskId !== "string" ||
+      !Array.isArray(control.cancellableTaskIds) || control.cancellableTaskIds.some(id => typeof id !== "string")) {
+    throw new StructuredBrainContractError("STRUCTURED_BRAIN_RESPONSE_INVALID", "Invalid current coordinator control view");
+  }
+  return control;
+}
+
+export function modelWorkDecisionSchema(context) {
+  const control = currentGoalControl(context);
+  if (control === null) return MODEL_WORK_DECISION_JSON_SCHEMA;
+  // Each request owns its schema. Neither concurrent contexts nor persisted
+  // intent contracts can inherit another goal's cancellation targets.
+  const schema = structuredClone(MODEL_WORK_DECISION_JSON_SCHEMA);
+  const orchestration = schema.properties.intent.oneOf.find(variant => variant.properties.type.const === "orchestrate");
+  orchestration.properties.action.oneOf = orchestration.properties.action.oneOf.filter(variant => {
+    if (variant.properties.type.const !== "cancel") return true;
+    if (control.cancellableTaskIds.length === 0) return false;
+    variant.properties.sourceTaskId.enum = [...control.cancellableTaskIds];
+    return true;
+  });
+  return deepFreeze(schema);
+}
+
+export function assertModelWorkDecisionControls(decision, context) {
+  const action = decision.intent.type === "orchestrate" ? decision.intent.action : null;
+  if (action?.type === "cancel" && !permitsCoordinatorCancellation(currentGoalControl(context), action.sourceTaskId)) {
+    throw new StructuredBrainContractError("STRUCTURED_BRAIN_RESPONSE_INVALID", "Cancel target is outside current coordinator controls");
+  }
+}
+
 function maximumBytesFrom(options) {
   if (
     options === null ||
@@ -329,7 +411,7 @@ function maximumBytesFrom(options) {
   return maximumBytes;
 }
 
-export function parseStructuredWorkDecision(text, options = {}) {
+function parseWorkDecision(text, options, normalize) {
   const maximumBytes = maximumBytesFrom(options);
   if (typeof text !== "string") {
     throw new StructuredBrainContractError(
@@ -354,11 +436,36 @@ export function parseStructuredWorkDecision(text, options = {}) {
     );
   }
   try {
-    return normalizeWorkDecision(value);
+    return normalize(value);
   } catch {
     throw new StructuredBrainContractError(
       "STRUCTURED_BRAIN_RESPONSE_INVALID",
       "Structured brain response is invalid",
     );
   }
+}
+
+export function parseStructuredWorkDecision(text, options = {}) {
+  return parseWorkDecision(text, options, normalizeWorkDecision);
+}
+
+export function parseModelWorkDecision(text, options = {}) {
+  return parseWorkDecision(text, options, (value) => {
+    const action = value?.intent?.type === "orchestrate" ? value.intent.action : null;
+    if (action?.type === "decompose" && action.work &&
+        CHILD_WORK_FIELDS.some(key => Object.hasOwn(action.work, key))) {
+      if (CHILD_WORK_FIELDS.some(key => Object.hasOwn(action, key) || !Object.hasOwn(action.work, key))) {
+        throw new Error("Ambiguous or incomplete model child work");
+      }
+      const { capability, dependsOn, acceptanceContract, ...work } = action.work;
+      value = { ...value, intent: { ...value.intent,
+        action: { ...action, work, capability, dependsOn, acceptanceContract } } };
+    }
+    if (value?.intent?.type === "orchestrate" && !Object.hasOwn(value.intent, "reason")) {
+      value = { ...value, intent: { ...value.intent, reason: value.intent.action?.reason } };
+    }
+    // Legacy decisions with both fields remain subject to exact equality;
+    // never overwrite a conflicting model-supplied value.
+    return normalizeWorkDecision(value);
+  });
 }

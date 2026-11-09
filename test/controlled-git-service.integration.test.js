@@ -10,12 +10,14 @@ import {
   readdir,
   rm,
   unlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 import { GitBareMirrorInspector } from "../src/adapters/git-bare-mirror-inspector.js";
 import {
@@ -36,13 +38,7 @@ function locateGit() {
   const candidate = result.stdout.split(/\r?\n/u).find(Boolean);
   if (!candidate || !path.isAbsolute(candidate)) return null;
   if (process.platform !== "win32") return path.resolve(candidate);
-  const implementation = path.join(
-    path.dirname(path.dirname(candidate)),
-    "mingw64",
-    "bin",
-    "git.exe",
-  );
-  return existsSync(implementation) ? path.resolve(implementation) : null;
+  return windowsGitImplementationCandidates(candidate).find(existsSync) ?? null;
 }
 
 async function git(gitCommand, cwd, args, options = {}) {
@@ -202,7 +198,7 @@ async function workspaceFiles(root) {
   return files.sort((left, right) => left.localeCompare(right, "en"));
 }
 
-async function createRepositoryFixture(t, gitCommand, { binaryConflict = false } = {}) {
+async function createRepositoryFixture(t, gitCommand, { binaryConflict = false, oneSidedDirectories = false, deploymentAssets = false, excludedAssets = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "controlled-git-integration-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repositoryRoot = path.join(root, "source");
@@ -241,6 +237,15 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false }
       "head side at ancestor\n",
     ),
   ]);
+  if (excludedAssets) {
+    await mkdir(path.join(repositoryRoot, "Test/Data"), { recursive: true });
+    await writeFile(path.join(repositoryRoot, "Test/Data/sample.mat"), "tracked test fixture\n");
+  }
+  if (deploymentAssets) {
+    await mkdir(path.join(repositoryRoot, 'Projects/Deploy'), { recursive: true });
+    await writeFile(path.join(repositoryRoot, 'Projects/Deploy/GCL.mat.enc'), Buffer.alloc(5_127_832, 1));
+    await writeFile(path.join(repositoryRoot, 'Projects/Deploy/Retina.mat.enc'), Buffer.alloc(4_274_520, 2));
+  }
   await git(gitCommand, repositoryRoot, ["add", "--all"]);
   await git(gitCommand, repositoryRoot, ["commit", "-m", "common ancestor"]);
   const ancestorOid = (
@@ -248,6 +253,10 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false }
   ).stdout.trim();
 
   await git(gitCommand, repositoryRoot, ["switch", "--create", "feature"]);
+  if (oneSidedDirectories) {
+    await mkdir(path.join(repositoryRoot, "base-only"));
+    await writeFile(path.join(repositoryRoot, "base-only", "common.txt"), "shared addition\n");
+  }
   await Promise.all([
     writeFile(
       path.join(repositoryRoot, "src", "conflict.txt"),
@@ -265,6 +274,11 @@ async function createRepositoryFixture(t, gitCommand, { binaryConflict = false }
   ).stdout.trim();
 
   await git(gitCommand, repositoryRoot, ["switch", "main"]);
+  if (oneSidedDirectories) {
+    await mkdir(path.join(repositoryRoot, "base-only"));
+    await writeFile(path.join(repositoryRoot, "base-only", "common.txt"), "shared addition\n");
+    await writeFile(path.join(repositoryRoot, "base-only", "nested.txt"), "base-only tree\n");
+  }
   await Promise.all([
     writeFile(
       path.join(repositoryRoot, "src", "conflict.txt"),
@@ -336,6 +350,84 @@ function serviceFor(gitCommand, setup) {
 }
 
 const gitCommand = locateGit();
+
+test("tracked test data does not block an unrelated text conflict or enter its editable workspace", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { excludedAssets: true });
+  const service = serviceFor(gitCommand, setup);
+  const prepared = await service.inspectConflict(setup.request);
+  assert.equal(prepared.status, "conflicted");
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const workspace = path.join(setup.root, "workspace"); await mkdir(workspace);
+  const receipt = await service.materializeConflictPreparationForCodeJob({ binding, targetRoot: workspace, excludePaths: [] });
+  assert.equal(receipt.files.some(entry => entry.path === "Test/Data/sample.mat"), false);
+  assert.equal(existsSync(path.join(workspace, "Test/Data/sample.mat")), false);
+  assert.match(await readFile(path.join(workspace, "src/conflict.txt"), "utf8"), /<<<<<<< /);
+  const resultTreeObject = await findLooseObject(setup.preparationRoot, prepared.resultTreeOid);
+  assert.equal(await resultTreeFile(gitCommand, setup,
+    path.dirname(path.dirname(resultTreeObject)),
+    prepared.resultTreeOid, "Test/Data/sample.mat"), "tracked test fixture\n");
+});
+
+test('unchanged deployment assets do not prevent preparing and materializing a text conflict', { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { deploymentAssets: true });
+  const constrained = new ControlledGitService({ gitCommand, mirrorInspector: new GitBareMirrorInspector({ gitCommand }),
+    preparationRoot: setup.preparationRoot, limits: { maxBlobBytes: 1_000_000, maxTotalBytes: 8_000_000 } });
+  await assert.rejects(constrained.inspectConflict(setup.request), error =>
+    ['CONTROLLED_GIT_OUTPUT_LIMIT', 'CONTROLLED_GIT_UNSUPPORTED_TREE'].includes(error.code));
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  assert.equal(prepared.status, 'conflicted');
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const workspace = path.join(setup.root, 'workspace'); await mkdir(workspace);
+  await serviceFor(gitCommand, setup).materializeConflictPreparationForCodeJob({ binding, targetRoot: workspace, excludePaths: [] });
+  assert.equal((await readFile(path.join(workspace, 'Projects/Deploy/GCL.mat.enc'))).length, 5_127_832);
+  assert.equal((await readFile(path.join(workspace, 'Projects/Deploy/Retina.mat.enc'))).length, 4_274_520);
+  assert.match(await readFile(path.join(workspace, 'src/conflict.txt'), 'utf8'), /<<<<<<< /);
+});
+
+test("merge preparation and repeated verification preserve donor object metadata", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand, { oneSidedDirectories: true });
+  for (const root of [setup.baseMirrorRoot, setup.headMirrorRoot]) {
+    for (const entry of await readdir(path.join(root, "objects", "pack"))) {
+      const file = path.join(root, "objects", "pack", entry);
+      await utimes(file, new Date("2020-01-01T00:00:00Z"), new Date("2020-01-01T00:00:00Z"));
+    }
+  }
+  const inspector = new GitBareMirrorInspector({ gitCommand });
+  const boundaries = () => Promise.all([
+    inspector.preflight({ repository: setup.request.gitTarget.baseRepository, mirrorRoot: setup.baseMirrorRoot,
+      expectedCommitOid: setup.request.gitTarget.baseRefOid }),
+    inspector.preflight({ repository: setup.request.gitTarget.headRepository, mirrorRoot: setup.headMirrorRoot,
+      expectedCommitOid: setup.request.gitTarget.headRefOid }),
+  ]);
+  const before = await boundaries();
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+    assert.deepEqual(await boundaries(), before);
+  }
+});
+
+test("sealed preparation survives unrelated fetch and repack without rewriting its evidence", { skip: gitCommand === null }, async t => {
+  const setup = await createRepositoryFixture(t, gitCommand);
+  const prepared = await serviceFor(gitCommand, setup).inspectConflict(setup.request);
+  const binding = createConflictPreparationBinding({ preparation: prepared, gitTarget: setup.request.gitTarget });
+  const sealedBefore = await preparationSnapshot(setup.preparationRoot);
+  const inspector = new GitBareMirrorInspector({ gitCommand });
+  const request = { repository: setup.request.gitTarget.baseRepository, mirrorRoot: setup.baseMirrorRoot,
+    expectedCommitOid: setup.request.gitTarget.baseRefOid };
+  const before = await inspector.preflight(request);
+  const repositoryRoot = path.join(setup.root, "source");
+  await writeFile(path.join(repositoryRoot, "unrelated.txt"), "another PR's objects\n");
+  await git(gitCommand, repositoryRoot, ["add", "unrelated.txt"]);
+  await git(gitCommand, repositoryRoot, ["commit", "-m", "unrelated change"]);
+  await git(gitCommand, setup.baseMirrorRoot, ["fetch", repositoryRoot, "HEAD:refs/heads/unrelated"]);
+  assert.notEqual((await inspector.preflight(request)).boundaryDigest, before.boundaryDigest);
+  await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+  await git(gitCommand, setup.baseMirrorRoot, ["repack", "-ad"]);
+  await serviceFor(gitCommand, setup).verifyConflictPreparation({ binding });
+  assert.deepEqual(await preparationSnapshot(setup.preparationRoot), sealedBefore);
+});
 
 test(
   "real isolated mirrors produce a durable full conflict workspace without source writes",

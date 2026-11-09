@@ -16,6 +16,7 @@ import { createApplication } from "../src/composition-root.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { StateStore } from "../src/lib/state-store.js";
 import { createWorkProposalRuntime } from "../src/work-proposal-runtime.js";
+import { beginCodeExecutionSession, isCodeExecutionContext } from "../src/lib/code-execution-context.js";
 
 const execFile = promisify(execFileCallback);
 const PROFILE_IMAGE =
@@ -56,7 +57,7 @@ class FastSandbox {
     return {
       exitCode: 0,
       signal: null,
-      stdout: "1 test passed",
+      stdout: "TAP version 13\nok 1 - test\n1..1\n# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0",
       stderr: "",
       durationMs: 1,
       imageId: `sha256:${"a".repeat(64)}`,
@@ -72,7 +73,7 @@ function guardFactory() {
   return new TestGuard();
 }
 
-function fixedBrain() {
+function fixedBrain({ continuous = false } = {}) {
   const decisions = [
     { type: "read_text", path: "src/app.js" },
     { type: "write_text", path: "src/app.js", content: UPDATED_SOURCE },
@@ -81,9 +82,25 @@ function fixedBrain() {
   ];
   return {
     calls: [],
+    ...(continuous ? { describe: () => ({ supportsCodeExecution: true, supportsCodeReading: true }) } : {}),
     async decide(input, authorization) {
       await authorization.beforeGenerate();
       this.calls.push(structuredClone(input));
+      if (continuous) {
+        assert.equal(isCodeExecutionContext(input.codeExecutionContext), true);
+        const tools = beginCodeExecutionSession(input.codeExecutionContext);
+        const page = await tools.invoke("read_source", { path: "src/app.js", offset: 0 });
+        assert.equal(page.text, ORIGINAL_SOURCE);
+        assert.equal(page.nextOffset, null);
+        const decide = (action) => ({ schemaVersion: 1, confidence: 100, summary: "Fix exported value", reason: "Requested behavior", action });
+        await tools.invoke("perform_action", { decision: decide(decisions[1]) });
+        const state = await tools.invoke("get_state", {});
+        assert.equal(state.capabilities.requiredProfilesRemaining, 1);
+        await tools.invoke("perform_action", { decision: decide(decisions[2]) });
+        assert.equal((await tools.invoke("get_state", {})).capabilities.requiredProfilesRemaining, 0);
+        await tools.close();
+        return decide(decisions[3]);
+      }
       const action = decisions.shift();
       assert.ok(action, "the code job requested an unexpected extra brain turn");
       return { action };
@@ -289,7 +306,7 @@ function applicationConfig(sourceRoot, git) {
   };
 }
 
-test("code action confirmation reaches memory and an exactly-once package application", async (t) => {
+for (const continuous of [false, true]) test(`${continuous ? "continuous native turn" : "code action confirmation"} reaches memory and an exactly-once package application`, async (t) => {
   const git = await gitExecutable();
   if (!git) {
     t.skip("git is required for the disposable checkout application boundary");
@@ -305,7 +322,7 @@ test("code action confirmation reaches memory and an exactly-once package applic
 
   const store = new StateStore(path.join(root, "state"));
   const sandbox = new FastSandbox();
-  const brain = fixedBrain();
+  const brain = fixedBrain({ continuous });
   const developerWorker = fixedDeveloperWorker();
   let proposalRuntime;
   let now = Date.now();
@@ -411,7 +428,7 @@ test("code action confirmation reaches memory and an exactly-once package applic
   assert.equal(job.status, "completed");
   assert.equal(job.requestedBy.workItemId, workItemId);
   assert.ok(job.memoryProjection);
-  assert.equal(brain.calls.length, 4);
+  assert.equal(brain.calls.length, continuous ? 1 : 4);
   assert.equal(sandbox.runs.length, 1);
   assert.equal(
     await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"),
@@ -432,6 +449,9 @@ test("code action confirmation reaches memory and an exactly-once package applic
   );
   assert.notEqual(completedMemory, undefined);
   assert.equal(completedMemory.repository, "acme/repo");
+  // Proposal execution precedes code completion and memory projection within a
+  // cycle, so delivery is reconciled on the following cycle.
+  await runCycle();
   const proposalResults = await proposalRuntime.consumer.readResultBatch();
   assert.equal(proposalResults.items.length, 1);
   assert.equal(proposalResults.items[0].outcome, "succeeded");

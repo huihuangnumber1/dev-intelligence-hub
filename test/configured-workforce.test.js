@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 import * as configuredWorkforceApi from "../src/services/configured-workforce.js";
+import { createCodeExecutionContext } from "../src/lib/code-execution-context.js";
 import {
   createConfiguredBrainRouter,
   createConfiguredWorkforce,
@@ -102,6 +103,26 @@ function assignedTask(eventType, suffix = "1") {
   };
 }
 
+test("workforce enables fair model waiting only when the host opts into automatic work", async () => {
+  for (const waitForModelCapacity of [false, true]) {
+    const calls = [];
+    const selected = role("test-model"); selected.brain.provider = "cli";
+    const workforce = createOwnedTestConfiguredWorkforce({
+      waitForModelCapacity, brainProviders: { cli: { kind: "codex-cli", credentialMode: "codex-native-login" } },
+      roles: { analyst: selected }, store: new MemoryStore(),
+    }, { supervisedCliProviderFactory(options) { return {
+      id: options.id, remote: true, singleAttempt: true,
+      async generate() { assert.fail("admission alone must not launch a model"); },
+      withAdmission(request, operation) { calls.push(request); return operation(); },
+    }; } });
+    let entered = 0;
+    await workforce.workers[0].withDecisionAdmission({ item: { itemId: "work-42" } }, async () => { entered += 1; });
+    assert.equal(entered, 1);
+    assert.equal(calls[0].waitForCapacity === true, waitForModelCapacity);
+    await workforce.close();
+  }
+});
+
 test("workforce builds independently controlled roles over one local provider", async () => {
   const calls = [];
   const workforce = createConfiguredWorkforce({
@@ -161,7 +182,7 @@ test("workforce preserves an optional high-capability task brain separately", as
     provider: "task-brain",
     model: "high-capability-model",
     remote: true,
-    remoteData: { requirements: true, code: true, memory: false },
+    remoteData: { requirements: true, code: true, memory: false, dingtalk: false },
   });
   assert.equal(
     Object.hasOwn(await workforce.employees[1].roleView(), "taskBrain"),
@@ -323,6 +344,32 @@ test("configured supervised CLIs stay remote and declare one process attempt", a
   }
 });
 
+test("configured routing carries explicit continuous execution support and opaque identity", async () => {
+  const context = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let received;
+  const router = createOwnedTestConfiguredBrainRouter({ brainProviders: { cli: { kind: "codex-cli" } } }, {
+    supervisedCliProviderFactory(options) {
+      return { id: options.id, remote: true, supportsCodeExecution: true,
+        async generate(value) { received = value; return '{"ok":true}'; } };
+    },
+  });
+  const brain = { provider: "cli", model: "gpt-6.1-sol", remoteData: { requirements: true, code: true, memory: false } };
+  assert.equal(router.describe(brain).supportsCodeExecution, true);
+  await router.generate({ brain, messages: MESSAGES, schema: SCHEMA, dataClasses: ["code"], codeExecutionContext: context });
+  assert.equal(received.codeExecutionContext, context);
+  await router.close();
+});
+
+test("configured routing rejects execution-support accessors without invoking them", () => {
+  let reads = 0;
+  assert.throws(() => createOwnedTestConfiguredBrainRouter({ brainProviders: { cli: { kind: "codex-cli" } } }, {
+    supervisedCliProviderFactory(options) {
+      return { id: options.id, remote: true, get supportsCodeExecution() { reads++; return true; }, async generate() {} };
+    },
+  }), /code execution support is invalid/);
+  assert.equal(reads, 0);
+});
+
 test("configured routing forwards credential mode and provider availability", async () => {
   const availabilityCalls = [];
   let receivedOptions = null;
@@ -399,7 +446,62 @@ test("configured Codex routing preserves stable entity sessions", async () => {
     sessionKey,
   });
 
-  assert.equal(calls[0].sessionKey, sessionKey);
+  assert.match(calls[0].sessionKey, /^auth-v2:[a-f0-9]{64}$/u);
+  assert.notEqual(calls[0].sessionKey, sessionKey);
+});
+
+test("configured routing forwards only explicit review reading support", async () => {
+  for (const supported of [undefined, false, true]) {
+    const router = createOwnedTestConfiguredBrainRouter(
+      { brainProviders: { cli: { kind: "codex-cli" } } },
+      {
+        supervisedCliProviderFactory(options) {
+          return {
+            id: options.id,
+            remote: true,
+            ...(supported === undefined ? {} : { supportsReviewReading: supported }),
+            async generate() { return '{"ok":true}'; },
+          };
+        },
+      },
+    );
+    const view = router.describe({
+      provider: "cli",
+      model: "gpt-6.1-sol",
+      remoteData: { requirements: true, code: true, memory: false },
+    });
+    assert.equal(Object.hasOwn(view, "supportsReviewReading"), supported === true);
+    if (supported === true) assert.equal(view.supportsReviewReading, true);
+    await router.close();
+  }
+});
+
+test("configured routing rejects invalid review reading declarations without invoking accessors", () => {
+  let getterCalls = 0;
+  for (const descriptor of [
+    { value: "true" },
+    { value: undefined },
+    { get() { getterCalls += 1; return true; } },
+  ]) {
+    assert.throws(
+      () => createOwnedTestConfiguredBrainRouter(
+        { brainProviders: { cli: { kind: "codex-cli" } } },
+        {
+          supervisedCliProviderFactory(options) {
+            const provider = {
+              id: options.id,
+              remote: true,
+              async generate() { return '{"ok":true}'; },
+            };
+            Object.defineProperty(provider, "supportsReviewReading", descriptor);
+            return provider;
+          },
+        },
+      ),
+      { name: "TypeError", message: "brain provider review reading support is invalid" },
+    );
+  }
+  assert.equal(getterCalls, 0);
 });
 
 test("configured routing preserves prototype-defined provider availability", async () => {

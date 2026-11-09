@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeConfirmationPlan } from "./confirmation-contract.js";
 import { normalizePullRequestExecutionBinding } from "./pull-request-execution-binding.js";
+import { normalizePublishedReviewReuse } from "./review-result-proof.js";
 import {
   assertWorkProposalAuthorityBinding,
   assertWorkProposalExactKeys,
@@ -126,6 +127,7 @@ export function createGitHubReviewProposalConfirmationPlan(
     selfAuthored = false,
     legacySelfAuthored = false,
     legacyUnversionedSelfAuthored = false,
+    publishedReviewReuse = null,
   } = {},
 ) {
   if (
@@ -166,7 +168,7 @@ export function createGitHubReviewProposalConfirmationPlan(
   );
   const payload = plainRecord(
     proposal.payload,
-    ["verdict", "body", "evidence", "summary", "reason"],
+    ["verdict", "body", "evidence", "summary", "reason", ...(publishedReviewReuse ? ["publicationReuse"] : [])],
     "payload",
   );
   const eventId = text(binding.eventId, "binding.eventId", 256);
@@ -263,6 +265,7 @@ export function createGitHubReviewProposalConfirmationPlan(
         reviewEvent,
         body,
         inputBinding,
+        ...(publishedReviewReuse ? { publishedReviewReuse: normalizePublishedReviewReuse(publishedReviewReuse) } : {}),
       }
     : { type: "pull_request_review", reviewEvent, body };
 
@@ -279,7 +282,7 @@ export function createGitHubReviewProposalConfirmationPlan(
     display: {
       title: `${repository} #${number} · 岗位 Review 提案`,
       summary,
-      actionLabel: downgradedSelfReview
+      actionLabel: publishedReviewReuse ? "确认复用评审并推进当前任务" : downgradedSelfReview
         ? "确认并以 COMMENT 发布到 GitHub"
         : "确认并发布到 GitHub",
       evidence: displayEvidence,
@@ -292,4 +295,13 @@ export function createGitHubReviewProposalConfirmationPlan(
       },
     },
   });
+}
+
+
+// All historical proof consumers reconstruct the same supported plan variants.
+// These plans prove past publication only; they do not grant current authority.
+export function historicalGitHubReviewConfirmationPlans(proposal, actorAccountId) {
+  return [{}, { selfAuthored: true }, { legacySelfAuthored: true }, { legacyUnversionedSelfAuthored: true }]
+    .map(variant => normalizeConfirmationPlan(createGitHubReviewProposalConfirmationPlan(proposal,
+      { actorAccountId, legacyRecovery: true, ...variant })));
 }

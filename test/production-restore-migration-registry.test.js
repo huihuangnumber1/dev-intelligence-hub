@@ -14,6 +14,12 @@ import test from "node:test";
 import { createBackupManifest } from "../src/domain/backup-manifest.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
+import { StateStore } from "../src/lib/state-store.js";
+import { TaskRunExecutionReceipts } from "../src/services/task-run-execution-receipts.js";
+import { migrateWorkContinuationState } from "../src/services/work-continuation-state.js";
+import { ownReviewFeedbackDigest } from "../src/adapters/github-own-review-feedback.js";
+import { createOriginalRepairFeedbackSnapshot, createOriginalRepairFeedbackArchiveRecord,
+  originalRepairFeedbackArchiveKey, originalRepairFeedbackArchiveReference } from "../src/domain/original-repair-feedback.js";
 import {
   defaultConfirmationState,
   normalizeConfirmationState,
@@ -99,6 +105,10 @@ const EXPECTED_OWNER_IDS = Object.freeze([
   "code-job-archive-index",
   "code-executor-state",
   "confirmation-queue",
+  "task-run-execution-receipts",
+  "automatic-own-pr-repair-state",
+  "work-continuations",
+  "original-repair-feedback-archive",
   "work-proposal-state",
   "attention-inbox",
   "owner-work-requests",
@@ -195,8 +205,10 @@ const OWNERS_REQUIRING_SPECIAL_ADAPTERS = Object.freeze([
   "code-job-state",
   "code-job-archive-record",
   "code-job-archive-index",
+  "original-repair-feedback-archive",
   "code-executor-state",
   "unified-memory-journal",
+  "work-continuations",
   "unified-memory-index",
   "legacy-authority-projection",
   "configured-role-lifecycle",
@@ -212,6 +224,7 @@ function ownerDescriptor(ownerId) {
       "code-job-state",
       "code-executor-state",
       "unified-memory-journal",
+      "work-continuations",
     ].includes(ownerId)
   ) {
     functions.migrate = noopMigrate;
@@ -222,7 +235,7 @@ function ownerDescriptor(ownerId) {
   if (ownerId === "legacy-authority-projection") {
     functions.plan = noopPlan;
   }
-  if (["code-job-archive-record", "code-job-archive-index"].includes(ownerId)) {
+  if (["code-job-archive-record", "code-job-archive-index", "original-repair-feedback-archive"].includes(ownerId)) {
     functions.verifyImmutable = noopVerifyImmutable;
   }
   return definePersistedSchemaOwner({ ownerId, ...functions });
@@ -269,6 +282,225 @@ test("the production catalog and migration port expose the exact audited boundar
   assert.deepEqual(Object.keys(registry), ["migrate"]);
   assert.equal(typeof registry.migrate, "function");
 });
+
+test("the archive owner supports immutable tombstones through verification outcomes v3", () => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) =>
+    ownerId === "code-job-archive-record"
+  );
+  assert.equal(owner.currentVersion, 3);
+  assert.deepEqual(owner.supportedVersions, [1, 2, 3]);
+});
+
+test("the ledger owner upgrades schema 11 without changing an already current authority baseline", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-ledger-state");
+  assert.equal(owner.currentVersion, 13);
+  assert.deepEqual(owner.supportedVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  const current = emptyWorkLedgerState();
+  const legacy = { ...structuredClone(current), schemaVersion: 11 };
+  const fixture = await candidateDirectory(t, { "work-ledger-state.json": legacy });
+  const registry = createProductionRestoreMigrationRegistry();
+  await registry.migrate(fixture);
+  assert.deepEqual(await readJson(fixture.directory, "work-ledger-state"), current);
+  const before = await readFile(path.join(fixture.directory, "work-ledger-state.json"));
+  await registry.migrate(fixture);
+  assert.deepEqual(await readFile(path.join(fixture.directory, "work-ledger-state.json")), before);
+  assert.equal(legacy.schemaVersion, 11);
+});
+
+test("a future ledger schema blocks the production restore before any writes", async (t) => {
+  const fixture = await candidateDirectory(t, { "work-ledger-state.json": {
+    ...emptyWorkLedgerState(), schemaVersion: 14,
+  } });
+  const originalWrite = StateStore.prototype.write;
+  let writes = 0;
+  t.mock.method(StateStore.prototype, "write", function (...args) {
+    writes += 1;
+    return originalWrite.apply(this, args);
+  });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+  assert.equal(writes, 0);
+});
+
+test("durable continuations migrate during restore without inventing historical execution receipts", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "work-continuations");
+  assert.equal(owner.mode, "migrate-replace");
+  const state = { schemaVersion: 1, records: [{ itemId: "work-one", roleId: "developer", fingerprint: "a".repeat(64),
+    status: "running", attempt: 2, reason: "work_ready", nextAttemptAt: null, updatedAt: "2026-10-21T00:00:00.000Z" }] };
+  const fixture = await candidateDirectory(t, { "work-continuations.json": state });
+  const file = path.join(fixture.directory, "work-continuations.json");
+  await createProductionRestoreMigrationRegistry().migrate(fixture);
+  const restored = JSON.parse(await readFile(file, 'utf8'));
+  assert.equal(restored.schemaVersion, 2);
+  assert.deepEqual(restored.records[0].receipts, []);
+  assert.equal(restored.records[0].source.itemRevision, null);
+  assert.equal(restored.records[0].status, 'running');
+  const before = await readFile(file);
+  await createProductionRestoreMigrationRegistry().migrate(fixture);
+  assert.deepEqual(await readFile(file), before);
+  const future = await candidateDirectory(t, { "work-continuations.json": { schemaVersion: 3, records: [] } });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(future));
+});
+
+test("malformed schema-2 handoffs reject restore before any owner write", async (t) => {
+  const at = "2026-10-21T00:00:00.000Z";
+  const valid = migrateWorkContinuationState({ schemaVersion: 1, records: [{ itemId: "work-one", roleId: "developer", fingerprint: "a".repeat(64),
+    status: "running", attempt: 1, reason: "work_ready", nextAttemptAt: null, updatedAt: at }] });
+  valid.records[0].receipts.push({ wakeId: "wake-one", roleId: "developer", fingerprint: "a".repeat(64),
+    startedAt: at, deadlineAt: at, finishedAt: null, outcome: "running", observedRevision: null, errorCode: null });
+  let writes = 0;
+  const originalWrite = StateStore.prototype.write;
+  t.mock.method(StateStore.prototype, "write", function (...args) { writes += 1; return originalWrite.apply(this, args); });
+  for (const mutate of [
+    record => { record.source.itemRevision = 0; },
+    record => { record.condition.type = "unknown"; },
+    record => { record.recovery.dueAt = 123; },
+    record => { record.receipts.push(structuredClone(record.receipts[0])); },
+    record => { record.receipts[0].finishedAt = at; },
+    record => { record.receipts[0].deadlineAt = "2026-10-20T00:00:00.000Z"; },
+    record => { record.receipts[0].observedRevision = -1; },
+  ]) {
+    const invalid = structuredClone(valid); mutate(invalid.records[0]);
+    const fixture = await candidateDirectory(t, {
+      "code-executor-state.json": { schemaVersion: 2, revision: 0, sessions: {} },
+      "work-continuations.json": invalid,
+    });
+    await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+    assert.equal(writes, 0);
+  }
+});
+
+test("execution receipts are a validated backup owner and remain byte-for-byte unchanged", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "task-run-execution-receipts");
+  assert.equal(owner.mode, "validate");
+  assert.deepEqual(owner.supportedVersions, [1]);
+  const running = { runId: "run-open", kind: "work-item", taskId: "work-one", roleId: "pr-engineer",
+    taskRevision: 2, leaseId: "lease-one", registeredAt: "2026-10-15T00:00:00.000Z",
+    modelStartedAt: "2026-10-15T00:00:01.000Z", lastActivityAt: "2026-10-15T00:00:02.000Z",
+    finishedAt: null, phase: "running", stopConfirmed: false, session: null, eventCount: 4, outcomeCode: null };
+  const completed = { ...running, runId: "run-completed", taskId: "work-two", phase: "completed",
+    stopConfirmed: true, finishedAt: "2026-10-15T00:00:03.000Z" };
+  const fixture = await candidateDirectory(t, { "task-run-execution-receipts.json": { schemaVersion: 1, records: [running, completed] } });
+  const file = path.join(fixture.directory, "task-run-execution-receipts.json");
+  const before = await readFile(file);
+  await createProductionRestoreMigrationRegistry().migrate(fixture);
+  assert.deepEqual(await readFile(file), before);
+  const restored = new TaskRunExecutionReceipts(new StateStore(fixture.directory));
+  assert.deepEqual(await restored.list(), [{ ...running, phase: "unknown" }, completed]);
+  const future = await candidateDirectory(t, { "task-run-execution-receipts.json": { schemaVersion: 2, records: [] } });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(future));
+});
+
+test("corrupt receipts reject a pending executor migration before any owner write", async (t) => {
+  const fixture = await candidateDirectory(t, {
+    "code-executor-state.json": { schemaVersion: 2, revision: 0, sessions: {} },
+    "task-run-execution-receipts.json": { schemaVersion: 1, records: [{ runId: "invalid" }] },
+  });
+  const before = await readFile(path.join(fixture.directory, "code-executor-state.json"));
+  let writes = 0;
+  const originalWrite = StateStore.prototype.write;
+  t.mock.method(StateStore.prototype, "write", function (...args) { writes += 1; return originalWrite.apply(this, args); });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+  assert.equal(writes, 0);
+  assert.deepEqual(await readFile(path.join(fixture.directory, "code-executor-state.json")), before);
+});
+
+test("original repair feedback snapshots are validated and restored without rewriting history", async (t) => {
+  const owner = allPersistedSchemaOwners().find(({ ownerId }) => ownerId === "automatic-own-pr-repair-state");
+  assert.equal(owner?.mode, "validate");
+  const head = "a".repeat(40);
+  const feedback = { changeRequests: [{ id: "review-one", author: "reviewer", body: "Preserve unsaved edits",
+    submittedAt: "2026-10-15T00:00:00.000Z", reviewedHeadRefOid: head }], threads: [] };
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: "acme/repo", number: 1,
+    context: { schemaVersion: 1, headRefOid: head, reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: head, observedAt: "2026-10-15T00:00:00.000Z" } });
+  for (const state of [
+    { schemaVersion: 1, repairs: [], published: [] },
+    { schemaVersion: 1, repairs: [], published: [], feedbackSnapshots: [snapshot] },
+  ]) {
+    const fixture = await candidateDirectory(t, { "automatic-own-pr-repair-state.json": state });
+    const file = path.join(fixture.directory, "automatic-own-pr-repair-state.json");
+    const before = await readFile(file);
+    await createProductionRestoreMigrationRegistry().migrate(fixture);
+    assert.deepEqual(await readFile(file), before);
+  }
+  const corrupted = structuredClone(snapshot);
+  corrupted.feedback.changeRequests[0].body = "unbound replacement";
+  const fixture = await candidateDirectory(t, {
+    "code-executor-state.json": { schemaVersion: 2, revision: 0, sessions: {} },
+    "automatic-own-pr-repair-state.json": { schemaVersion: 1, repairs: [], published: [], feedbackSnapshots: [corrupted] },
+  });
+  const before = await readFile(path.join(fixture.directory, "code-executor-state.json"));
+  let writes = 0;
+  const originalWrite = StateStore.prototype.write;
+  t.mock.method(StateStore.prototype, "write", function (...args) { writes += 1; return originalWrite.apply(this, args); });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+  assert.equal(writes, 0);
+  assert.deepEqual(await readFile(path.join(fixture.directory, "code-executor-state.json")), before);
+  const future = await candidateDirectory(t, { "automatic-own-pr-repair-state.json": { schemaVersion: 3, repairs: [], published: [] } });
+  await assert.rejects(createProductionRestoreMigrationRegistry().migrate(future));
+});
+
+function repairFeedbackArchiveFixture() {
+  const feedback = { changeRequests: [{ id: "archive-review", author: "reviewer", body: "Keep the complete historical request" }], threads: [] };
+  const snapshot = createOriginalRepairFeedbackSnapshot({ repository: "acme/repo", number: 42,
+    context: { schemaVersion: 1, headRefOid: "a".repeat(40), reviewFeedbackDigest: ownReviewFeedbackDigest(feedback), feedback },
+    provenance: { kind: "captured_before_repair", observedHeadRefOid: "a".repeat(40), observedAt: "2026-10-15T00:00:00.000Z" } });
+  const reference = originalRepairFeedbackArchiveReference(snapshot);
+  const record = createOriginalRepairFeedbackArchiveRecord(snapshot);
+  const state = { schemaVersion: 2, repairs: [], published: [{ repository: snapshot.repository, number: snapshot.number,
+    feedbackDigest: snapshot.feedbackDigest, feedbackSnapshotId: snapshot.snapshotId, feedbackSnapshotArchive: reference,
+    commitOid: "b".repeat(40), confirmationId: "archive-publication", feedbackFingerprints: ["c".repeat(64)] }], feedbackSnapshots: [] };
+  return structuredClone({ snapshot, record, state, key: originalRepairFeedbackArchiveKey(snapshot.snapshotId) });
+}
+
+test("immutable feedback archives and schema2 references preserve exact bytes, including crash orphans", async (t) => {
+  const archive = repairFeedbackArchiveFixture();
+  for (const orphan of [false, true]) {
+    const files = { [`${archive.key}.json`]: `  ${JSON.stringify(archive.record)}\n\n`,
+      ...(orphan ? {} : { "automatic-own-pr-repair-state.json": `${JSON.stringify(archive.state)}\n` }) };
+    const fixture = await candidateDirectory(t, files);
+    const before = new Map(await Promise.all(Object.keys(files).map(async (name) => [name, await readFile(path.join(fixture.directory, name))])));
+    await createProductionRestoreMigrationRegistry().migrate(fixture);
+    await createProductionRestoreMigrationRegistry().migrate(fixture);
+    for (const [name, bytes] of before) assert.deepEqual(await readFile(path.join(fixture.directory, name)), bytes);
+  }
+});
+
+for (const corruption of ["missing", "body", "bodyHash", "repository", "number", "originalHead", "feedbackDigest", "snapshotId", "future", "unsupported", "key", "malformed-key", "corrupt-orphan", "future-orphan"]) {
+  test(`feedback archive preflight rejects ${corruption} before every planned owner write`, async (t) => {
+    const archive = repairFeedbackArchiveFixture();
+    const files = {
+      "code-executor-state.json": { schemaVersion: 2, revision: 0, sessions: {} },
+      "automatic-own-pr-repair-state.json": archive.state,
+      [`${archive.key}.json`]: archive.record,
+    };
+    const row = archive.state.published[0], reference = row.feedbackSnapshotArchive;
+    if (corruption === "missing") delete files[`${archive.key}.json`];
+    if (["body", "corrupt-orphan"].includes(corruption)) archive.record.snapshot.feedback.changeRequests[0].body = "tampered body";
+    if (corruption === "bodyHash") reference.bodyHash = "0".repeat(64);
+    if (corruption === "repository") row.repository = reference.repository = "acme/other";
+    if (corruption === "number") row.number = reference.number = 43;
+    if (corruption === "originalHead") reference.originalHeadRefOid = "c".repeat(40);
+    if (corruption === "feedbackDigest") row.feedbackDigest = reference.feedbackDigest = "d".repeat(64);
+    if (corruption === "snapshotId") row.feedbackSnapshotId = reference.snapshotId = `repair-feedback-snapshot-${"e".repeat(64)}`;
+    if (["future", "future-orphan"].includes(corruption)) archive.record.schemaVersion = 2;
+    if (corruption === "unsupported") archive.record.schemaVersion = 0;
+    if (["key", "malformed-key"].includes(corruption)) {
+      delete files[`${archive.key}.json`];
+      files[`original-repair-feedback-record-${corruption === "key" ? "f".repeat(64) : "invalid"}.json`] = archive.record;
+      delete files["automatic-own-pr-repair-state.json"];
+    }
+    if (corruption.endsWith("-orphan")) delete files["automatic-own-pr-repair-state.json"];
+    const fixture = await candidateDirectory(t, files);
+    const before = new Map(await Promise.all((await readdir(fixture.directory)).map(async (name) => [name, await readFile(path.join(fixture.directory, name))])));
+    let writes = 0;
+    const originalWrite = StateStore.prototype.write;
+    t.mock.method(StateStore.prototype, "write", function (...args) { writes += 1; return originalWrite.apply(this, args); });
+    await assert.rejects(createProductionRestoreMigrationRegistry().migrate(fixture));
+    assert.equal(writes, 0);
+    for (const [name, bytes] of before) assert.deepEqual(await readFile(path.join(fixture.directory, name)), bytes);
+  });
+}
 
 test("every omitted restore owner fails construction before restore starts", () => {
   for (const ownerId of PERSISTED_SCHEMA_OWNER_IDS) {
@@ -495,7 +727,7 @@ test("Code Job and executor legacy adapters are detached and idempotent", () => 
   const executor = normalizeControlledCodeExecutorState(legacyExecutor);
   assert.equal(CONTROLLED_CODE_EXECUTOR_STATE_KEY, "code-executor-state");
   assert.deepEqual(executor, {
-    schemaVersion: 2,
+    schemaVersion: 3,
     revision: 0,
     sessions: {},
   });
@@ -743,7 +975,7 @@ test("the production registry plans every fixed owner before deterministic write
   );
   assert.equal(
     (await readJson(fixture.directory, "work-ledger-state")).schemaVersion,
-    11,
+    13,
   );
   assert.equal(
     (await readJson(fixture.directory, "code-job-state")).schemaVersion,
@@ -751,7 +983,7 @@ test("the production registry plans every fixed owner before deterministic write
   );
   assert.equal(
     (await readJson(fixture.directory, "code-executor-state")).schemaVersion,
-    2,
+    3,
   );
   const journal = await readJson(fixture.directory, "unified-memory-records");
   assert.equal(journal.schemaVersion, 2);
@@ -848,7 +1080,7 @@ test("a future owner blocks every planned replacement before the first write", a
   const fixture = await candidateDirectory(t, {
     "configuration-state.json": legacyConfiguration,
     "code-executor-state.json": {
-      schemaVersion: 3,
+      schemaVersion: 4,
       revision: 0,
       sessions: {},
     },
@@ -962,4 +1194,64 @@ test("immutable Code Job archive families validate byte-for-byte against live st
     ),
     stateBytes,
   );
+});
+
+function resealDigest(value, digestKey) {
+  const content = { ...value };
+  delete content[digestKey];
+  return { ...content, [digestKey]: digestValue(content) };
+}
+
+function archiveWithTombstoneVersion(archive, schemaVersion) {
+  const changed = new Map([...archive].map(([key, value]) => [key, structuredClone(value)]));
+  const state = changed.get("code-job-state");
+  const manifest = state.archiveIndex[0];
+  const recordKey = `code-job-tombstone-record-${manifest.jobId}`;
+  const record = changed.get(recordKey);
+  record.schemaVersion = schemaVersion;
+  if (schemaVersion === 2) delete record.outcome.verificationOutcome;
+  const sealedRecord = resealDigest(record, "tombstoneDigest");
+  changed.set(recordKey, sealedRecord);
+  const byteLength = (value) => Buffer.byteLength(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+  let storageBytes = byteLength(sealedRecord);
+  for (const [key, index] of changed) {
+    if (!key.startsWith("code-job-tombstone-index-")) continue;
+    const sealedIndex = resealDigest({
+      ...index,
+      tombstoneDigest: sealedRecord.tombstoneDigest,
+    }, "indexDigest");
+    changed.set(key, sealedIndex);
+    storageBytes += byteLength(sealedIndex);
+  }
+  const sealedManifest = resealDigest({
+    ...manifest,
+    tombstoneDigest: sealedRecord.tombstoneDigest,
+    storageBytes,
+  }, "manifestDigest");
+  state.archiveIndex = [sealedManifest];
+  state.archive = resealDigest({
+    ...state.archive,
+    storageBytes,
+    lastManifestDigest: sealedManifest.manifestDigest,
+  }, "checkpointDigest");
+  return changed;
+}
+
+test("restore accepts old v2 and new v3 tombstones without rewriting immutable bytes", async (t) => {
+  const archive = await createCodeJobArchiveFixture();
+  for (const schemaVersion of [2, 3]) {
+    await t.test(`schema v${schemaVersion}`, async (subtest) => {
+      const versioned = archiveWithTombstoneVersion(archive, schemaVersion);
+      const files = Object.fromEntries([...versioned].map(([key, value]) => [`${key}.json`, value]));
+      const fixture = await candidateDirectory(subtest, files);
+      const before = new Map(await Promise.all(Object.keys(files).map(async (name) => [
+        name,
+        await readFile(path.join(fixture.directory, name), "utf8"),
+      ])));
+      await createProductionRestoreMigrationRegistry().migrate(fixture);
+      for (const [name, bytes] of before) {
+        assert.equal(await readFile(path.join(fixture.directory, name), "utf8"), bytes);
+      }
+    });
+  }
 });

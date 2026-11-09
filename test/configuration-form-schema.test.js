@@ -366,7 +366,7 @@ test("test library profiles expose a dedicated script template and source editor
     ["codeExecutor", "profiles", "reusable-smoke", "kind"],
     "node-script",
   );
-  assert.deepEqual(kind.options, ["node-test", "node-script"]);
+  assert.deepEqual(kind.options, ["node-test", "node-script", "windows-test", "windows-build"]);
   const source = configurationFieldDescriptor(
     [
       "codeExecutor",
@@ -379,6 +379,52 @@ test("test library profiles expose a dedicated script template and source editor
   );
   assert.equal(source.control, "textarea");
   assert.equal(source.maximumBytes, 65_536);
+});
+
+test("Windows fixed resources expose a bounded optional collection and editable fields", () => {
+  const path = ["codeExecutor", "profiles", "native", "resources"];
+  const collection = configurationCollectionDescriptor(path);
+  assert.equal(collection.kind, "array");
+  assert.equal(collection.optional, true);
+  assert.equal(collection.maximum, 16);
+  assert.equal(collection.uniqueBy, "name");
+  const template = configurationStructureTemplate(path);
+  assert.deepEqual(template.value, { name: "resource", sourcePath: "C:/path/to/resource", sha256: "0".repeat(64), kind: "file" });
+  for (const [field, format, maximumBytes] of [["name", "resource-name", 64], ["sourcePath", "windows-absolute-path", 4096], ["sha256", "sha256", 64]]) {
+    const descriptor = configurationFieldDescriptor([...path, 0, field], template.value[field]);
+    assert.equal(descriptor.format, format);
+    assert.equal(descriptor.maximumBytes, maximumBytes);
+    assert.notEqual(descriptor.readOnly, true);
+  }
+  assert.deepEqual(configurationFieldDescriptor([...path, 0, "kind"], "file").options, ["file", "directory"]);
+  for (const kind of ["windows-test", "windows-build", "node-script"]) {
+    assert.equal(Object.hasOwn(configurationStructureTemplate(["codeExecutor", "profiles"], kind).value, "resources"), false);
+  }
+});
+
+test("own PR repair exposes a disabled checkbox template and scoped help", () => {
+  const path = ["githubActions", "automaticOwnPrRepair"];
+  const field = configurationFieldDescriptor(path, false);
+  assert.equal(field.label, "自动修复我的 PR");
+  assert.equal(field.control, "checkbox");
+  assert.equal(field.kind, "boolean");
+  assert.match(field.help, /开发工程师/u);
+  assert.match(field.help, /无需逐项确认/u);
+  assert.match(field.help, /原 PR/u);
+  assert.match(field.help, /合并/u);
+  assert.deepEqual(configurationSlotDescriptor(path).operations, ["add", "remove", "replace"]);
+  assert.deepEqual(configurationStructureTemplate(path), { kind: "slot", value: false });
+});
+
+test("profile form fields use the sandbox ID boundary", () => {
+  const profiles = configurationCollectionDescriptor(["codeExecutor", "profiles"]);
+  assert.equal(profiles.keyFormat, "profile-id");
+  const binding = configurationFieldDescriptor(
+    ["codeExecutor", "requiredProfilesByWorkspace", "dashboard", 0],
+    "node-contract",
+  );
+  assert.equal(binding.format, "profile-id");
+  assert.equal(binding.maximumBytes, 64);
 });
 
 test("router-backed brain references declare a dynamic provider option source", () => {
@@ -526,9 +572,19 @@ test("provider variants expose fixed supervised Codex and Claude CLI forms", () 
     "codex-login",
     { providerKind: "codex-cli" },
   );
-  assert.deepEqual(descriptor.options, ["codex-login", "api-key"]);
-  assert.equal(descriptor.optionLabels["codex-login"], "Codex 当前登录（受管代理，推荐）");
+  assert.deepEqual(descriptor.options, ["codex-login", "codex-native-login", "api-key"]);
+  assert.equal(descriptor.optionLabels["codex-login"], "Codex 受管登录（兼容）");
+  assert.equal(descriptor.optionLabels["codex-native-login"], "Codex 原生登录（会话由 CLI 保存）");
   assert.equal(descriptor.optionLabels["api-key"], "环境变量 API Key");
+  assert.match(descriptor.help, /CODEX_HOME/);
+  assert.match(descriptor.help, /不自动切换/);
+
+  const claudeDescriptor = configurationFieldDescriptor(
+    ["brainProviders", "claude-cli", "credentialMode"],
+    "api-key",
+    { providerKind: "claude-cli" },
+  );
+  assert.deepEqual(claudeDescriptor.options, ["api-key"]);
 
   const legacySlot = configurationSlotDescriptor(
     ["brainProviders", "legacy-cli", "credentialMode"],

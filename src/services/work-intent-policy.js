@@ -212,6 +212,7 @@ function normalizeContext(value) {
     "executionSource",
     "controlledCommitEvidence",
     "evidenceTarget",
+    "internalReview",
   ].filter((key) => Object.hasOwn(value ?? {}, key));
   const entries = exact(value, [
     "assignmentId",
@@ -231,6 +232,10 @@ function normalizeContext(value) {
     roleId: safeId(entries.get("roleId"), "roleId"),
     event,
   };
+  if (entries.has("internalReview")) {
+    if (entries.get("internalReview") !== true) contextError("internalReview 无效");
+    context.internalReview = true;
+  }
   if (entries.has("evidenceTarget")) {
     try {
       context.evidenceTarget = normalizeDeliveryEvidenceTarget(
@@ -406,6 +411,14 @@ export function createWorkIntentPolicy({
   function bind({ context: contextValue, intent: intentValue } = {}) {
     const context = normalizeContext(contextValue);
     const intent = normalizeWorkIntent(intentValue);
+    const internalReview = context.internalReview === true ||
+      context.event.eventType === "pull_request.internal_review_requested" ||
+      (context.roleId === trustedCapabilities.get("pr-review") &&
+       context.event.eventType === "pull_request.owner_requested" &&
+       context.event.payload?.workType === "development");
+    if (internalReview && ["propose_github_review", "propose_github_pull_request_action"].includes(intent.type)) {
+      denied("内部复审结果应在本地交付或退回研发");
+    }
     if (
       context.executionSource !== undefined &&
       intent.type !== "propose_code_action"
@@ -483,6 +496,7 @@ export function createWorkIntentPolicy({
         {
           verdict: intent.verdict,
           body: intent.body,
+          ...(intent.publicationReuse === undefined ? {} : { publicationReuse: intent.publicationReuse }),
           evidence: intent.evidence,
           ...commonPayload,
         },

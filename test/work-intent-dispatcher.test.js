@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { createDeliveryEvidenceTarget } from "../src/domain/delivery-evidence-contract.js";
+import { createCiRepairEvidence } from "../src/domain/ci-repair-evidence.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
   createConflictCodeExecutionSource,
+  createReviewRepairCodeExecutionSource,
+  createCiRepairCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../src/domain/code-execution-source.js";
 import { createPullRequestExecutionBinding } from "../src/domain/pull-request-execution-binding.js";
@@ -631,8 +634,9 @@ function fixture(pairs, options = {}) {
     policy: options.policy ?? policy(),
     attentionProducer: attention,
     proposalProducer: proposals,
-    conflictExecutionSourcePreparer:
-      options.conflictExecutionSourcePreparer,
+      conflictExecutionSourcePreparer:
+        options.conflictExecutionSourcePreparer,
+      reviewRepairSourcePreparer: options.reviewRepairSourcePreparer,
     controlledCommitEvidenceReader:
       options.controlledCommitEvidenceReader,
     actionAdmissionGate: options.actionAdmissionGate,
@@ -722,6 +726,33 @@ test("a lifecycle cutover after binding prevents downstream attention creation",
 });
 
 const WORK_INTENT_REF = /^work-intent-[a-f0-9]{64}$/;
+
+for (const sealed of [false, true]) {
+  test(`incomplete local completion returns for delivery and cannot poison later intents (sealed ${sealed})`, async () => {
+    const pair = workPair(2, completeIntent());
+    const other = workPair(3, askUserIntent());
+    const { dispatcher, ledger, time } = fixture([pair, other]);
+    if (sealed) {
+      ledger.failAckBeforeOnce = true;
+      assert.equal((await dispatcher.dispatchPending({ limit: 1 })).uncertain, 1);
+      assert.notEqual(ledger.outbox[0].dispatchBinding, null);
+      time.advance(1_001);
+    }
+    const ack = ledger.ackIntent.bind(ledger);
+    ledger.ackIntent = (input) => {
+      if (input.nextStatus === "completed") throw Object.assign(new Error("Missing required report"), { code: "WORK_LEDGER_GRAPH_BLOCKED" });
+      return ack(input);
+    };
+    const recovered = fixture([], { ledger, time }).dispatcher;
+    const result = await recovered.dispatchPending();
+    assert.equal(result.retryWait, 1);
+    assert.equal(result.uncertain, 0);
+    assert.equal(result.delivered, 1);
+    assert.equal(ledger.outbox[0].status, "failed");
+    assert.equal(ledger.items[0].status, "retry_wait");
+    assert.equal(ledger.ackCalls.find(call => call.nextStatus === "retry_wait").details.code, "completion-delivery-required");
+  });
+}
 
 test("internal outcomes and durable proposals map to explicit ledger states", async (t) => {
   const cases = [
@@ -1034,6 +1065,75 @@ test("proposal authority auto-selects the sole action-compatible deliverable", a
   ]);
 });
 
+test("incompatible verification contract reports a precise unstarted failure without invoking policy or producer", async () => {
+  const pair = workPair(6, codeIntent({ operation: "verify" }), { target: { type: "role", id: "developer" } });
+  attachChildContract(pair, { revision: 1, acceptanceCriteria: [], expectedDeliverables: [
+    { deliverableId: "ci-fix-package", kind: "change-package", description: "保留原修复包", required: true },
+  ] });
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+  const result = await dispatcher.dispatchPending();
+  assert.equal(result.blocked, 1);
+  assert.equal(result.items[0].code, "delivery-evidence-incompatible");
+  assert.equal(ledger.ackCalls[0].details.code, "delivery-evidence-incompatible");
+  assert.equal(proposals.calls.length, 0);
+  assert.equal(ledger.bindCalls.length, 0);
+});
+
+test("a contracted PR child can inspect without claiming its final delivery", async () => {
+  const pair = workPair(6, codeIntent({ operation: "inspect" }), {
+    target: { type: "role", id: "developer" },
+  });
+  const sourceBinding = {
+    ...currentWorkItemInputBinding(pair.item),
+    rootItemId: "work-item-orchestrator-root",
+  };
+  pair.item.kind = "graph_task";
+  pair.item.source = null;
+  pair.item.assignment.graphTask = { sourceBinding };
+  const acceptanceContract = {
+    revision: 3,
+    acceptanceCriteria: [
+      { criterionId: "verified", description: "检查后提供权威验证证据" },
+    ],
+    expectedDeliverables: [
+      {
+        deliverableId: "implementation",
+        kind: "change-package",
+        description: "必要修改的受控变更包",
+        required: false,
+      },
+      {
+        deliverableId: "verification",
+        kind: "test-report",
+        description: "受控测试报告",
+        required: true,
+      },
+    ],
+  };
+  attachChildContract(pair, acceptanceContract);
+  const originalGraph = clone(pair.item.graph);
+  const { dispatcher, ledger, proposals } = fixture([pair]);
+
+  const result = await dispatcher.dispatchPending();
+
+  assert.equal(result.delivered, 1);
+  assert.equal(result.blocked, 0);
+  assert.equal(proposals.calls.length, 1);
+  const proposal = proposals.calls[0];
+  assert.equal(proposal.payload.operation, "inspect");
+  assert.deepEqual(
+    proposal.binding.inputBinding,
+    createPullRequestExecutionBinding({ sourceBinding, event: pair.item.event }),
+  );
+  assert.equal(Object.hasOwn(proposal.binding, "evidenceTarget"), false);
+  assert.equal(
+    Object.hasOwn(ledger.bindCalls[0].boundIntent.binding, "evidenceTarget"),
+    false,
+  );
+  assert.equal(ledger.items[0].status, "waiting_external");
+  assert.deepEqual(ledger.items[0].graph, originalGraph);
+});
+
 test("a structured role decision reaches dispatcher action-compatible selection", async () => {
   const acceptanceContract = {
     revision: 3,
@@ -1156,7 +1256,13 @@ test("proposal enqueue rejects action-incompatible authoritative delivery", asyn
     {
       name: "inspect cannot create authoritative evidence",
       roleId: "developer",
+      intent: codeIntent({ operation: "inspect", deliverableId: "verification" }),
+    },
+    {
+      name: "contracted inspect without a PR binding retains its existing rejection",
+      roleId: "developer",
       intent: codeIntent({ operation: "inspect" }),
+      withoutPrSource: true,
     },
   ];
   for (const [index, entry] of cases.entries()) {
@@ -1165,6 +1271,11 @@ test("proposal enqueue rejects action-incompatible authoritative delivery", asyn
         target: { type: "role", id: entry.roleId },
       });
       attachChildContract(pair, acceptanceContract);
+      if (entry.withoutPrSource) {
+        pair.item.kind = "graph_task";
+        pair.item.source = null;
+        pair.item.assignment.graphTask = { sourceBinding: null };
+      }
       const { dispatcher, ledger, proposals } = fixture([pair]);
 
       const result = await dispatcher.dispatchPending();
@@ -1556,6 +1667,21 @@ test("legacy in-flight intents with unknowable bindings never call policy or dow
   assert.equal(proposals.calls.length, 0);
 });
 
+test("role dispatch filters before limiting and leaves other roles unclaimed", async () => {
+  const developer = conflictWorkPair(1);
+  const review = workPair(2, reviewIntent(), { target: { type: "role", id: "pr-engineer" } });
+  const { dispatcher, ledger, proposals } = fixture([developer, review], {
+    policy: policy({ githubReviewRoles: ["pr-engineer"] }),
+    conflictExecutionSourcePreparer: { async prepare() { throw new Error("unrelated developer preparation ran"); } },
+  });
+  const result = await dispatcher.dispatchPending({ limit: 1, roleId: "pr-engineer" });
+  assert.equal(result.delivered, 1);
+  assert.deepEqual(ledger.claimCalls.map(({ intentId }) => intentId), [review.outbox.intentId]);
+  assert.equal(ledger.outbox[0].status, "pending");
+  assert.equal(proposals.calls.length, 1);
+  await assert.rejects(dispatcher.dispatchPending({ roleId: "invalid role" }), /roleId is invalid/);
+});
+
 test("legacy binding quarantine does not consume the actionable dispatch limit", async () => {
   const time = controlledClock();
   const legacy = workPair(13, askUserIntent(), {
@@ -1619,6 +1745,33 @@ test("policy rejection blocks safely and attention conflicts split blocked from 
     assert.equal(ledger.ackCalls[0].outcome, "failed");
     assert.ok(Date.parse(ledger.ackCalls[0].availableAt) > Date.parse(ledger.ackCalls[0].details.at ?? "2026-08-02T04:00:00.000Z"));
   });
+});
+
+test("an already fixed owner PR goes from developer to internal PR review without confirmation", async () => {
+  const pair = workPair(4, {
+    ...handoffIntent(), capability: "pr-review",
+    brief: `Existing repair on Head ${"a".repeat(40)} covers the outstanding feedback; review code and regression evidence`,
+    evidence: ["current-head-diff", "regression-report"],
+  }, { target: { type: "role", id: "developer" } });
+  pair.item.event = normalizeWorkflowEvent({
+    schemaVersion: 1, eventType: "pull_request.owner_requested",
+    occurredAt: "2026-08-02T03:00:00.000Z",
+    source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    subject: clone(pair.item.event.subject),
+    payload: { ...clone(pair.item.event.payload), title: "Existing PR repair", workType: "development" },
+  });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(4, pair.item.event, pair.item.assignmentId)).source;
+  const { dispatcher, ledger, attention, proposals } = fixture([pair], {
+    policy: policy({ capabilityRoles: { "pr-review": "pr-engineer" } }),
+  });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(ledger.items[0].status, "queued");
+  assert.equal(ledger.items[0].currentTarget.id, "pr-engineer");
+  assert.equal(ledger.outbox[0].dispatchBinding.boundIntent.binding.targetRoleId, "pr-engineer");
+  assert.equal(attention.calls.length, 0);
+  assert.equal(proposals.calls.length, 0);
+  assert.equal((await dispatcher.dispatchPending()).scanned, 0);
+  assert.equal(ledger.ackCalls.length, 1);
 });
 
 test("handoff uses only the policy-mapped role and never exposes a half-handoff crash state", async (t) => {
@@ -1764,6 +1917,7 @@ test("dispatcher binds a PR intent to the active Head instead of its origin even
   pair.item.source = appendPullRequestWorkSource(
     created.source,
     prSourceEnvelope(2, headB, "workflow-assignment-head-b"),
+    { attemptAtActivation: 0 },
   ).source;
 
   const contexts = [];
@@ -2010,6 +2164,85 @@ test("persisted conflict binding retries delivery without preparing a second sou
   assert.equal(recovered.delivered, 1);
   assert.equal(preparations, 1);
   assert.equal(proposals.calls.length, 1);
+});
+
+test("orchestrator owner conflict work seals the same conflict source without a copied dashboard status", async () => {
+  const pair = conflictWorkPair(6);
+  const { mergeStateStatus, ...payload } = pair.item.event.payload;
+  pair.item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.owner_requested",
+    occurredAt: "2026-08-02T03:00:00.000Z", source: { provider: "local-owner", scopeId: "owner-request:123e4567-e89b-42d3-a456-426614174000" },
+    subject: clone(pair.item.event.subject), payload: { ...clone(payload), title: "Resolve PR conflict", workType: "general",
+      suggestedCapability: "development", expectedHeadRefOid: payload.headRefOid } });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(6, pair.item.event, pair.item.assignmentId)).source;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], { conflictExecutionSourcePreparer: { async prepare(binding) {
+    preparations += 1; return conflictExecutionSource(binding);
+  } } });
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "conflict_preparation");
+});
+
+test("own review repair binds its trusted source once and resumes the persisted proposal", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "address_review" });
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], {
+    time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding, roleId }) {
+      assert.equal(roleId, "developer");
+      preparations += 1;
+      return createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] });
+    } },
+  });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls.length, 0);
+  time.advance(1_001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "review_repair");
+});
+
+test("CI repair diagnostics bind and resume through canonical proposal storage", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "fix_ci" });
+  const time = controlledClock();
+  const ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], {
+    time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding }) {
+      preparations += 1;
+      return createCiRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"],
+        ciEvidence: createCiRepairEvidence({ schemaVersion: 1, repository: inputBinding.repository,
+          number: inputBinding.pullRequestNumber, headRefOid: inputBinding.headRefOid,
+          headRefName: inputBinding.gitTarget.headRefName,
+          checks: [{ kind: "status_context", name: "QuickTest", url: null, conclusion: "FAILURE" }],
+          diagnostics: [{ check: "QuickTest", state: "unavailable", failures: [{ message: "Fixture missing", file: "test.cpp" }] }] }) });
+    } },
+  });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  assert.equal(proposals.calls.length, 0);
+  time.advance(1_001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "ci_repair");
+  assert.equal(proposals.calls[0].binding.executionSource.ciEvidence.diagnostics[0].failures[0].message, "Fixture missing");
+});
+
+for (const code of ['OWN_PR_CI_SOURCE_NOT_READY', 'CODE_CI_REPAIR_CONTEXT_UNAVAILABLE', 'OWN_PR_CONFLICT_SOURCE_NOT_READY']) test(`CI source ${code} retries without submitting an ordinary unpublishable proposal`, async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: 'CLEAN', relation: 'authored', nextAction: 'fix_ci' });
+  const { dispatcher, proposals, ledger } = fixture([pair], {
+    reviewRepairSourcePreparer: { async prepare() { throw Object.assign(new Error('CI evidence not ready'), { code }); } },
+  });
+  const result = await dispatcher.dispatchPending();
+  assert.equal(result.retryWait, 1);
+  assert.equal(proposals.calls.length, 0);
+  assert.equal(ledger.ackCalls[0].details.code, code === 'OWN_PR_CONFLICT_SOURCE_NOT_READY' ? 'conflict-source-unavailable' : 'ci-source-unavailable');
+  assert.equal(ledger.items[0].status, 'retry_wait');
 });
 
 test("upgrade recovery blocks a persisted conflict proposal without a sealed source", async () => {
@@ -2276,4 +2509,27 @@ test("dispatcher rejects accessor and sparse ledger pages without invoking gette
       assert.equal(malicious.reads(), 0);
     });
   }
+});
+
+
+test("internal repair conflict source survives an interrupted host binding without ordinary modify fallback", async () => {
+  const pair = conflictWorkPair(6, codeIntent(), { mergeStateStatus: "CLEAN", relation: "authored", nextAction: "address_review" });
+  const old = pair.item.event;
+  pair.item.event = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.internal_review_requested",
+    occurredAt: old.occurredAt, source: { provider: "internal-review-repair", scopeId: "internal-review:123e4567-e89b-42d3-a456-426614174000" },
+    subject: old.subject, payload: { workType: "pull_request", state: "open", headRefOid: old.payload.headRefOid,
+      gitTargetAvailable: true, gitTarget: old.payload.gitTarget,
+      internalReview: { kind: "own_pr_ci_repair", headRefOid: old.payload.headRefOid, feedbackDigest: "c".repeat(64),
+        publicationConfirmationId: "prior-publication", controlledCommitEvidenceId: "prior-commit" } } });
+  pair.item.source = createPullRequestWorkSource(prSourceEnvelope(6, pair.item.event, pair.item.assignmentId)).source;
+  const time = controlledClock(), ledger = new FakeLedger([pair], time);
+  ledger.failBindAfterOnce = true;
+  let preparations = 0;
+  const { dispatcher, proposals } = fixture([pair], { time, ledger,
+    reviewRepairSourcePreparer: { async prepare({ inputBinding }) { preparations++; return conflictExecutionSource(inputBinding); } } });
+  assert.equal((await dispatcher.dispatchPending()).uncertain, 1);
+  time.advance(1001);
+  assert.equal((await dispatcher.dispatchPending()).delivered, 1);
+  assert.equal(preparations, 1);
+  assert.equal(proposals.calls[0].binding.executionSource.kind, "conflict_preparation");
 });

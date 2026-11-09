@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 import {
   CODE_JOB_ACTIONS_BY_OPERATION,
   createCodeJobGrant,
@@ -7,7 +8,7 @@ import {
   updateCodeJobLifecycle,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import {
   classifyCodeJobMemoryEvent,
@@ -25,6 +26,22 @@ const WORKSPACE_REVISION = "4".repeat(64);
 const FILE_BEFORE = "5".repeat(64);
 const FILE_AFTER = "6".repeat(64);
 const HEAD_REF_OID = "1".repeat(40);
+
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} memory retains source authority without invented conflict preparation`, () => {
+  const binding = conflictInputBinding();
+  const source = sourceKind === 'ci_repair' ? ciRepairSource(binding, ['src', 'test', 'docs'])
+    : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test", "docs"] });
+  const job = observedJob(binding, { operation: "modify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify],
+    writablePaths: ["src", "test", "docs"], executionSource: source });
+  const event = createCodeJobMemoryEvent({ sequence: 1, previousDigest: null, job, kind: "observation" });
+  const normalized = normalizeCodeJobMemoryEvent(event);
+  const snapshot = JSON.parse(normalized.memoryRecord.content);
+  assert.equal(snapshot.executionSource.kind, sourceKind);
+  assert.equal(Object.hasOwn(snapshot.executionSource, "preparationId"), false);
+  assert.deepEqual(snapshot.executionSource.writablePathSamples, ["docs", "src", "test"]);
+  assert.equal(JSON.stringify(normalized).includes("conflict-preparation:undefined"), false);
+  assert.ok(normalized.memoryRecord.tags.includes(sourceKind === 'ci_repair' ? 'ci-repair' : 'review-repair'));
+});
 
 function inputBinding() {
   return {

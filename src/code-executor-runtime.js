@@ -1,6 +1,11 @@
 import path from "node:path";
 import { types as utilTypes } from "node:util";
 import { DockerTestSandbox } from "./adapters/docker-test-sandbox.js";
+import { WindowsFixedTestRunner } from "./adapters/windows-fixed-test-runner.js";
+import { ConfiguredTestRunner } from "./adapters/configured-test-runner.js";
+import { InspectionEnvironmentRecoveryReader } from './adapters/inspection-environment-recovery-reader.js';
+import { SettledVerificationRecoveryReader } from './adapters/settled-verification-recovery-reader.js';
+import { isWindowsTestProfile } from "./domain/windows-test-profile.js";
 import { GitObjectSnapshotter } from "./adapters/git-object-snapshotter.js";
 import { createControlledGitRuntimeBundle } from "./controlled-git-runtime.js";
 import { projectRoot } from "./lib/config.js";
@@ -139,8 +144,8 @@ function normalizeEnabledConfig(config) {
   assertRecord(config);
   if (config.enabled === false || config.enabled === undefined) return null;
   if (config.enabled !== true) throw invalidConfig();
-  assertRecord(config.docker);
   assertRecord(config.profiles);
+  if (Object.values(config.profiles).some((profile) => !isWindowsTestProfile(profile))) assertRecord(config.docker);
   assertRecord(config.requiredProfilesByWorkspace);
   if (Object.keys(config.profiles).length === 0) {
     throw invalidConfig("至少需要配置一个固定测试配置");
@@ -209,10 +214,13 @@ function createWorkspaceAuthority(
   sandbox,
   gitSettings,
   conflictMaterializerAvailable,
+  inspectProjection = null,
 ) {
   return Object.freeze({
     workspaces: Object.freeze(
       workspaces.map((workspace) => {
+        const writablePaths = inspectProjection?.workspaceId === workspace.id
+          ? inspectProjection.writablePaths : workspace.writablePaths;
         const profiles = requiredProfiles[workspace.id].map((id) =>
           Object.freeze({
             id,
@@ -236,7 +244,7 @@ function createWorkspaceAuthority(
         return Object.freeze({
           id: workspace.id,
           capabilities: Object.freeze(capabilities),
-          writablePaths: Object.freeze([...workspace.writablePaths]),
+          writablePaths: Object.freeze([...writablePaths]),
           excludePaths: Object.freeze([...workspace.excludePaths]),
           requiredProfiles: Object.freeze(profiles),
           authorityDigest: digestValue({
@@ -245,7 +253,7 @@ function createWorkspaceAuthority(
             capabilities,
             sourceRoot: workspace.sourceRoot,
             gitSnapshot,
-            writablePaths: workspace.writablePaths,
+            writablePaths,
             excludePaths: workspace.excludePaths,
             requiredProfiles: profiles,
           }),
@@ -376,6 +384,18 @@ function snapshotLimits(brokerLimits = {}) {
   );
 }
 
+function controlledGitDependencies(dependencies, brokerLimits = {}) {
+  const injected = ownDataValue(dependencies, "controlledGitDependencies") ?? {};
+  if (utilTypes.isProxy(injected)) throw invalidConfig();
+  assertRecord(injected);
+  if (Object.hasOwn(injected, "limits")) throw invalidConfig("Controlled Git 大小限制必须来自工作区 broker 配置");
+  const limits = Object.fromEntries(
+    Object.entries(snapshotLimits(brokerLimits)).map(([key, value]) =>
+      [key === "maxFileBytes" ? "maxBlobBytes" : key, value]),
+  );
+  return Object.defineProperties({ limits }, Object.getOwnPropertyDescriptors(injected));
+}
+
 function createChangePackageTargets(workspaces, authority) {
   const authorityByWorkspace = new Map(
     authority.workspaces.map((workspace) => [workspace.id, workspace]),
@@ -449,7 +469,9 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
   }
   const controlledGitRuntime = await createControlledGitRuntimeBundle(
     controlledGitConfig,
-    ownDataValue(dependencies, "controlledGitDependencies") ?? {},
+    controlledGitConfig?.enabled === true
+      ? controlledGitDependencies(dependencies, enabledConfig.brokerLimits)
+      : ownDataValue(dependencies, "controlledGitDependencies") ?? {},
   );
   const injectedConflictMaterializer =
     dependencies.conflictMaterializer === undefined
@@ -548,17 +570,26 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     });
   const sandbox =
     dependencies.sandbox ||
-    new DockerTestSandbox({
-      dockerExecutable: enabledConfig.docker.executable,
-      dockerHost: enabledConfig.docker.host,
-      allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+    new ConfiguredTestRunner({
       profiles: enabledConfig.profiles,
-      ...(dependencies.processRunner
-        ? { processRunner: dependencies.processRunner }
-        : {}),
-      ...(dependencies.sourceEnvironment
-        ? { sourceEnvironment: dependencies.sourceEnvironment }
-        : {}),
+      ...(Object.values(enabledConfig.profiles).some((profile) => !isWindowsTestProfile(profile)) ? {
+        dockerRunner: new DockerTestSandbox({
+          dockerExecutable: enabledConfig.docker.executable,
+          dockerHost: enabledConfig.docker.host,
+          allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+          profiles: Object.fromEntries(Object.entries(enabledConfig.profiles).filter(([, profile]) => !isWindowsTestProfile(profile))),
+          ...(dependencies.processRunner ? { processRunner: dependencies.processRunner } : {}),
+          ...(dependencies.sourceEnvironment ? { sourceEnvironment: dependencies.sourceEnvironment } : {}),
+        }),
+      } : {}),
+      ...(Object.values(enabledConfig.profiles).some(isWindowsTestProfile) ? {
+        windowsRunner: new WindowsFixedTestRunner({
+          allowedWorkspaceRoot: path.join(runtimeRoot, "workspaces"),
+          runRoot: path.join(runtimeRoot, "windows-tests"),
+          profiles: Object.fromEntries(Object.entries(enabledConfig.profiles).filter(([, profile]) => isWindowsTestProfile(profile))),
+          ...(dependencies.sourceEnvironment ? { sourceEnvironment: dependencies.sourceEnvironment } : {}),
+        }),
+      } : {}),
     });
   const executor = new ControlledCodeExecutor({
     broker,
@@ -582,21 +613,43 @@ export async function createCodeExecutorRuntime(config, dependencies = {}) {
     workspaces,
     authority,
   );
+  const inspectAuthorityForWritablePaths = ({ workspaceId, writablePaths }) => {
+    const workspace = workspaces.find(entry => entry.id === workspaceId);
+    if (!workspace || !Array.isArray(writablePaths) ||
+        new Set(writablePaths).size !== writablePaths.length ||
+        writablePaths.some(entry => !workspace.writablePaths.includes(entry))) {
+      throw invalidConfig("只读历史授权只能投影当前可写路径的子集");
+    }
+    return createWorkspaceAuthority(workspaces, enabledConfig.requiredProfilesByWorkspace,
+      sandbox, gitSettings, conflictMaterializer !== null,
+      { workspaceId, writablePaths: [...writablePaths] });
+  };
   const completedChangeExporter = createCompletedChangeExporter(executor);
   const auditArtifactReader = createAuditArtifactReader(journal);
+  const settledVerificationReader = typeof sandbox.readSettledPreparationFailure === 'function'
+    ? new SettledVerificationRecoveryReader({ executor, artifacts: auditArtifactReader, sandbox }) : null;
+  const inspectionEnvironmentReader = typeof sandbox.readProfileReadiness === 'function'
+    ? new InspectionEnvironmentRecoveryReader({ executor, artifacts: auditArtifactReader, sandbox }) : null;
   return Object.freeze({
     broker,
     sandbox,
     journal,
     executor,
     authority,
+    inspectAuthorityForWritablePaths,
     changePackageTargets,
     completedChangeExporter,
     auditArtifactReader,
+    settledVerificationReader,
+    inspectionEnvironmentReader,
     conflictPreparationVerifier:
       controlledGitRuntime?.verifier ?? null,
     conflictExecutionSourcePreparer:
       controlledGitRuntime?.preparer ?? null,
+    conflictInspectionReader:
+      controlledGitRuntime?.inspectionReader ?? null,
+    conflictSourceReader:
+      controlledGitRuntime?.sourceReader ?? null,
     controlledCommitBuilder:
       controlledGitRuntime?.commitBuilder ?? null,
     controlledCommitPublisher:

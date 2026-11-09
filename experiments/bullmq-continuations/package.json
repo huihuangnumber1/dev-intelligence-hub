@@ -1,0 +1,16 @@
+{
+  "name": "bullmq-continuations-trial",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "trial": "node trial.mjs"
+  },
+  "dependencies": {
+    "bullmq": "6.3.19",
+    "ioredis": "6.0.0"
+  }
+}

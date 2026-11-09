@@ -1,3 +1,4 @@
+import { authorityLifecycleMemoryRecord } from "../domain/memory-authority-lifecycle.js";
 import { createHash } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
@@ -932,6 +933,39 @@ function storedRecord(value) {
     );
   }
   return normalized;
+}
+
+function retireOrphanedUnboundConsultations(value) {
+  // Older window eviction dropped unbound consultation checkpoints without
+  // retiring their records. Preserve history and validate the full repaired state.
+  if (value?.schemaVersion !== 2 || value.lifecycleAuthority?.authorityProjection?.schemaVersion !== 4 ||
+      !Array.isArray(value.records)) return null;
+  const records = value.records.map(storedRecord).map(record =>
+    AUTHORITY_BOUND_PROJECTION_SOURCES.has(record.source.kind) ? projectionRecord(record) : record);
+  const active = new Set(value.lifecycleAuthority.authorityProjection.entries.map(entry => entry.recordId));
+  const superseded = new Set(records.flatMap(record => record.evidence
+    .filter(evidence => evidence.startsWith("supersedes:")).map(evidence => evidence.slice("supersedes:".length))));
+  const obsolete = [];
+  for (const record of records) {
+    if (record.source.kind !== "consultation-request" || active.has(record.recordId) || superseded.has(record.recordId)) continue;
+    const content = JSON.parse(record.content);
+    if (!isDeepStrictEqual(content.authority, { applies: false, current: true, bindingDigest: null, inputBinding: null })) continue;
+    obsolete.push(projectionRecord(normalizeMemoryRecord(authorityLifecycleMemoryRecord({
+      key: record.source.id, sourceKind: record.source.kind, recordId: record.recordId,
+      binding: null, occurredAt: record.occurredAt,
+    }))));
+  }
+  return obsolete.length === 0 ? null : { ...value, revision: value.revision + 1,
+    records: [...value.records, ...obsolete] };
+}
+
+function assertAuthorityProjectionRetirements(previous, next, records) {
+  const retained = new Set(next.entries.map(entry => entry.recordId));
+  const retired = new Set(records.flatMap(record => record.evidence
+    .filter(evidence => evidence.startsWith("supersedes:")).map(evidence => evidence.slice("supersedes:".length))));
+  if (previous.entries.some(entry => entry.current !== false && !retained.has(entry.recordId) && !retired.has(entry.recordId))) {
+    throw memoryError("MEMORY_LIFECYCLE_AUTHORITY_INVALID", "移除当前记忆投影必须记录失效凭证", 409);
+  }
 }
 
 function normalizeJournal(value, limits) {
@@ -2118,6 +2152,7 @@ function prepareAuthorityProjectionCommit(
       409,
     );
   }
+  assertAuthorityProjectionRetirements(previous, projectionState, records);
   return { records, projectionState };
 }
 
@@ -2270,7 +2305,17 @@ export class LocalMemoryJournal {
     this.#recovering ||= this.#operationQueue.enqueue(() =>
       this.#exclusiveLease.run(async () => {
         const stored = await this.#store.read(MEMORY_JOURNAL_KEY, null);
-        const journal = normalizeJournal(stored, this.#limits);
+        let journal;
+        try { journal = normalizeJournal(stored, this.#limits); }
+        catch (error) {
+          if (error?.code !== "MEMORY_JOURNAL_CORRUPTED") throw error;
+          try {
+            const recovered = retireOrphanedUnboundConsultations(stored);
+            if (recovered === null) throw error;
+            journal = normalizeJournal(recovered, this.#limits);
+          } catch { throw error; }
+          await this.#store.write(MEMORY_JOURNAL_KEY, journal);
+        }
         const built = buildIndex(journal.records, journal.revision);
         const storedIndex = await this.#store.read(MEMORY_INDEX_KEY, null);
         this.#journal = journal;
@@ -2625,6 +2670,7 @@ export class LocalMemoryJournal {
             409,
           );
         }
+        assertAuthorityProjectionRetirements(previous, projectionState, records);
         return this.#append(records, {
           ...this.#journal.lifecycleAuthority,
           authorityProjection: projectionState,

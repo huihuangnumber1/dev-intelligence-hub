@@ -136,6 +136,22 @@ function sameValue(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function isContentVersion(value) {
+  return value !== null && typeof value === "object" &&
+    Object.getPrototypeOf(value) === Object.prototype &&
+    Reflect.ownKeys(value).length === 0 && Object.isFrozen(value);
+}
+
+function normalizeVersionedRead(result, expectedVersion) {
+  const error = corruptedState();
+  assertWorkProposalExactKeys(result, result?.changed === true
+    ? ["changed", "version", "value"] : ["changed", "version"], error);
+  if (!isContentVersion(result.version) ||
+      (result.changed !== true && result.changed !== false) ||
+      (result.changed === false && result.version !== expectedVersion)) throw error;
+  return result;
+}
+
 function optionalTimestamp(value, error) {
   return value === null ? null : normalizeWorkProposalTimestamp(value, error);
 }
@@ -520,6 +536,8 @@ function normalizeIdFactory(value) {
 
 export class WorkProposalStore {
   #evidenceReader;
+  #durableSnapshot = null;
+  #normalizationLimits;
 
   constructor({
     store,
@@ -539,6 +557,7 @@ export class WorkProposalStore {
     this.clock = clock;
     this.idFactory = normalizeIdFactory(idFactory);
     this.limits = normalizeLimits(limits);
+    this.#normalizationLimits = this.limits;
     this.state = defaultState();
     this.ready = false;
     this.#evidenceReader = new WorkProposalEvidenceReader({
@@ -552,6 +571,7 @@ export class WorkProposalStore {
   recover() {
     return this.operationQueue.enqueue(() =>
       this.exclusiveLease.run(async () => {
+        this.#durableSnapshot = null;
         const durable = await this.store.read(WORK_PROPOSAL_STATE_KEY, defaultState());
         const recovered = normalizeState(durable, this.limits);
         this.state = recovered;
@@ -839,6 +859,10 @@ export class WorkProposalStore {
     return this.#evidenceReader.getResultForProposal(value);
   }
 
+  listReviewPublicationSources(value) {
+    return this.#evidenceReader.listReviewPublicationSources(value);
+  }
+
   listEvidenceCandidates(value) {
     return this.#evidenceReader.listEvidenceCandidates(value);
   }
@@ -920,14 +944,20 @@ export class WorkProposalStore {
         const change = operation(durable);
         if (!change.write) return change.value;
         this.#assertCapacity(change.state);
-        const candidate = normalizeState(change.state, this.limits);
+        const limits = this.limits;
+        const candidate = normalizeState(change.state, limits);
+        const store = this.store;
+        let writtenVersion;
         try {
-          await this.store.write(WORK_PROPOSAL_STATE_KEY, candidate);
+          writtenVersion = await store.write(WORK_PROPOSAL_STATE_KEY, candidate);
         } catch (writeError) {
+          this.#durableSnapshot = null;
           await this.#reconcileFailedWrite(writeError);
           throw writeError;
         }
         this.state = candidate;
+        this.#durableSnapshot = typeof store.readVersioned === "function" && isContentVersion(writtenVersion)
+          ? { store, limits, version: writtenVersion, state: structuredClone(candidate) } : null;
         return change.value;
       });
     });
@@ -935,13 +965,30 @@ export class WorkProposalStore {
 
   async #readDurableState() {
     try {
-      const durable = normalizeState(
-        await this.store.read(WORK_PROPOSAL_STATE_KEY, defaultState()),
-        this.limits,
-      );
+      const store = this.store;
+      let durable, version, snapshot;
+      if (typeof store.readVersioned === "function") {
+        // StateStore checks exact fresh bytes and existence on every read.
+        snapshot = this.limits === this.#normalizationLimits && this.#durableSnapshot?.store === store &&
+          this.#durableSnapshot.limits === this.limits ? this.#durableSnapshot : null;
+        const result = normalizeVersionedRead(await store.readVersioned(WORK_PROPOSAL_STATE_KEY, defaultState(), {
+          ifVersion: snapshot?.version,
+        }), snapshot?.version);
+        version = result.version;
+        if (!result.changed) {
+          // The cached value never aliases public state or mutation inputs.
+          durable = structuredClone(snapshot.state);
+          if (snapshot.limits !== this.limits) durable = normalizeState(durable, this.limits);
+        } else durable = normalizeState(result.value, this.limits);
+      } else durable = normalizeState(await store.read(WORK_PROPOSAL_STATE_KEY, defaultState()), this.limits);
+      // Public state may have been mutated even when durable bytes are unchanged.
       this.#acceptDurableState(durable);
+      this.#durableSnapshot = version === undefined ? null
+        : snapshot?.version === version && snapshot.limits === this.limits ? snapshot
+        : { store, limits: this.limits, version, state: structuredClone(durable) };
       return durable;
     } catch (error) {
+      this.#durableSnapshot = null;
       this.ready = false;
       throw error;
     }

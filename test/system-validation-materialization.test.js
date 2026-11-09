@@ -12,8 +12,23 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { isWindowsGitImplementationPath, windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 const execFileAsync = promisify(execFile);
+
+test("Windows Git discovery includes UCRT64 and legacy native implementations without wrappers", () => {
+  const candidates = windowsGitImplementationCandidates("C:/Program Files/Git/cmd/git.exe");
+  assert.deepEqual(candidates, [
+    "C:\\Program Files\\Git\\ucrt64\\bin\\git.exe",
+    "C:\\Program Files\\Git\\mingw64\\bin\\git.exe",
+    "C:\\Program Files\\Git\\mingw32\\bin\\git.exe",
+  ]);
+  assert.deepEqual(windowsGitImplementationCandidates(candidates[0]), candidates);
+  for (const candidate of candidates) assert.equal(isWindowsGitImplementationPath(candidate), true);
+  for (const rejected of ["C:/Program Files/Git/cmd/git.exe", "C:/Program Files/Git/bin/git.exe",
+    "tools/ucrt64/bin/git.exe", "//server/share/ucrt64/bin/git.exe", "C:/Git/ucrt64/bin/git.exe\0"])
+    assert.equal(isWindowsGitImplementationPath(rejected), false, rejected);
+});
 
 async function git(root, ...arguments_) {
   const { stdout } = await execFileAsync("git", arguments_, {

@@ -83,6 +83,10 @@ export function scoreItem(
   } else if (item.kind === "message") {
     score = 78;
     reasons.push("今日重要消息");
+  } else if (item.kind === "mail") {
+    score = ["mentioned", "assigned", "authored", "review_requested"].includes(item.relation) ? 82 : 76;
+    reasons.push(item.relation === "mentioned" ? "邮件明确 @你" :
+      item.relation === "assigned" ? "邮件关联分配给你的工作" : "与你相关的重要邮件");
   } else if (item.kind === "pull_request" && item.relation === "authored") {
     score = 55;
     reasons.push("需要你修改或推进");

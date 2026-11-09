@@ -21,6 +21,7 @@ const PROVIDER_KEYS = new Set([
   "maxRequestBytes",
   "contextTokens",
   "credentialMode",
+  "maxConcurrentTurns",
   "remote",
 ]);
 const PROVIDER_LIMIT_KEYS = Object.freeze([
@@ -34,6 +35,7 @@ const CLI_PROVIDER_KEYS = new Set([
   "maxResponseBytes",
   "maxRequestBytes",
   "credentialMode",
+  "maxConcurrentTurns",
   "remote",
 ]);
 const ROLE_KEYS = new Set([
@@ -308,7 +310,7 @@ function declaredRemote(config, name) {
   return config.remote === true;
 }
 
-function providerWithBoundary(provider, remote, lifecycle) {
+function providerWithBoundary(provider, remote, lifecycle, sessionIsolationKey = null) {
   const runtime = lifecycle.admit(provider);
   const attemptDescriptor = Object.getOwnPropertyDescriptor(
     provider,
@@ -318,7 +320,27 @@ function providerWithBoundary(provider, remote, lifecycle) {
     provider,
     "supportsEntitySessions",
   );
+  const reviewReadingDescriptor = Object.getOwnPropertyDescriptor(
+    provider,
+    "supportsReviewReading",
+  );
+  const nativeReviewSkillsDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsNativeReviewSkills");
+  const codeReadingDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsCodeReading");
+  const codeExecutionDescriptor = Object.getOwnPropertyDescriptor(provider, "supportsCodeExecution");
+  if (codeExecutionDescriptor && (!("value" in codeExecutionDescriptor) || typeof codeExecutionDescriptor.value !== "boolean")) {
+    throw new TypeError("brain provider code execution support is invalid");
+  }
+  if (codeReadingDescriptor && (!("value" in codeReadingDescriptor) || typeof codeReadingDescriptor.value !== "boolean")) {
+    throw new TypeError("brain provider code reading support is invalid");
+  }
+  if (nativeReviewSkillsDescriptor && (!("value" in nativeReviewSkillsDescriptor) || typeof nativeReviewSkillsDescriptor.value !== "boolean")) {
+    throw new TypeError("brain provider native review skill support is invalid");
+  }
   const availability = provider.checkAvailability;
+  const admission=provider.withAdmission;
+  const quiescence=provider.withEntityQuiescence;
+  if(quiescence!==undefined && typeof quiescence!=='function')throw new TypeError('brain provider quiescence is invalid');
+  if(admission!==undefined && typeof admission!=='function')throw new TypeError('brain provider admission is invalid');
   if (
     attemptDescriptor &&
     (!("value" in attemptDescriptor) ||
@@ -336,14 +358,29 @@ function providerWithBoundary(provider, remote, lifecycle) {
   ) {
     throw new TypeError("brain provider entity session support is invalid");
   }
+  if (
+    reviewReadingDescriptor &&
+    (!("value" in reviewReadingDescriptor) ||
+      typeof reviewReadingDescriptor.value !== "boolean")
+  ) {
+    throw new TypeError("brain provider review reading support is invalid");
+  }
   const boundary = Object.freeze({
     id: provider.id,
     remote: provider.remote || remote,
     ...(attemptDescriptor?.value === true ? { singleAttempt: true } : {}),
     ...(sessionDescriptor?.value === true
-      ? { supportsEntitySessions: true }
+      ? { supportsEntitySessions: true, sessionIsolationKey }
       : {}),
+    ...(reviewReadingDescriptor?.value === true
+      ? { supportsReviewReading: true }
+      : {}),
+    ...(nativeReviewSkillsDescriptor?.value === true ? { supportsNativeReviewSkills: true } : {}),
+    ...(codeReadingDescriptor?.value === true ? { supportsCodeReading: true } : {}),
+    ...(codeExecutionDescriptor?.value === true ? { supportsCodeExecution: true } : {}),
     generate: provider.generate.bind(provider),
+    ...(admission ? {withAdmission:admission.bind(provider)} : {}),
+    ...(quiescence ? {withEntityQuiescence:quiescence.bind(provider)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(provider) }
       : {}),
@@ -362,6 +399,7 @@ function providerOptions(
 ) {
   const name = `brainProviders.${id}`;
   const config = exactConfig(value, PROVIDER_KEYS, name);
+  if(config.maxConcurrentTurns!==undefined && (config.kind!=='codex-cli' || config.credentialMode!=='codex-native-login'))throw new TypeError(`${name}.maxConcurrentTurns requires native Codex login`);
   const remote = declaredRemote(config, name);
   const common = {
     ...selectOptions(config, PROVIDER_LIMIT_KEYS),
@@ -403,10 +441,11 @@ function providerOptions(
       supervisedCliProviderFactory({
         ...common,
         cliKind: config.kind,
-        ...selectOptions(config, ["credentialMode"]),
+        ...selectOptions(config, ["credentialMode","maxConcurrentTurns"]),
       }, cliRuntimeFacts(dependencies)),
       remote,
       lifecycle,
+      `${config.kind}:${config.credentialMode ?? "api-key"}`,
     );
   }
   throw new TypeError(
@@ -470,6 +509,8 @@ function configuredBrainRouter(
     return Object.freeze({
       generate: router.generate.bind(router),
       checkAvailability: router.checkAvailability.bind(router),
+      withAdmission:router.withAdmission.bind(router),
+      withEntityQuiescence:router.withEntityQuiescence.bind(router),
       describe: router.describe.bind(router),
       close: lifecycle.close,
     });
@@ -534,12 +575,14 @@ function configuredWorkforce({
   roles = {},
   store,
   onRun = async () => {},
+  waitForModelCapacity = false,
   clock,
   actionAdmissionGate,
   dependencies = {},
   constructionCleanupOwner: rawConstructionCleanupOwner,
 } = {}, brainRouterFactory) {
   if (typeof onRun !== "function") throw new TypeError("onRun is invalid");
+  if (typeof waitForModelCapacity !== "boolean") throw new TypeError("waitForModelCapacity is invalid");
   const constructionCleanupOwner = configuredConstructionCleanupOwner(
     rawConstructionCleanupOwner,
   );
@@ -557,6 +600,7 @@ function configuredWorkforce({
     for (const [id, rawConfig] of dataEntries(roles, "employees.roles")) {
       const config = roleOptions(id, rawConfig);
       const employee = new ConfiguredRoleEmployee({
+        waitForModelCapacity,
         definition: {
           id,
           name: config.name,

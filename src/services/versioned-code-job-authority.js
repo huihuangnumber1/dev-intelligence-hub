@@ -1,14 +1,16 @@
 import {
   CODE_JOB_LEGACY_BRAIN_BINDING_SCHEMA,
   CODE_JOB_TASK_BRAIN_BINDING_SCHEMA,
+  CODE_JOB_ACTIONS_BY_OPERATION,
 } from "../domain/code-job-contract.js";
 import {
   normalizeConfigurationDocument,
 } from "../domain/configuration-contract.js";
-import { codeExecutionSourceWritablePaths } from "../domain/code-execution-source.js";
+import { codeExecutionSourceWritablePaths, isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { CodeExecutionPolicy } from "../domain/code-execution-policy.js";
 import { workProposalError } from "../domain/work-proposal-contract.js";
 import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import { createConfiguredCodeJobBrainDirectory } from "./code-job-brain-directory.js";
 import {
   createConfiguredConstructionCleanupOwner,
@@ -16,8 +18,8 @@ import {
 } from "./configured-workforce.js";
 import {
   codeJobBrainDigest,
+  codeJobBrainBindingDigests,
   CodeJobGrantFactory,
-  legacyCodeJobBrainDigest,
   prepareCodeJobGrantVerification,
 } from "./code-job-grant-factory.js";
 
@@ -168,6 +170,18 @@ function globalExecutorAuthority(configuration) {
 
 function conflictPreparationAuthority(configuration, executionSource) {
   if (executionSource === null) return null;
+  if (isHeadRepairExecutionSource(executionSource)) {
+    const headRepository = executionSource.inputBinding.gitTarget.headRepository.toLowerCase();
+    const headMirror = Object.entries(configuration.codeExecutor.conflictPreparation?.headMirrorsByRepository ?? {})
+      .find(([repository]) => repository.toLowerCase() === headRepository)?.[1] ?? null;
+    return {
+      kind: executionSource.kind,
+      enabled: configuration.githubActions?.automaticOwnPrRepair === true,
+      gitCommand: configuration.codeExecutor.gitCommand ?? null,
+      headRepository,
+      headMirror,
+    };
+  }
   const conflict = configuration.codeExecutor.conflictPreparation;
   const gitTarget = executionSource.preparationBinding.gitTarget;
   const mirrorFor = (mirrors, repository) => {
@@ -251,13 +265,16 @@ function grantAuthorityDigest(authority, scope, brainBindingSchema) {
 
 export function codeJobAuthorityScopeCacheIdentity(scope) {
   const executionSource = scope.executionSource;
-  const gitTarget = executionSource?.preparationBinding?.gitTarget;
+  const gitTarget = isHeadRepairExecutionSource(executionSource)
+    ? executionSource.inputBinding.gitTarget
+    : executionSource?.preparationBinding?.gitTarget;
   return {
     ...scope,
     executionSource:
       executionSource === null || executionSource === undefined
         ? null
         : {
+            ...(isHeadRepairExecutionSource(executionSource) ? { kind: executionSource.kind } : {}),
             baseRepository: gitTarget.baseRepository.toLowerCase(),
             headRepository: gitTarget.headRepository.toLowerCase(),
           },
@@ -331,6 +348,7 @@ class AuthorityHistory {
   #scopeTimelines;
   #roleTimelines;
   #legacyStates;
+  #inspectPlans = new Map();
 
   constructor(versions, executorAuthority) {
     this.#versions = versions;
@@ -342,6 +360,67 @@ class AuthorityHistory {
 
   versionAt(index) {
     return this.#versions[index];
+  }
+
+  inspectExtensionPlan(grant, currentIndex, projectAuthority) {
+    if (grant.schemaVersion !== 2 || grant.operation !== "inspect" ||
+        grantBrainBindingSchema(grant) !== CODE_JOB_TASK_BRAIN_BINDING_SCHEMA ||
+        grant.writablePaths.length !== 0 || typeof projectAuthority !== "function" ||
+        canonicalJsonDigest(grant.allowedActions) !== canonicalJsonDigest(CODE_JOB_ACTIONS_BY_OPERATION.inspect)) return null;
+    const planKey = canonicalJsonDigest({ workspaceAuthorityDigest: grant.workspaceAuthorityDigest,
+      repository: grant.repository, workspaceId: grant.workspaceId, roleId: grant.requestedBy.roleId,
+      policyVersion: grant.policyVersion, brainDigest: grant.brainDigest, requiredProfiles: grant.requiredProfiles });
+    if (this.#inspectPlans.has(planKey)) return this.#inspectPlans.get(planKey);
+    const workspaceAt = configuration => configuration.codeExecutor.workspaces.find(x => x.id === grant.workspaceId);
+    const currentConfiguration = this.#versions[currentIndex].configuration;
+    const currentWorkspace = workspaceAt(currentConfiguration);
+    const gitSettings = configuration => canonicalJsonDigest({
+      command: configuration.codeExecutor.gitCommand ?? null,
+      timeoutMs: configuration.codeExecutor.gitTimeoutMs ?? null,
+    });
+    let projection = null;
+    let projectionPaths = null;
+    let plan = null;
+    for (let candidate = currentIndex - 1; currentWorkspace && candidate >= 0; candidate--) {
+      const originalConfiguration = this.#versions[candidate].configuration;
+      const nextConfiguration = this.#versions[candidate + 1].configuration;
+      const original = workspaceAt(originalConfiguration);
+      const next = workspaceAt(nextConfiguration);
+      if (!original || !next || original.writablePaths.some(entry => !next.writablePaths.includes(entry)) ||
+          gitSettings(originalConfiguration) !== gitSettings(nextConfiguration) ||
+          roleTaskBrainDigest(originalConfiguration, grant.requestedBy.roleId) !==
+            roleTaskBrainDigest(nextConfiguration, grant.requestedBy.roleId)) break;
+      if (original.writablePaths.length >= currentWorkspace.writablePaths.length) continue;
+      // Rebuild only the historical write list against the current runtime's
+      // exact Git, source, exclusion and profile boundaries. Never accept a
+      // caller-supplied digest or change the persisted grant.
+      const pathsKey = canonicalJsonDigest(original.writablePaths);
+      if (projectionPaths !== pathsKey) {
+        const executorAuthority = projectAuthority({ workspaceId: grant.workspaceId,
+          writablePaths: original.writablePaths });
+        const versions = this.#versions.map((version, index) => {
+          if (index <= candidate) return version;
+          const configuration = structuredClone(version.configuration);
+          workspaceAt(configuration).writablePaths = [...original.writablePaths];
+          return { ...version, configuration, digest: canonicalJsonDigest(configuration) };
+        });
+        const history = new AuthorityHistory(versions, executorAuthority);
+        projection = { executorAuthority, history, active: versions[currentIndex],
+          timeline: history.verificationTimeline(grant).scopedDigests };
+        projectionPaths = pathsKey;
+      }
+      const { executorAuthority, timeline } = projection;
+      // Keeping all prior epochs prevents revocation followed by restoration
+      // from resurrecting a checkpoint, including changes unrelated to writes.
+      if (timeline[candidate] !== grant.workspaceAuthorityDigest ||
+          timeline[currentIndex] !== grant.workspaceAuthorityDigest ||
+          !configurationAdmitsGrant(currentConfiguration, grant, executorAuthority)) continue;
+      plan = projection;
+      break;
+    }
+    this.#inspectPlans.set(planKey, plan);
+    if (this.#inspectPlans.size > 32) this.#inspectPlans.delete(this.#inspectPlans.keys().next().value);
+    return plan;
   }
 
   verificationTimeline(grant) {
@@ -506,27 +585,31 @@ function requireTrackedRepository(configuration, repository) {
 
 function decisionAuthorization(value) {
   const keys = value && typeof value === "object" ? Reflect.ownKeys(value) : [];
+  const hasSignal = keys.includes("signal");
   if (
     !value ||
     Object.getPrototypeOf(value) !== Object.prototype ||
-    keys.length !== 2 ||
+    keys.length !== (hasSignal ? 3 : 2) ||
     !keys.includes("beforeGenerate") ||
     !keys.includes("brainDigest")
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   const brainDigest = Object.getOwnPropertyDescriptor(value, "brainDigest");
+  const signal = hasSignal ? Object.getOwnPropertyDescriptor(value, "signal") : null;
   if (
     !brainDigest?.enumerable ||
     !("value" in brainDigest) ||
     typeof brainDigest.value !== "string" ||
-    !/^[a-f0-9]{64}$/.test(brainDigest.value)
+    !/^[a-f0-9]{64}$/.test(brainDigest.value) ||
+    (hasSignal && (!signal?.enumerable || !("value" in signal)))
   ) {
     throw new TypeError("code brain authorization is invalid");
   }
   return {
     beforeGenerate: method(value, "beforeGenerate", "code brain authorization"),
     brainDigest: brainDigest.value,
+    ...(hasSignal ? { signal: normalizeAbortSignal(signal.value) } : {}),
   };
 }
 
@@ -561,21 +644,10 @@ function roleTaskBrainDigest(configuration, roleId) {
   });
 }
 
-function legacyRoleBrainDigest(configuration, roleId) {
-  const role = configuration.employees.roles[roleId];
-  if (!role) return null;
-  return legacyCodeJobBrainDigest({
-    roleId,
-    brain: role.brain,
-    brainProviders: configuration.brainProviders,
-  });
-}
-
-function grantRoleBrainDigest(configuration, grant) {
-  return grantBrainBindingSchema(grant) ===
-      CODE_JOB_TASK_BRAIN_BINDING_SCHEMA
-    ? roleTaskBrainDigest(configuration, grant.requestedBy.roleId)
-    : legacyRoleBrainDigest(configuration, grant.requestedBy.roleId);
+function roleBrainDigestMatches(configuration, roleId, brainDigest, brainBindingSchema = CODE_JOB_TASK_BRAIN_BINDING_SCHEMA) {
+  const brain = roleBrainForBinding(configuration.employees.roles[roleId], brainBindingSchema);
+  return brain !== null && codeJobBrainBindingDigests({ roleId, brain,
+    brainProviders: configuration.brainProviders, brainBindingSchema }).includes(brainDigest);
 }
 
 function executableConfiguration(configuration) {
@@ -609,7 +681,7 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
     !policy.codeOperationsByRole[roleId]?.includes(grant.operation) ||
     !configuration.trackedRepositories.includes(grant.repository) ||
     !workspace ||
-    grantRoleBrainDigest(configuration, grant) !== grant.brainDigest
+    !roleBrainDigestMatches(configuration, roleId, grant.brainDigest, grantBrainBindingSchema(grant))
   ) {
     return false;
   }
@@ -621,7 +693,11 @@ function configurationAdmitsGrant(configuration, grant, executorAuthority) {
   if (grant.schemaVersion === 3) {
     if (
       grant.operation !== "modify" ||
-      !workspace.capabilities?.includes("conflict_preparation_snapshot")
+      !workspace.capabilities?.includes(isHeadRepairExecutionSource(grant.executionSource)
+        ? "git_head_snapshot" : "conflict_preparation_snapshot") ||
+      (isHeadRepairExecutionSource(grant.executionSource) &&
+        (configuration.githubActions?.automaticOwnPrRepair !== true ||
+          canonicalJsonDigest(expectedWritablePaths) !== canonicalJsonDigest([...workspace.writablePaths].sort((left, right) => left.localeCompare(right, "en")))))
     ) {
       return false;
     }
@@ -678,6 +754,7 @@ export class VersionedCodeJobAuthority {
   #readActive;
   #readSnapshot;
   #executorAuthority;
+  #inspectAuthorityForWritablePaths;
   #startupCodeExecutorDigest;
   #brainDependencies;
   #grantFactoryFactory;
@@ -695,6 +772,7 @@ export class VersionedCodeJobAuthority {
   constructor({
     configurationReader,
     executorAuthority,
+    inspectAuthorityForWritablePaths = null,
     startupConfiguration,
     brainDependencies = {},
     actionAdmissionGate,
@@ -756,6 +834,10 @@ export class VersionedCodeJobAuthority {
     }
     const startup = normalizeConfigurationDocument(startupConfiguration);
     this.#executorAuthority = executorAuthority;
+    if (inspectAuthorityForWritablePaths !== null && typeof inspectAuthorityForWritablePaths !== "function") {
+      throw new TypeError("inspectAuthorityForWritablePaths must be a function");
+    }
+    this.#inspectAuthorityForWritablePaths = inspectAuthorityForWritablePaths;
     this.#startupCodeExecutorDigest = canonicalJsonDigest(startup.codeExecutor);
     this.#brainDependencies = brainDependencies;
     this.#grantFactoryFactory = grantFactoryFactory;
@@ -843,6 +925,15 @@ export class VersionedCodeJobAuthority {
         }
       }
     }
+    const inspectPlan = current.history.inspectExtensionPlan(grant, currentIndex,
+      this.#inspectAuthorityForWritablePaths);
+    if (inspectPlan) {
+      const context = this.#context(inspectPlan.active, inspectPlan.history, currentIndex, {
+        executorAuthority: inspectPlan.executorAuthority,
+        cacheKey: `inspect:${grant.workspaceAuthorityDigest}`,
+      });
+      return this.#verifyWithContext(grant, context, context);
+    }
     throw currentError;
   }
 
@@ -863,12 +954,14 @@ export class VersionedCodeJobAuthority {
   }
 
   #brainCandidateContext(current, roleId, brainDigest) {
+    if (configurationAdmitsRole(current.configuration, roleId) &&
+        roleBrainDigestMatches(current.configuration, roleId, brainDigest)) return current;
     for (let index = current.historyIndex - 1; index >= 0; index -= 1) {
       const version = current.history.versionAt(index);
       try {
         if (
           configurationAdmitsRole(version.configuration, roleId) &&
-          roleTaskBrainDigest(version.configuration, roleId) === brainDigest
+          roleBrainDigestMatches(version.configuration, roleId, brainDigest)
         ) {
           return this.#context(version, current.history, index);
         }
@@ -879,9 +972,50 @@ export class VersionedCodeJobAuthority {
     return null;
   }
 
+  async describe(roleId, brainDigest) {
+    this.#assertOpen();
+    decisionRoleId({ roleId });
+    if (brainDigest !== undefined &&
+        (typeof brainDigest !== "string" || !/^[a-f0-9]{64}$/.test(brainDigest))) {
+      throw new TypeError("code brain digest is invalid");
+    }
+    const current = await this.#current();
+    const context = brainDigest === undefined || current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context || current.roleAuthorityDigest(roleId) === undefined ||
+        current.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑封印已不受当前活动配置授权");
+    }
+    const describe = optionalMethod(this.#directory(context), "describe");
+    const result = describe ? await describe(roleId) : { supportsCodeReading: false };
+    this.#assertOpen();
+    const latest = await this.#current();
+    if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) {
+      throw invalid("岗位大脑配置在能力读取时已变化");
+    }
+    return result;
+  }
+
+  async withEntityQuiescence({ roleId, brainDigest, entityKey, signal = null }, operation) {
+    this.#assertOpen();
+    await this.describe(roleId, brainDigest);
+    const current = await this.#current();
+    const context = current.brainDigests.get(roleId) === brainDigest
+      ? current : this.#brainCandidateContext(current, roleId, brainDigest);
+    if (!context) return { executed: false };
+    const directory = this.#directory(context);
+    const quiescence = optionalMethod(directory, 'withEntityQuiescence');
+    return quiescence ? quiescence({ roleId, entityKey, signal }, async () => {
+      this.#assertOpen();
+      const latest = await this.#current();
+      if (latest.roleAuthorityDigest(roleId) !== context.roleAuthorityDigest(roleId)) return null;
+      return operation();
+    }) : { executed: false };
+  }
+
   async decide(value, authorization) {
     this.#assertOpen();
-    const { beforeGenerate, brainDigest } = decisionAuthorization(authorization);
+    const { beforeGenerate, brainDigest, signal } = decisionAuthorization(authorization);
     const roleId = decisionRoleId(value);
     const current = await this.#current();
     let context = current.brainDigests.get(roleId) === brainDigest
@@ -908,6 +1042,7 @@ export class VersionedCodeJobAuthority {
       },
       brainDigest,
       admitGenerate: this.#actionAdmission,
+      ...(signal === undefined ? {} : { signal }),
     });
     this.#assertOpen();
     return result;
@@ -937,10 +1072,10 @@ export class VersionedCodeJobAuthority {
     active,
     history,
     historyIndex,
-    { requireStartupBoundary = false } = {},
+    { requireStartupBoundary = false, executorAuthority = this.#executorAuthority, cacheKey = null } = {},
   ) {
     this.#assertOpen();
-    const contextKey = `${active.version}:${active.digest}`;
+    const contextKey = cacheKey ?? `${active.version}:${active.digest}`;
     const cached = this.#contexts.get(contextKey);
     if (cached) return cached;
     const configuration = active.configuration;
@@ -965,7 +1100,7 @@ export class VersionedCodeJobAuthority {
         );
         if (
           !conflict.enabled ||
-          conflict.baseMirror === null ||
+          (!isHeadRepairExecutionSource(scope.executionSource) && conflict.baseMirror === null) ||
           conflict.headMirror === null
         ) {
           throw invalid("Conflict preparation 的仓库镜像授权未配置");
@@ -978,7 +1113,7 @@ export class VersionedCodeJobAuthority {
       );
     };
     const grants = this.#grantFactoryFactory({
-      executorAuthority: this.#executorAuthority,
+      executorAuthority,
       policyVersion: policy.version,
       workspaceByRepository: policy.workspaceByRepository,
       codeActionRoles: roleIds,
@@ -1014,7 +1149,7 @@ export class VersionedCodeJobAuthority {
           historyIndex,
           {
             executorAuthorityDigest: executorWorkspaceAuthorityDigest(
-              this.#executorAuthority,
+              executorAuthority,
               grant.workspaceId,
             ),
             repository: grant.repository,

@@ -99,6 +99,8 @@ function normalizeWorker(worker) {
     throw directoryError("worker is invalid");
   }
   const availability = worker.checkAvailability;
+  const admission=worker.withDecisionAdmission;
+  if(admission!==undefined && typeof admission!=='function')throw directoryError('worker admission is invalid');
   if (availability !== undefined && typeof availability !== "function") {
     throw directoryError("worker is invalid");
   }
@@ -107,6 +109,7 @@ function normalizeWorker(worker) {
     workerId,
     view: worker.view.bind(worker),
     decide: worker.decide.bind(worker),
+    ...(admission ? {withDecisionAdmission:admission.bind(worker)} : {}),
     ...(availability
       ? { checkAvailability: availability.bind(worker) }
       : {}),
@@ -187,6 +190,7 @@ export class RoleWorkerDirectory {
         enabled: state.enabled,
         paused: state.paused,
         decide: worker.decide,
+        ...(worker.withDecisionAdmission ? {withDecisionAdmission:worker.withDecisionAdmission} : {}),
         ...(worker.checkAvailability
           ? { checkAvailability: worker.checkAvailability }
           : {}),

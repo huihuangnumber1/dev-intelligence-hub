@@ -1145,14 +1145,16 @@ async function validateExternalReviewConfirmation() {
   const deferredRestoreVisible = await deferredRestore.isVisible();
   await deferredRestore.click();
   await page.locator("#confirmation-dialog[open]").waitFor();
+  assert.equal(await page.locator("[data-review-handoff]").inputValue(), "pull_request");
   await page
-    .getByRole("button", { name: "确认并发布到 GitHub", exact: true })
+    .getByRole("button", { name: "确认发布并分配下一步", exact: true })
     .click();
   await page.locator("#confirmation-dialog").waitFor({ state: "hidden" });
   await page.locator('[data-view="employees"]').click();
-  const publishedVisible = await page
-    .getByText("已发布", { exact: true })
-    .isVisible();
+  await page.locator(".employee-job-history > summary").click();
+  const publishedBadge = page.getByText("已发布", { exact: true });
+  await publishedBadge.waitFor();
+  const publishedVisible = await publishedBadge.isVisible();
   await page.locator('[data-view="memory"]').click();
   await page.getByText(reviewJob.title, { exact: true }).waitFor();
   const diagnostics = await pageDiagnostics(observation);
@@ -1423,11 +1425,16 @@ assert.deepEqual(Object.keys(reviewResult.request.body).sort(), [
   "expectedItemRevision",
   "expectedQueueRevision",
   "requestId",
+  "reviewHandoff",
 ]);
 assert.equal(reviewResult.request.body.expectedQueueRevision, 8);
 assert.equal(reviewResult.request.body.expectedItemRevision, 2);
 assert.equal(reviewResult.request.body.displayedPayloadDigest, "a".repeat(64));
 assert.equal(reviewResult.request.body.approvalBindingDigest, "b".repeat(64));
+assert.deepEqual(reviewResult.request.body.reviewHandoff, {
+  workType: "pull_request",
+  responsiblePerson: null,
+});
 
 const initialSystemFailure = results.find(
   (entry) => entry.name === "system-status-initial-error",

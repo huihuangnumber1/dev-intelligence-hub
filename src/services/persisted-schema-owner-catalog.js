@@ -44,6 +44,10 @@ import {
   CONTROLLED_CODE_EXECUTOR_STATE_KEY,
   normalizeControlledCodeExecutorState,
 } from "./controlled-code-executor.js";
+import { TASK_RUN_RECEIPT_STATE_KEY, normalizeTaskRunExecutionReceiptPersistedState } from "./task-run-execution-receipts.js";
+import { AUTOMATIC_OWN_PR_REPAIR_STATE_KEY, normalizeAutomaticOwnPrRepairState } from "./automatic-own-pr-repair.js";
+import { WORK_CONTINUATION_STATE_KEY, normalizeWorkContinuationState, migrateWorkContinuationState } from "./work-continuation-state.js";
+import { ORIGINAL_REPAIR_FEEDBACK_ARCHIVE_PREFIX, normalizeOriginalRepairFeedbackArchiveRecord } from "../domain/original-repair-feedback.js";
 import {
   planLegacyAuthorityProjectionAdoption,
 } from "./legacy-authority-projection-adapter.js";
@@ -111,8 +115,8 @@ const OWNER_BASELINES = Object.freeze([
     ownerId: "work-ledger-state",
     key: "work-ledger-state",
     mode: "migrate-replace",
-    currentVersion: 11,
-    supportedVersions: frozenVersions(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11),
+    currentVersion: 13,
+    supportedVersions: frozenVersions(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13),
     optional: true,
   }),
   Object.freeze({
@@ -132,8 +136,8 @@ const OWNER_BASELINES = Object.freeze([
       discovery: "strict-scan",
     }),
     mode: "immutable-validate",
-    currentVersion: 2,
-    supportedVersions: frozenVersions(1, 2),
+    currentVersion: 3,
+    supportedVersions: frozenVersions(1, 2, 3),
     optional: true,
   }),
   Object.freeze({
@@ -153,14 +157,47 @@ const OWNER_BASELINES = Object.freeze([
     ownerId: "code-executor-state",
     key: "code-executor-state",
     mode: "migrate-replace",
-    currentVersion: 2,
-    supportedVersions: frozenVersions(1, 2),
+    currentVersion: 3,
+    supportedVersions: frozenVersions(1, 2, 3),
     optional: true,
   }),
   Object.freeze({
     ownerId: "confirmation-queue",
     key: "confirmation-queue",
     mode: "validate",
+    currentVersion: 1,
+    supportedVersions: frozenVersions(1),
+    optional: true,
+  }),
+  Object.freeze({
+    ownerId: "task-run-execution-receipts",
+    key: "task-run-execution-receipts",
+    mode: "validate",
+    currentVersion: 1,
+    supportedVersions: frozenVersions(1),
+    optional: true,
+  }),
+  Object.freeze({
+    ownerId: "automatic-own-pr-repair-state",
+    key: "automatic-own-pr-repair-state",
+    mode: "validate",
+    currentVersion: 2,
+    supportedVersions: frozenVersions(1, 2),
+    optional: true,
+  }),
+  Object.freeze({
+    ownerId: "work-continuations", key: WORK_CONTINUATION_STATE_KEY, mode: "migrate-replace",
+    currentVersion: 2, supportedVersions: frozenVersions(1, 2), optional: true,
+  }),
+  Object.freeze({
+    ownerId: "original-repair-feedback-archive",
+    keyFamily: frozenFamily({
+      prefix: ORIGINAL_REPAIR_FEEDBACK_ARCHIVE_PREFIX,
+      suffix: "",
+      memberPattern: "[a-f0-9]{64}",
+      discovery: "strict-scan",
+    }),
+    mode: "immutable-validate",
     currentVersion: 1,
     supportedVersions: frozenVersions(1),
     optional: true,
@@ -177,8 +214,8 @@ const OWNER_BASELINES = Object.freeze([
     ownerId: "attention-inbox",
     key: "attention-inbox",
     mode: "validate",
-    currentVersion: 1,
-    supportedVersions: frozenVersions(1),
+    currentVersion: 2,
+    supportedVersions: frozenVersions(1, 2),
     optional: true,
   }),
   Object.freeze({
@@ -534,6 +571,22 @@ const PRODUCTION_OWNER_CATALOG = Object.freeze([
     normalize: normalizeConfirmationState,
   }),
   definePersistedSchemaOwner({
+    ownerId: "task-run-execution-receipts",
+    normalize: normalizeTaskRunExecutionReceiptPersistedState,
+  }),
+  definePersistedSchemaOwner({
+    ownerId: "automatic-own-pr-repair-state",
+    normalize: normalizeAutomaticOwnPrRepairState,
+  }),
+  definePersistedSchemaOwner({
+    ownerId: "work-continuations", normalize: normalizeWorkContinuationState, migrate: migrateWorkContinuationState,
+  }),
+  definePersistedSchemaOwner({
+    ownerId: "original-repair-feedback-archive",
+    normalize: normalizeOriginalRepairFeedbackArchiveRecord,
+    verifyImmutable: normalizeOriginalRepairFeedbackArchiveRecord,
+  }),
+  definePersistedSchemaOwner({
     ownerId: "work-proposal-state",
     normalize: normalizeWorkProposalPersistedState,
   }),
@@ -594,6 +647,9 @@ const FIXED_OWNER_KEYS = Object.freeze({
   "code-job-state": CODE_JOB_STATE_KEY,
   "code-executor-state": CONTROLLED_CODE_EXECUTOR_STATE_KEY,
   "confirmation-queue": CONFIRMATION_QUEUE_STATE_KEY,
+  "task-run-execution-receipts": TASK_RUN_RECEIPT_STATE_KEY,
+  "automatic-own-pr-repair-state": AUTOMATIC_OWN_PR_REPAIR_STATE_KEY,
+  "work-continuations": WORK_CONTINUATION_STATE_KEY,
   "work-proposal-state": WORK_PROPOSAL_STATE_KEY,
   "attention-inbox": ATTENTION_INBOX_STATE_KEY,
   "owner-work-requests": OWNER_WORK_REQUEST_STATE_KEY,

@@ -1,4 +1,5 @@
 const PULL_REQUEST_EVENTS = Object.freeze([
+  "pull_request.role_handoff",
   "pull_request.observed",
   "pull_request.created",
   "pull_request.updated",
@@ -39,45 +40,6 @@ export function withPrLifecycleRoutes(definition) {
   return {
     ...definition,
     rules: [
-      {
-        id: REVIEWED_PR_APPROVED_RULE_ID,
-        source: "root",
-        enabled: true,
-        priority: 10_000,
-        fallback: false,
-        condition: {
-          op: "all",
-          conditions: [
-            {
-              op: "oneOf",
-              path: "eventType",
-              values: [...PULL_REQUEST_EVENTS],
-            },
-            {
-              op: "equals",
-              path: "payload.relation",
-              value: "review_requested",
-            },
-            {
-              op: "equals",
-              path: "payload.actionState",
-              value: "waiting_other",
-            },
-            {
-              op: "equals",
-              path: "payload.nextAction",
-              value: "wait_merge",
-            },
-            {
-              op: "equals",
-              path: "payload.myReviewState",
-              value: "APPROVED",
-            },
-          ],
-        },
-        targets: [{ type: "role", id: "tester" }],
-        onMatch: "stop",
-      },
       {
         id: AUTHORED_PR_APPROVED_RULE_ID,
         source: "root",

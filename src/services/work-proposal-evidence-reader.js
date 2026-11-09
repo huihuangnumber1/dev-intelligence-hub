@@ -1,3 +1,4 @@
+import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import {
   deliveryEvidenceKindsForProposal,
   normalizeDeliveryEvidenceTarget,
@@ -271,6 +272,37 @@ export class WorkProposalEvidenceReader {
       : cloneWorkProposalValue(result);
     checkAbort(signal);
     return projection;
+  }
+
+  // Discovery is separate from the task-scoped accepted-evidence catalog.
+  // Include all versions for this PR/account: even an old-Base pending action
+  // can still publish. Candidate eligibility checks the exact target separately.
+  listReviewPublicationSources(value) {
+    const error = evidenceQueryError();
+    const keys = ["inputBinding", "limit", ...(Object.hasOwn(value ?? {}, "signal") ? ["signal"] : [])];
+    assertWorkProposalExactKeys(value, keys, error);
+    const inputBinding = normalizePullRequestExecutionBinding(value.inputBinding);
+    if (inputBinding.schemaVersion !== 2) throw error;
+    const maximum = safeWorkProposalInteger(value.limit, "limit", { minimum: 1, maximum: MAX_EVIDENCE_CANDIDATES, error });
+    const signal = optionalAbortSignal(value.signal, error);
+    checkAbort(signal);
+    const state = this.#readState();
+    const results = new Map(state.results.map(result => [result.resultId, result]));
+    const matches = state.proposals.filter(entry => {
+      const proposal = entry.proposal;
+      if (proposal.kind !== "github_review_proposal") return false;
+      try {
+        const source = normalizePullRequestExecutionBinding(proposal.binding.inputBinding);
+        return source.repository === inputBinding.repository && source.pullRequestNumber === inputBinding.pullRequestNumber &&
+          (source.schemaVersion === 1 ||
+            source.gitTarget.sourceAccountId.toLowerCase() === inputBinding.gitTarget.sourceAccountId.toLowerCase());
+      } catch { return false; }
+    });
+    checkAbort(signal);
+    return { complete: matches.length <= maximum, items: matches.slice(-maximum).reverse().map(entry => cloneWorkProposalValue({
+      proposal: entry.proposal, result: results.get(entry.resultId) ?? null,
+      status: entry.status, downstreamRef: entry.downstreamRef,
+    })) };
   }
 
   listEvidenceCandidates(value) {

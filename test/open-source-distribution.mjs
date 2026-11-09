@@ -724,6 +724,7 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "docs/OPERATIONS.md",
     "docs/PRIVACY.md",
     "docs/PROJECT_STATUS.md",
+    "docs/USER_GUIDE.zh-CN.md",
     "npm-shrinkwrap.json",
     "package.json",
     "README.md",
@@ -733,6 +734,7 @@ test("npm distribution contains the safe bootstrap and excludes local runtime st
     "src/lib/config.js",
     "src/lib/windows-codex-credential-helper.ps1",
     "src/server.js",
+    "src/skills/quick-pr-review/SKILL.md",
   ]) {
     assert.equal(included.has(required), true, `missing ${required}`);
   }
@@ -1487,11 +1489,9 @@ test(
     await context.test(
       "the clean payload starts, reports status, and stops through its trusted manager",
       {
-        skip: process.env.MYDASHBOARD_SKIP_HOST_TESTS === "true"
-          ? "requires configured Windows workstation service lifecycle"
-          : process.platform !== "win32" && powershell === null
-            ? "requires PowerShell manager availability"
-            : false,
+        skip: process.platform !== "win32" && powershell === null
+          ? "requires PowerShell manager availability"
+          : false,
       },
       async () => {
         const port = await availablePort();
@@ -1530,18 +1530,7 @@ test(
           runManager({ ...managerOptions, action: "Stop" });
 
         managedLiveUrl = `http://127.0.0.1:${port}/api/live`;
-        let live;
-        try {
-          live = await pollJson(managedLiveUrl, 120_000);
-        } catch (error) {
-          const managedLog = await readFile(
-            path.join(runtimeInfo.runtimeDirectory, "logs", "server.log"),
-            "utf8",
-          ).catch(() => "<managed log unavailable>");
-          assert.fail(
-            `clean managed service did not become live: ${error?.message ?? "unknown error"}\n${managedLog.slice(-maximumDiagnosticCharacters)}`,
-          );
-        }
+        const live = await pollJson(managedLiveUrl);
         assert.equal(live.body.schemaVersion, 1);
         assert.equal(live.body.live, true);
         assert.equal(live.body.service, "mydashboard");
@@ -1552,7 +1541,7 @@ test(
 
         const status = await pollJson(
           `http://127.0.0.1:${port}/api/system/status`,
-          120_000,
+          45_000,
           (body) => body?.readiness?.ready === true,
           (body) => JSON.stringify({
             ready: body?.readiness?.ready,
@@ -1562,7 +1551,6 @@ test(
             probeFailures: body?.readiness?.probeFailures,
             probeSummary: body?.readiness?.probeSummary,
           }),
-          30_000,
         );
         assert.equal(status.body.liveness.live, true);
         assert.equal(status.body.readiness.schemaVersion, 1);
@@ -1571,10 +1559,12 @@ test(
 
         const brainStatus = await pollJson(
           `http://127.0.0.1:${port}/api/brain-providers/status`,
-          60_000,
+          // Allow one bounded status operation (180 s) and its cleanup (30 s).
+          // Aborting/retrying at 30 s can repeatedly cancel credential staging.
+          210_000,
           () => true,
           () => "",
-          30_000,
+          210_000,
         );
         assert.equal(brainStatus.body.schemaVersion, 1);
         assert.equal(
@@ -1587,10 +1577,6 @@ test(
 
         const dashboard = await pollJson(
           `http://127.0.0.1:${port}/api/dashboard`,
-          60_000,
-          () => true,
-          () => "",
-          30_000,
         );
         assert.deepEqual(dashboard.body.meta.errors, []);
         assert.equal(dashboard.body.meta.sources.github, 0);

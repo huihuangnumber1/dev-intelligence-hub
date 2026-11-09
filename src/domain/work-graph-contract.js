@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 const INVALID_CONTROL = /[\u0000-\u001f\u007f]/;
+const INVALID_PROSE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SAFE_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._:/#-]{0,254}[A-Za-z0-9])?$/;
 const SAFE_TOKEN = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
@@ -118,10 +119,10 @@ function denseArray(value, maximum, { minimum = 0 } = {}) {
   return result;
 }
 
-function boundedText(value, name, maximumBytes, pattern = null, { empty = false } = {}) {
+function boundedText(value, name, maximumBytes, pattern = null, { empty = false, multiline = false } = {}) {
   if (
     typeof value !== "string" ||
-    INVALID_CONTROL.test(value) ||
+    (multiline ? INVALID_PROSE_CONTROL : INVALID_CONTROL).test(value) ||
     (!empty && value.trim().length === 0) ||
     Buffer.byteLength(value, "utf8") > maximumBytes ||
     (pattern !== null && !pattern.test(value))
@@ -296,7 +297,7 @@ function normalizeDelivery(value, limits) {
     revision: safeInteger(value.revision, "delivery.revision"),
     contractRevision: safeInteger(value.contractRevision, "delivery.contractRevision"),
     status: value.status,
-    summary: boundedText(value.summary, "delivery.summary", 16 * 1_024),
+    summary: boundedText(value.summary, "delivery.summary", 16 * 1_024, null, { multiline: true }),
     evidence,
   };
 }

@@ -382,7 +382,22 @@ function orchestrationIntentVariant(value) {
         choices: normalizeChoices(entries.get("choices")),
       };
     }
-    case "pause":
+    case "pause": {
+      const hasChildWait = plainDataEntries(value, "pause intent")
+        .some(([key]) => key === "waitForChildren");
+      const entries = exactObject(
+        value,
+        hasChildWait ? [...commonKeys, "waitForChildren"] : commonKeys,
+        "pause intent",
+      );
+      if (hasChildWait && entries.get("waitForChildren") !== true) {
+        invalid("waitForChildren 必须为 true");
+      }
+      return {
+        ...commonIntent(entries, type),
+        ...(hasChildWait ? { waitForChildren: true } : {}),
+      };
+    }
     case "resume":
     case "cancel": {
       const entries = exactObject(value, commonKeys, `${type} intent`);
@@ -666,6 +681,9 @@ export const ORCHESTRATION_INTENT_JSON_SCHEMA = deepFreeze({
       },
     }),
     orchestrationSchema("pause"),
+    orchestrationSchema("pause", {
+      waitForChildren: { type: "boolean", const: true },
+    }),
     orchestrationSchema("resume"),
     orchestrationSchema("cancel"),
   ],

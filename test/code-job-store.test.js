@@ -5,9 +5,10 @@ import {
   codeJobIdForGrant,
   createCodeJobGrant,
   normalizeCodeJobGrant,
+  normalizeCodeJob,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createChangePackage } from "../src/domain/change-package-contract.js";
 import { createCodeJobChangePackageEvent } from "../src/domain/code-job-change-package-event.js";
@@ -16,6 +17,7 @@ import {
   memoryRecordForCodeJobEvent,
 } from "../src/domain/code-job-memory-event.js";
 import { normalizeMemoryRecord } from "../src/domain/memory-record.js";
+import { projectArchivedCodeJobForBrowser } from "../src/domain/code-job-browser-projection.js";
 import { OperationQueue } from "../src/lib/operation-queue.js";
 import {
   CODE_JOB_STATE_KEY,
@@ -60,6 +62,44 @@ class MemoryStore {
     if (this.writeCount === this.writeThenFailAt) {
       throw new Error("disk acknowledgement unavailable");
     }
+  }
+}
+
+class VersionedMemoryStore extends MemoryStore {
+  constructor(value = null) {
+    super(value);
+    this.contentVersions = new Map();
+    this.codeJobReadCount = 0;
+    this.versionedReadCount = 0;
+  }
+
+  async read(name, fallback) {
+    if (name === CODE_JOB_STATE_KEY) this.codeJobReadCount += 1;
+    return super.read(name, fallback);
+  }
+
+  async readVersioned(name, fallback, { ifVersion } = {}) {
+    this.versionedReadCount += 1;
+    const value = this.values.get(name);
+    const serialized = value === undefined ? null : JSON.stringify(value);
+    let current = this.contentVersions.get(name);
+    if (!current || current.serialized !== serialized) {
+      current = { serialized, version: Object.freeze({}) };
+      this.contentVersions.set(name, current);
+    }
+    return ifVersion === current.version
+      ? { changed: false, version: current.version }
+      : { changed: true, version: current.version,
+          value: structuredClone(value === undefined ? fallback : value) };
+  }
+
+  async write(name, value) {
+    const hadVersion = this.contentVersions.has(name);
+    await super.write(name, value);
+    if (!hadVersion) return undefined;
+    const version = Object.freeze({});
+    this.contentVersions.set(name, { serialized: JSON.stringify(value), version });
+    return version;
   }
 }
 
@@ -317,6 +357,275 @@ async function readyStore({
   await jobs.recover();
   return { jobs, store, time, exclusiveLease };
 }
+
+for (const escaped of [false, true]) test(`completion reports survive archive with exact binding and escaped bounds ${escaped}`, async () => {
+  const f = await readyStore();
+  const hostGrant = grant(escaped ? { evidence: Array.from({ length: 20 }, (_, i) => `${i}` + '"'.repeat(2040)) } : {});
+  const created = await f.jobs.createApprovedJob(approval({ grant: hostGrant }));
+  const starting = await f.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const active = await f.jobs.activate({ jobId: created.job.jobId, expectedRevision: starting.job.revision,
+    workspaceRevision: '4'.repeat(64) });
+  const action = { type: 'complete', actionId: 'completion-report-action', expectedWorkspaceRevision: '4'.repeat(64) };
+  const report = { actionId: action.actionId, actionDigest: digestValue(action), workspaceRevision: action.expectedWorkspaceRevision,
+    outcome: escaped ? '"'.repeat(4096) : 'Inspection findings and remaining verification.',
+    evidence: escaped ? Array.from({ length: 20 }, (_, i) => `${i}` + '"'.repeat(2040)) : ['model evidence only'] };
+  for (const [key, value] of [['actionId', 'other-action'], ['actionDigest', '0'.repeat(64)],
+    ['workspaceRevision', '0'.repeat(64)], ['outcome', ''], ['evidence', ['duplicate', 'duplicate']]]) {
+    await assert.rejects(f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision,
+      action, completionReport: { ...report, [key]: value } }), { code: 'INVALID_CODE_JOB_MUTATION' });
+  }
+  const prepared = await f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision,
+    action, completionReport: report });
+  const persisted = normalizeCodeJob(f.store.value.jobs[0]);
+  assert.deepEqual(persisted.execution.pendingAction.completionReport, report);
+  await assert.rejects(f.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: prepared.job.revision,
+    action, completionReport: { ...report, outcome: 'substituted report' } }), { code: 'CODE_JOB_TRANSITION_CONFLICT' });
+  const observed = await f.jobs.recordObservation({ jobId: active.job.jobId, expectedRevision: prepared.job.revision,
+    actionId: action.actionId, status: 'succeeded', workspaceRevision: action.expectedWorkspaceRevision,
+    detail: { result: { created: [], modified: [], deleted: [] } } });
+  assert.deepEqual(normalizeCodeJob(f.store.value.jobs[0]).execution.observations[0].completionReport, report);
+  const recovered = await readyStore({ store: f.store, time: f.time });
+  let current = await recovered.jobs.getForWorker(active.job.jobId);
+  assert.deepEqual(current.execution.observations[0].completionReport, report);
+  if (current.status === 'paused') current = (await recovered.jobs.resume({ jobId: current.jobId, expectedRevision: current.revision })).job;
+  const manifest = { created: [], modified: [], deleted: [] };
+  if (escaped) {
+    while (Buffer.byteLength(JSON.stringify({ evidence: hostGrant.evidence, manifest })) < 120 * 1024) {
+      manifest.created.push({ path: `src/${'x'.repeat(500)}${manifest.created.length}.js`, sha256: 'a'.repeat(64) });
+    }
+  }
+  const terminalDetail = { schemaVersion: 1, outcome: report.outcome, evidence: hostGrant.evidence, completionReport: report,
+      workspaceRevision: action.expectedWorkspaceRevision, completedActionId: action.actionId,
+      checks: ['node-tests'], manifest };
+  const withoutReport = { ...terminalDetail };
+  delete withoutReport.completionReport;
+  await assert.rejects(recovered.jobs.complete({ jobId: current.jobId, expectedRevision: current.revision,
+    result: withoutReport }), { code: 'INVALID_CODE_JOB' });
+  const completed = await recovered.jobs.complete({ jobId: current.jobId, expectedRevision: current.revision,
+    result: terminalDetail });
+  assert.equal((await recovered.jobs.getDetail({ jobId: current.jobId })).terminalDetail.outcome, report.outcome);
+  const batch = await recovered.jobs.readMemoryProjectionBatch({ limit: 10 });
+  for (const event of batch.items) await recovered.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  await recovered.jobs.compactTerminalPrefix(compactionRequest(f.store, { targetThroughSequence: completed.job.sequence }));
+  const archived = await recovered.jobs.getDetail({ jobId: current.jobId });
+  assert.equal(archived.archived, true);
+  assert.equal(archived.terminalDetail.outcome, report.outcome);
+  assert.deepEqual(archived.terminalDetail.completionReport.evidence, report.evidence);
+  if (!escaped) {
+    const storageKey = `code-job-tombstone-record-${current.jobId}`;
+    const original = await f.store.read(storageKey, null);
+    for (const replacement of [{ actionId: '../invalid' }, { workspaceRevision: 'not-a-sha256' },
+      { actionId: 123, workspaceRevision: 456 }]) {
+      const changed = structuredClone(original);
+      Object.assign(changed.outcome.completionReport, replacement);
+      const bad = changed.outcome.completionReport;
+      bad.actionDigest = digestValue({ type: 'complete', actionId: bad.actionId, expectedWorkspaceRevision: bad.workspaceRevision });
+      const sealed = resealArchiveFixture(changed, f.store.value.archiveIndex[0]);
+      assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, { storageKey, manifest: sealed.manifest }),
+        { code: 'CODE_JOB_ARCHIVE_CORRUPTED' });
+    }
+  }
+  const reopened = await readyStore({ store: f.store, time: f.time });
+  assert.deepEqual((await reopened.jobs.getDetail({ jobId: current.jobId })).terminalDetail, archived.terminalDetail);
+});
+
+test("unchanged versioned code jobs reuse certified state without reading and validating history again", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const certified = fixture.jobs.state;
+  const repeated = await fixture.jobs.createApprovedJob(approval());
+  assert.equal(repeated.status, "already");
+  assert.equal(store.codeJobReadCount, 0);
+  assert.equal(store.versionedReadCount, 3);
+  assert.equal(fixture.jobs.state, certified);
+  assert.ok(Object.isFrozen(certified.jobs[0].execution));
+  created.job.status = "fenced";
+  assert.notEqual(fixture.jobs.state.jobs[0].status, created.job.status);
+});
+
+test("a code job mutation preserves certified unchanged history while newly changed jobs are validated", async () => {
+  const fixture = await readyStore({ store: new VersionedMemoryStore() });
+  await fixture.jobs.createApprovedJob(approval());
+  const first = fixture.jobs.state.jobs[0];
+  const otherGrant = grant({ proposalId: "work-intent-proposal-cache-2", contentDigest: "d".repeat(64),
+    requestedBy: { roleId: "developer", workItemId: "work-cache-2" },
+    source: { assignmentId: "assignment-cache-2", eventId: "event-cache-2" } });
+  await fixture.jobs.createApprovedJob(approval({ confirmationId: "confirmation-cache-2",
+    requestId: "request-cache-2", displayedPayloadDigest: "2".repeat(64),
+    approvalBindingDigest: "3".repeat(64), grant: otherGrant }));
+  assert.equal(fixture.jobs.state.jobs[0], first);
+  assert.ok(Object.isFrozen(first.grant));
+  assert.throws(() => { first.grant.objective = "forged"; }, TypeError);
+});
+
+test("changed versioned code job bytes are fully validated before cached state can be reused", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  await fixture.jobs.createApprovedJob(approval());
+  const changed = structuredClone(store.value);
+  changed.jobs[0].grant.objective = "A forged grant has the same job and state revisions.";
+  Object.freeze(changed.jobs[0]);
+  store.value = changed;
+  await assert.rejects(fixture.jobs.createApprovedJob(approval()), { code: "CODE_JOB_STATE_CORRUPTED" });
+});
+
+test("a versioned write with a lost acknowledgement is reread before another job is admitted", async () => {
+  const store = new VersionedMemoryStore();
+  const fixture = await readyStore({ store });
+  store.writeThenFailAt = 1;
+  await assert.rejects(fixture.jobs.createApprovedJob(approval()), /disk acknowledgement unavailable/);
+  const observed = await fixture.jobs.createApprovedJob(approval());
+  assert.equal(observed.status, "already");
+  assert.equal(store.value.jobs.length, 1);
+  assert.equal(store.writeCount, 1);
+});
+
+test("another writer's changed valid version is adopted before a later mutation", async () => {
+  const store = new VersionedMemoryStore();
+  const first = await readyStore({ store });
+  const created = await first.jobs.createApprovedJob(approval());
+  const other = await readyStore({ store });
+  await other.jobs.pause({ jobId: created.job.jobId, expectedRevision: created.job.revision, reason: "Owner paused" });
+  const outcome = await first.jobs.createApprovedJob(approval());
+  assert.equal(outcome.status, "already");
+  assert.equal(first.jobs.state.jobs[0].status, "paused");
+  assert.equal(first.jobs.state.revision, store.value.revision);
+});
+
+test("changed version tokens cannot hide rollback, missing state, or a forged unchanged result", async (t) => {
+  for (const kind of ["rollback", "missing", "forged version"]) await t.test(kind, async () => {
+    const store = new VersionedMemoryStore();
+    const fixture = await readyStore({ store });
+    const created = await fixture.jobs.createApprovedJob(approval());
+    const previous = structuredClone(store.value);
+    await fixture.jobs.pause({ jobId: created.job.jobId, expectedRevision: created.job.revision, reason: "Owner paused" });
+    if (kind === "rollback") store.value = previous;
+    if (kind === "missing") store.value = null;
+    if (kind === "forged version") store.readVersioned = async () => ({ changed: false, version: Object.freeze({}) });
+    await assert.rejects(fixture.jobs.createApprovedJob(approval()), {
+      code: kind === "forged version" ? "CODE_JOB_STATE_CORRUPTED" : "CODE_JOB_STATE_ROLLBACK",
+    });
+    await assert.rejects(fixture.jobs.get(created.job.jobId), { code: "CODE_JOB_STORE_NOT_READY" });
+  });
+});
+
+test("a write without an opaque committed version forces a fresh durable read", async () => {
+  const store = new VersionedMemoryStore();
+  const write = store.write.bind(store);
+  store.write = async (...args) => { await write(...args); };
+  const fixture = await readyStore({ store });
+  await fixture.jobs.createApprovedJob(approval());
+  const written = fixture.jobs.state;
+  assert.equal((await fixture.jobs.createApprovedJob(approval())).status, "already");
+  assert.notEqual(fixture.jobs.state, written);
+});
+
+test("a valid same-revision fork and replacement of the public state reference remain fail closed", async (t) => {
+  for (const kind of ["durable fork", "public state replacement"]) await t.test(kind, async () => {
+    const store = new VersionedMemoryStore();
+    const fixture = await readyStore({ store });
+    await fixture.jobs.createApprovedJob(approval());
+    const changed = structuredClone(store.value);
+    const job = changed.jobs[0];
+    job.updatedAt = "2026-08-02T06:00:01.000Z";
+    delete job.recordDigest;
+    job.recordDigest = digestValue(job);
+    if (kind === "durable fork") store.value = changed;
+    else fixture.jobs.state = changed;
+    await assert.rejects(fixture.jobs.createApprovedJob(approval()), { code: "CODE_JOB_STATE_FORKED" });
+  });
+});
+
+async function activeTimeoutStore() {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval());
+  const starting = await fixture.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const activated = await fixture.jobs.activate({ jobId: starting.job.jobId, expectedRevision: starting.job.revision,
+    workspaceRevision: "4".repeat(64) });
+  return { ...fixture, active: activated.job };
+}
+
+function timeoutMutation(job, overrides = {}) {
+  return { jobId: job.jobId, expectedRevision: job.revision, failedRunId: "native-timeout-run-1",
+    errorCode: "STRUCTURED_PROVIDER_TIMEOUT", failedAt: job.updatedAt,
+    progressFingerprint: "6".repeat(64), baselineProgressFingerprint: "6".repeat(64), ...overrides };
+}
+
+test("timeout continuation is optional and old execution records retain their exact digest and shape", async () => {
+  const fixture = await activeTimeoutStore();
+  assert.equal(Object.hasOwn(fixture.active.execution, "timeoutContinuation"), false);
+  assert.deepEqual(normalizeCodeJob(fixture.active), fixture.active);
+  const writes = fixture.store.writeCount;
+  const recovered = await readyStore({ store: fixture.store, time: fixture.time });
+  assert.deepEqual(await recovered.jobs.getForWorker(fixture.active.jobId), fixture.active);
+  assert.equal(fixture.store.writeCount, writes);
+});
+
+test("timeout continuation CAS stores strict metadata, applies backoff and retains owner lifecycle authority", async (t) => {
+  for (const terminal of ["cancel", "fence"]) await t.test(terminal, async () => {
+    const fixture = await activeTimeoutStore();
+    let current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(fixture.active))).job;
+    const checkpoint = structuredClone(current.execution.timeoutContinuation);
+    assert.equal(checkpoint.consecutiveNoProgress, 1);
+    assert.equal((await fixture.jobs.listRunnable()).items.length, 0);
+    fixture.time.advance(60_000);
+    assert.equal((await fixture.jobs.listRunnable()).items.length, 1);
+    const again = await fixture.jobs.recordTimeoutContinuation(timeoutMutation(current));
+    assert.equal(again.status, "already");
+    current = (await fixture.jobs.pause({ jobId: current.jobId, expectedRevision: current.revision, reason: "owner hold" })).job;
+    assert.deepEqual(current.execution.timeoutContinuation, checkpoint);
+    await assert.rejects(fixture.jobs.recordTimeoutContinuation(timeoutMutation(current, { failedRunId: "wrongly-adopt-paused" })),
+      { code: "CODE_JOB_TRANSITION_CONFLICT" });
+    current = (await fixture.jobs.resume({ jobId: current.jobId, expectedRevision: current.revision })).job;
+    assert.deepEqual(current.execution.timeoutContinuation, checkpoint);
+    current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(current, { failedRunId: "native-timeout-run-2" }))).job;
+    assert.equal(current.execution.timeoutContinuation.consecutiveNoProgress, 2, "manual resume does not reset progress budget");
+    const lastCheckpoint = structuredClone(current.execution.timeoutContinuation);
+    if (terminal === "cancel") {
+      current = (await fixture.jobs.cancel({ jobId: current.jobId, expectedRevision: current.revision, reason: "owner cancelled" })).job;
+      current = (await fixture.jobs.finalizeCancellation({ jobId: current.jobId, expectedRevision: current.revision,
+        settlement: executorCancellationProof(current) })).job;
+      assert.equal(current.status, "cancelled");
+    } else {
+      current = (await fixture.jobs.fence({ jobId: current.jobId, expectedRevision: current.revision,
+        result: { code: "INVALID_CODE_JOB_AUTHORITY", message: "owner authority changed" } })).job;
+      assert.equal(current.status, "fenced");
+    }
+    assert.deepEqual(current.execution.timeoutContinuation, lastCheckpoint);
+    assert.deepEqual(normalizeCodeJob(current), current);
+    const recovered = await readyStore({ store: fixture.store, time: fixture.time });
+    assert.deepEqual(await recovered.jobs.getForWorker(current.jobId), current);
+  });
+});
+
+test("timeout continuation metadata rejects unsupported, malformed and rebound persisted records", async (t) => {
+  const fixture = await activeTimeoutStore();
+  const current = (await fixture.jobs.recordTimeoutContinuation(timeoutMutation(fixture.active))).job;
+  const badMutations = [
+    ["extra key", metadata => { metadata.unknownPolicy = true; }],
+    ["null", (_metadata, execution) => { execution.timeoutContinuation = null; }],
+    ["unsupported failure", metadata => { metadata.errorCode = "STRUCTURED_PROVIDER_CLEANUP_FAILED"; }],
+    ["negative budget", metadata => { metadata.consecutiveNoProgress = -1; }],
+    ["unbounded budget", metadata => { metadata.consecutiveNoProgress = 4; }],
+    ["fingerprint missing", metadata => { delete metadata.progressFingerprint; }],
+    ["arbitrary retry time", metadata => { metadata.retryAfter = "2099-01-01T00:00:00.000Z"; }],
+    ["failure before creation", metadata => { metadata.failedAt = "2000-01-01T00:00:00.000Z"; }],
+    ["session absent", (_metadata, execution) => { execution.sessionId = null; }],
+  ];
+  for (const [name, mutate] of badMutations) await t.test(name, () => {
+    const corrupted = structuredClone(current);
+    mutate(corrupted.execution.timeoutContinuation, corrupted.execution);
+    delete corrupted.recordDigest;
+    corrupted.recordDigest = digestValue(corrupted);
+    assert.throws(() => normalizeCodeJob(corrupted), { code: "INVALID_CODE_JOB" });
+  });
+  const writes = fixture.store.writeCount;
+  await assert.rejects(fixture.jobs.recordTimeoutContinuation(timeoutMutation(current,
+    { failedRunId: "native-timeout-unsupported", errorCode: "STRUCTURED_PROVIDER_REAP_FAILED" })),
+    { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.equal(fixture.store.writeCount, writes);
+});
 
 async function completedDeliveryFixture(options = {}) {
   const {
@@ -636,6 +945,32 @@ test("createApprovedJob persists one queued job with all four digest bindings", 
   assert.equal(durable.proposal.contentDigest, request.grant.contentDigest);
   assert.equal(durable.grant.grantDigest, request.grant.grantDigest);
   assert.match(durable.recordDigest, /^[a-f0-9]{64}$/);
+});
+
+test("durable writes preserve bounded host-composed large files through observation and restart", async () => {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval({ grant: grant({ operation: "modify",
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"] }) }));
+  const starting = await fixture.jobs.claimStarting({ jobId: created.job.jobId, expectedRevision: created.job.revision });
+  const active = await fixture.jobs.activate({ jobId: created.job.jobId, expectedRevision: starting.job.revision, workspaceRevision: "4".repeat(64) });
+  const content = "preserve this large source line\n".repeat(5_000);
+  assert.ok(content.length > 128 * 1024);
+  const action = { type: "write_text", actionId: "large-host-write", path: "src/large.cpp", content,
+    expectedSha256: "3".repeat(64), expectedWorkspaceRevision: "4".repeat(64) };
+  const prepared = await fixture.jobs.prepareAction({ jobId: active.job.jobId, expectedRevision: active.job.revision, action });
+  const reopened = await readyStore({ store: fixture.store, time: fixture.time });
+  const persisted = await reopened.jobs.getForWorker(active.job.jobId);
+  assert.equal(persisted.execution.pendingAction.action.content, content);
+  const observed = await reopened.jobs.recordObservation({ jobId: persisted.jobId, expectedRevision: persisted.revision,
+    actionId: action.actionId, status: "succeeded", workspaceRevision: "5".repeat(64), detail: { result: { bytes: content.length } } });
+  assert.equal(observed.job.execution.observations[0].action.content, content);
+  assert.deepEqual(normalizeCodeJob(observed.job), observed.job);
+  const writes = fixture.store.writeCount;
+  await assert.rejects(reopened.jobs.prepareAction({ jobId: observed.job.jobId, expectedRevision: observed.job.revision,
+    action: { ...action, actionId: "too-large-host-write", expectedWorkspaceRevision: "5".repeat(64), content: "x".repeat(1024 * 1024 + 1) } }),
+  { code: "CODE_JOB_ACTION_TOO_LARGE" });
+  assert.equal(fixture.store.writeCount, writes);
+  assert.ok(prepared.job.execution.pendingAction);
 });
 
 test("live job detail paginates revision-bound sanitized observations", async () => {
@@ -962,6 +1297,13 @@ test("worker candidate cursors rotate bounded runnable work without starvation",
     () => jobs.listRunnable({ afterSequence: -1 }),
     (error) => error.code === "INVALID_CODE_JOB_QUERY",
   );
+  for (const job of created) await jobs.pause({ jobId: job.jobId, expectedRevision: job.revision, reason: 'owner pause' });
+  const paused = await jobs.listPaused({ limit: 2, afterSequence: created[2].sequence });
+  assert.deepEqual(paused.items.map(job => job.sequence), [created[0].sequence, created[1].sequence]);
+  assert.ok(paused.items.every(job => job.status === 'paused'));
+  paused.items[0].grant.objective = 'mutated projection';
+  assert.notEqual((await jobs.getForWorker(created[0].jobId)).grant.objective, 'mutated projection');
+  assert.equal((await jobs.listPaused({ roleId: 'tester' })).items.length, 0);
 });
 
 test("durable state recovers and rejects tampering before serving queries", async () => {
@@ -2752,6 +3094,50 @@ test("schema v3 conflict package delivery is self-contained, recoverable, and id
   );
 });
 
+test("an unchanged head repair records package-only delivery without a commit and survives restart", async () => {
+  const { inputBinding, subject } = conflictGrant();
+  const repair = grant({ schemaVersion: 3, inputBinding, subject, operation: "modify",
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] }),
+    allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"] });
+  let manifest;
+  const fixture = await completedDeliveryFixture({ jobApproval: approval({ grant: repair }),
+    changePackageReader: { async get() { return structuredClone(manifest); } } });
+  const [event] = (await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })).items;
+  const revision = event.exportRequest.expectedWorkspaceRevision;
+  manifest = changePackageForEvent(event, { workspace: { id: "widgets-local", sourceRevision: revision, workspaceRevision: revision } });
+  const request = changePackageAcknowledgement(event, manifest, { noChanges: true });
+  assert.throws(() => fixture.jobs.acknowledgeChangePackageDelivery({ ...request, noChanges: false }), { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.throws(() => fixture.jobs.acknowledgeChangePackageDelivery({ ...request, controlledCommit: {} }), { code: "INVALID_CODE_JOB_MUTATION" });
+  assert.equal((await fixture.jobs.acknowledgeChangePackageDelivery(request)).status, "applied");
+  const detail = await fixture.jobs.getDetail({ jobId: fixture.completed.job.jobId });
+  assert.equal(detail.changePackage.receipt.noChanges, true);
+  assert.equal(detail.changePackage.receipt.controlledCommit, undefined);
+  const recovered = await readyStore({ store: fixture.store,
+    changePackageReader: { async get() { return structuredClone(manifest); } } });
+  assert.equal((await recovered.jobs.acknowledgeChangePackageDelivery(request)).status, "already");
+});
+
+for (const variation of ["changed", "revision", "conflict"]) {
+  test(`package-only delivery cannot waive commit proof for ${variation}`, async () => {
+    const conflict = conflictGrant();
+    const repair = variation === "conflict" ? conflict : grant({ schemaVersion: 3, inputBinding: conflict.inputBinding,
+      subject: conflict.subject, operation: "modify", allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION.modify], writablePaths: ["src"],
+      executionSource: createReviewRepairCodeExecutionSource({ inputBinding: conflict.inputBinding, writablePaths: ["src"] }) });
+    let manifest;
+    const fixture = await completedDeliveryFixture({ jobApproval: approval({ grant: repair }),
+      changePackageReader: { async get() { return structuredClone(manifest); } } });
+    const [event] = (await fixture.jobs.readChangePackageDeliveryBatch({ limit: 1 })).items;
+    const revision = event.exportRequest.expectedWorkspaceRevision;
+    manifest = changePackageForEvent(event, {
+      workspace: { id: "widgets-local", sourceRevision: variation === "revision" ? "3".repeat(64) : revision, workspaceRevision: revision },
+      ...(variation === "changed" ? { created: [{ path: "src/new.js", content: Buffer.from("changed\n") }] } : {}),
+    });
+    await assert.rejects(fixture.jobs.acknowledgeChangePackageDelivery(changePackageAcknowledgement(event, manifest, { noChanges: true })),
+      { code: "CODE_JOB_CHANGE_PACKAGE_BINDING_CONFLICT" });
+    assert.equal((await fixture.jobs.readChangePackageDeliveryBatch()).cursor, 0);
+  });
+}
+
 test("schema v3 delivery requires and retains exact controlled commit evidence", async () => {
   let manifest;
   const fixture = await completedDeliveryFixture({
@@ -3689,6 +4075,66 @@ test("action admission reserves enough durable space for its later observation e
   );
 });
 
+async function pinnedHistoryFixture({ projected = true } = {}) {
+  const f = await readyStore();
+  const first = (await f.jobs.createApprovedJob(approval())).job;
+  const paused = (await f.jobs.pause({ jobId: first.jobId, expectedRevision: first.revision, reason: 'owner hold' })).job;
+  const create = index => f.jobs.createApprovedJob(approval({ confirmationId: `confirmation-history-${index}`,
+    displayedPayloadDigest: String(index).repeat(64), approvalBindingDigest: String(index + 3).repeat(64),
+    requestId: `request-history-${index}`, grant: grant({ proposalId: `proposal-history-${index}`,
+      contentDigest: String(index).repeat(64), requestedBy: { roleId: 'developer', workItemId: `work-history-${index}` },
+      source: { assignmentId: `assignment-history-${index}`, eventId: `event-history-${index}` } }) }));
+  const history = (await create(2)).job;
+  await f.jobs.fail({ jobId: history.jobId, expectedRevision: history.revision,
+    result: { code: 'HISTORICAL_FAILURE', detail: 'x'.repeat(96 * 1024) } });
+  if (projected) for (const event of (await f.jobs.readMemoryProjectionBatch({ limit: 100 })).items) {
+    await f.jobs.acknowledgeMemoryProjection(memoryAcknowledgement(event));
+  }
+  const third = (await create(3)).job;
+  const starting = (await f.jobs.claimStarting({ jobId: third.jobId, expectedRevision: third.revision })).job;
+  const active = (await f.jobs.activate({ jobId: third.jobId, expectedRevision: starting.revision, workspaceRevision: '4'.repeat(64) })).job;
+  const prepared = (await f.jobs.prepareAction({ jobId: third.jobId, expectedRevision: active.revision,
+    action: { type: 'read_text', actionId: 'read-after-pinned-history', path: 'src/app.js', expectedWorkspaceRevision: '4'.repeat(64) } })).job;
+  return { ...f, paused, prepared, historyId: history.jobId };
+}
+
+test('a user-held prefix cannot let projected terminal history consume active action headroom', async () => {
+  const f = await pinnedHistoryFixture(), before = structuredClone(f.store.value);
+  const maximumStateBytes = Buffer.byteLength(JSON.stringify(before), 'utf8') + 250 * 1024;
+  const limits = { maximumStateBytes, maximumJobs: 2 };
+  const constrained = await readyStore({ store: f.store, time: f.time, limits });
+  const pending = f.prepared.execution.pendingAction;
+  const admitted = await constrained.jobs.admitAction({ jobId: f.prepared.jobId, expectedRevision: f.prepared.revision,
+    actionId: pending.actionId, actionDigest: pending.actionDigest });
+  assert.equal(admitted.status, 'applied');
+  assert.deepEqual(await constrained.jobs.getForWorker(f.paused.jobId), f.paused);
+  assert.deepEqual(await constrained.jobs.getForWorker(f.historyId), before.jobs.find(job => job.jobId === f.historyId));
+  const recovered = await readyStore({ store: f.store, time: f.time, limits });
+  assert.equal((await recovered.jobs.getForWorker(f.prepared.jobId)).execution.actionAdmission.actionId, pending.actionId);
+  assert.equal(f.store.value.archive.throughSequence, 0);
+});
+
+test('restart accepts bounded retained history above the live byte budget without rewriting it', async () => {
+  const f = await pinnedHistoryFixture(), before = structuredClone(f.store.value);
+  const limits = { maximumStateBytes: Buffer.byteLength(JSON.stringify(before), 'utf8') - 50 * 1024 };
+  const recovered = await readyStore({ store: f.store, time: f.time, limits });
+  assert.deepEqual(await recovered.jobs.getForWorker(f.historyId), before.jobs.find(job => job.jobId === f.historyId));
+  assert.deepEqual(f.store.value, before);
+  await assert.rejects(readyStore({ store: f.store, time: f.time, limits: { ...limits, maximumArchiveBytes: 1 } }),
+    { code: 'CODE_JOB_STATE_CORRUPTED' });
+});
+
+for (const projected of [false, true]) test(`pinned history cannot bypass unprojected work or exhausted historical storage: projected=${projected}`, async () => {
+  const f = await pinnedHistoryFixture({ projected });
+  const limits = { maximumStateBytes: Buffer.byteLength(JSON.stringify(f.store.value), 'utf8') + 250 * 1024,
+    ...(projected ? { maximumArchiveBytes: 1 } : {}) };
+  const constrained = await readyStore({ store: f.store, time: f.time, limits });
+  const pending = f.prepared.execution.pendingAction;
+  await assert.rejects(constrained.jobs.admitAction({ jobId: f.prepared.jobId, expectedRevision: f.prepared.revision,
+    actionId: pending.actionId, actionDigest: pending.actionDigest }), { code: 'CODE_JOB_RETENTION_BLOCKED' });
+  assert.equal((await constrained.jobs.getForWorker(f.prepared.jobId)).execution.actionAdmission, null);
+});
+
 test("memory projection receipt is exact, CAS-bound, and idempotent after acknowledgement loss", async () => {
   const { jobs, store } = await readyStore();
   const created = await jobs.createApprovedJob(approval());
@@ -3997,4 +4443,117 @@ test("explicit compaction archives only a terminal prefix, never paused work", a
   assert.equal(compacted.receipt.targetThroughSequence, 1);
   assert.equal((await jobs.list()).archive.throughSequence, 1);
   assert.equal((await jobs.list()).total, 0);
+});
+
+async function archivedVerificationFixture(code, {
+  operation = "verify",
+  terminalMethod = "fail",
+} = {}) {
+  const fixture = await readyStore();
+  const created = await fixture.jobs.createApprovedJob(approval({
+    grant: grant({
+      operation,
+      requestedBy: { roleId: "tester", workItemId: "work-1" },
+      allowedActions: [...CODE_JOB_ACTIONS_BY_OPERATION[operation]],
+    }),
+  }));
+  const failed = await fixture.jobs[terminalMethod]({
+    jobId: created.job.jobId,
+    expectedRevision: created.job.revision,
+    result: { code, summary: "Private detail C:\\private\\test-output.log" },
+  });
+  await fixture.jobs.markMemoryProjected(memoryProjection(failed.job));
+  const live = await fixture.jobs.get(created.job.jobId);
+  await fixture.jobs.compactTerminalPrefix(compactionRequest(fixture.store, {
+    targetThroughSequence: failed.job.sequence,
+  }));
+  const manifest = fixture.store.value.archiveIndex[0];
+  const storageKey = `code-job-tombstone-record-${manifest.jobId}`;
+  return {
+    ...fixture,
+    live,
+    manifest,
+    storageKey,
+    tombstone: await fixture.store.read(storageKey, null),
+  };
+}
+
+function resealArchiveFixture(tombstone, originalManifest) {
+  const { tombstoneDigest: ignoredTombstoneDigest, ...content } = tombstone;
+  const sealed = { ...content, tombstoneDigest: digestValue(content) };
+  const { manifestDigest: ignoredManifestDigest, ...manifestContent } = originalManifest;
+  const changedManifest = { ...manifestContent, tombstoneDigest: sealed.tombstoneDigest };
+  return {
+    tombstone: sealed,
+    manifest: { ...changedManifest, manifestDigest: digestValue(changedManifest) },
+  };
+}
+
+test("verification outcome survives compaction and restart without private terminal detail", async (t) => {
+  for (const code of [
+    "CODE_JOB_VERIFICATION_FAILED",
+    "CODE_JOB_VERIFICATION_TIMEOUT",
+    "CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE",
+    "CODE_JOB_VERIFICATION_UNKNOWN",
+  ]) {
+    await t.test(code, async () => {
+      const fixture = await archivedVerificationFixture(code);
+      assert.equal(fixture.live.verificationOutcome, code);
+      assert.equal(fixture.tombstone.schemaVersion, 3);
+      assert.equal(fixture.tombstone.outcome.verificationOutcome, code);
+      assert.doesNotMatch(JSON.stringify(fixture.tombstone), /Private detail|private\\\\test-output/);
+      assert.deepEqual(await fixture.jobs.get(fixture.live.jobId), fixture.live);
+      const recovered = await readyStore({ store: fixture.store });
+      assert.deepEqual(await recovered.jobs.get(fixture.live.jobId), fixture.live);
+    });
+  }
+});
+
+test("legacy tombstones remain readable without a verification outcome", async () => {
+  const fixture = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED");
+  for (const schemaVersion of [1, 2]) {
+    const legacy = structuredClone(fixture.tombstone);
+    legacy.schemaVersion = schemaVersion;
+    delete legacy.outcome.verificationOutcome;
+    if (schemaVersion === 1) delete legacy.outcome.changePackageDelivery;
+    const sealed = resealArchiveFixture(legacy, fixture.manifest);
+    const normalized = normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: fixture.storageKey,
+      manifest: sealed.manifest,
+    });
+    assert.equal(Object.hasOwn(projectArchivedCodeJobForBrowser(normalized.tombstone), "verificationOutcome"), false);
+  }
+});
+
+test("archived verification outcome is digest-bound and restricted to failed verify jobs", async () => {
+  const fixture = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED");
+  const changed = structuredClone(fixture.tombstone);
+  changed.outcome.verificationOutcome = "CODE_JOB_VERIFICATION_TIMEOUT";
+  assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(changed, {
+    storageKey: fixture.storageKey,
+    manifest: fixture.manifest,
+  }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+
+  for (const invalid of ["UNKNOWN_PRIVATE_CODE", { code: "CODE_JOB_VERIFICATION_FAILED" }]) {
+    const forged = structuredClone(fixture.tombstone);
+    forged.outcome.verificationOutcome = invalid;
+    const sealed = resealArchiveFixture(forged, fixture.manifest);
+    assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: fixture.storageKey,
+      manifest: sealed.manifest,
+    }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+  }
+
+  for (const options of [{ operation: "inspect" }, { terminalMethod: "fence" }]) {
+    const other = await archivedVerificationFixture("CODE_JOB_VERIFICATION_FAILED", options);
+    assert.equal(other.tombstone.outcome.verificationOutcome, null);
+    assert.equal(Object.hasOwn(await other.jobs.get(other.live.jobId), "verificationOutcome"), false);
+    const forged = structuredClone(other.tombstone);
+    forged.outcome.verificationOutcome = "CODE_JOB_VERIFICATION_FAILED";
+    const sealed = resealArchiveFixture(forged, other.manifest);
+    assert.throws(() => normalizeCodeJobArchiveTombstoneRecord(sealed.tombstone, {
+      storageKey: other.storageKey,
+      manifest: sealed.manifest,
+    }), { code: "CODE_JOB_ARCHIVE_CORRUPTED" });
+  }
 });

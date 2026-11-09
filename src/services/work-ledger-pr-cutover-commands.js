@@ -1,13 +1,17 @@
 import { assertExpectedWorkGraphRevision } from "./work-ledger-graph-command-support.js";
+import { hasCodeConfirmationSettlement } from "./work-ledger-code-confirmation-settlement.js";
+import { hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { requireWorkLedgerItem } from "./work-ledger-item-commands.js";
 import {
   activatePendingPullRequestWorkSource,
   currentWorkItemInputBinding,
+  matchesHistoricalPullRequestInputBinding,
   pullRequestHeadAdmission,
 } from "./work-ledger-pr-source.js";
 import { assertItemRevision } from "./work-ledger-transitions.js";
 import {
   boundedLedgerString,
+  ledgerDigest,
   hasExactLedgerKeys,
   workLedgerError,
 } from "./work-ledger-values.js";
@@ -58,7 +62,8 @@ function recordCutoverTimelineEvent(index, entry) {
   const state = pullRequestCutoverTimelineIndexes.get(index);
   if (state === undefined) return;
   const itemId =
-    typeof entry?.itemId === "string" && entry.type !== "pr_source_revised"
+    typeof entry?.itemId === "string" &&
+      entry.type !== "pr_source_revised" && entry.type !== "pr_source_ignored"
       ? entry.itemId
       : null;
   const record = { entry, itemId };
@@ -222,7 +227,7 @@ function normalizeItemId(value) {
   }
 }
 
-function normalizeCommand(value) {
+export function normalizePullRequestSourceReconciliationCommand(value) {
   if (
     !hasExactLedgerKeys(value, [
       "itemId",
@@ -254,17 +259,45 @@ function pendingHeadChanged(source) {
   return active.headRevision !== pending.headRevision;
 }
 
-function latestRejectedProposalProof(item, timelineIndex) {
+export function isExpiredCodeConfirmation(decision) {
+  const value = decision?.value;
+  // Authorization changes can leave a running job quarantined. Only the
+  // confirmation-only stale result proves that no code job was started.
+  return decision?.outcome === "stale" &&
+    value?.kind === "code_action_proposal" &&
+    typeof value.downstreamRef === "string" &&
+    value.downstreamRef.startsWith("confirmation-code-job-") &&
+    Array.isArray(value.evidence) && value.evidence.length === 1 &&
+    value.evidence[0] === `confirmation:${value.downstreamRef}`;
+}
+
+function isCodeProposalStoppedBeforeConfirmation(decision) {
+  const value = decision?.value;
+  // This handler result is emitted only before enqueueing a confirmation.
+  // Other stale results can represent an executing or quarantined code job.
+  return decision?.outcome === "stale" &&
+    value?.kind === "code_action_proposal" &&
+    value.downstreamRef === null &&
+    typeof decision.referenceId === "string" &&
+    Array.isArray(value.evidence) && value.evidence.length === 2 &&
+    value.evidence[0] === "authorization_changed" &&
+    value.evidence[1] === `proposal:${decision.referenceId}`;
+}
+
+function latestSettledProposalProof(item, timelineIndex, codeConfirmationSettled) {
   if (
     item.decisionContext?.source !== "proposal" ||
-    item.decisionContext?.outcome !== "rejected" ||
+    (item.decisionContext?.outcome !== "rejected" &&
+      !isExpiredCodeConfirmation(item.decisionContext) &&
+      !isCodeProposalStoppedBeforeConfirmation(item.decisionContext) &&
+      !codeConfirmationSettled) ||
     typeof item.decisionContext.contentDigest !== "string"
   ) {
     return null;
   }
   const entry = latestCutoverTimelineEvent(timelineIndex, item.itemId);
   return entry?.type === "proposal_result_applied" &&
-    entry.details?.outcome === "rejected" &&
+    entry.details?.outcome === item.decisionContext.outcome &&
     entry.details?.decision?.contentDigest ===
       item.decisionContext.contentDigest &&
     Number.isSafeInteger(entry.details?.workItemRevision) &&
@@ -273,7 +306,7 @@ function latestRejectedProposalProof(item, timelineIndex) {
     : null;
 }
 
-function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
+function definitiveBlockedSettlement(item, outboxById, timelineIndex, confirmationSettlements) {
   if (item.status !== "blocked" || item.activeIntentId !== null) return null;
   if ([
     "pr_source_left_scope",
@@ -300,10 +333,15 @@ function definitiveBlockedSettlement(item, outboxById, timelineIndex) {
   ) {
     return { proposalProof: null };
   }
-  const proposalProof = latestRejectedProposalProof(item, timelineIndex);
+  const confirmationSettled = hasCodeConfirmationSettlement(
+    item, outboxById, confirmationSettlements?.get(item.itemId),
+  ) || hasReviewConfirmationSettlement(item, outboxById, confirmationSettlements?.get(item.itemId));
+  const proposalProof = latestSettledProposalProof(item, timelineIndex, confirmationSettled);
   if (
     proposalProof !== null &&
-    (item.statusReason === "proposal_rejected" ||
+    (item.statusReason === `proposal_${item.decisionContext.outcome}` ||
+      (["pr_source_revised", "pr_source_left_scope_pending_settlement",
+        "pr_source_reentered_scope_pending_settlement"].includes(item.statusReason) && confirmationSettled) ||
       crossRootPullRequestCutoverPendingId(item) !== null)
   ) {
     return { proposalProof };
@@ -347,11 +385,41 @@ function unstartedIntent(item, outboxById) {
   return null;
 }
 
+function retainedWorkflowWaitBinding(item, outbox) {
+  const binding = outbox.sourceBinding;
+  if (outbox.inputDigest !== binding?.inputDigest) return false;
+  if (ledgerDigest(binding) === ledgerDigest(currentWorkItemInputBinding(item))) return true;
+  return matchesHistoricalPullRequestInputBinding(item, binding);
+}
+
+function obsoleteHeadCondition(item, outboxById) {
+  if (item.status !== "waiting_condition" || item.activeIntentId === null) return null;
+  const outbox = outboxById.get(item.activeIntentId);
+  const condition = outbox?.intent?.condition;
+  if (outbox?.status !== "delivered" || outbox.outcome?.status !== "delivered" ||
+      outbox.intent.type !== "wait_condition" || condition?.kind !== "workflow_fact" ||
+      !["merge-state", "ci-status", "review-decision", "next-action", "action-state", "head-oid", "base-oid", "state"].includes(condition.fact) ||
+      outbox.sourceBinding == null || !retainedWorkflowWaitBinding(item, outbox)) return null;
+  return outbox;
+}
+
+function ownerRequestedAfterCancellation(replacementRoot, predecessor) {
+  const event = replacementRoot?.event;
+  return predecessor.status === "cancelled" &&
+    predecessor.activeIntentId === null &&
+    replacementRoot?.source?.scope?.kind === "owner_requested" &&
+    replacementRoot.source.scope.active === true &&
+    samePullRequestSubject(predecessor, replacementRoot) &&
+    event?.eventType === "pull_request.owner_requested" &&
+    event.source?.provider === "local-owner" &&
+    Date.parse(event.occurredAt) > Date.parse(predecessor.updatedAt);
+}
+
 export function inspectPullRequestSourceCutover(
   root,
   items,
   outboxById,
-  { forceHeadChanged = false, timelineIndex = null } = {},
+  { forceHeadChanged = false, timelineIndex = null, confirmationSettlements = null, replacementRoot = null } = {},
 ) {
   const headChanged = forceHeadChanged || pendingHeadChanged(root.source);
   const participants = [
@@ -361,14 +429,17 @@ export function inspectPullRequestSourceCutover(
   const proposalSettlements = [];
   const blockers = participants.filter((item) => {
     const statusReady = item.itemId === root.itemId
-      ? ROOT_READY_STATUSES.has(item.status)
+      ? ROOT_READY_STATUSES.has(item.status) ||
+        ownerRequestedAfterCancellation(replacementRoot, item)
       : CHILD_TERMINAL_STATUSES.has(item.status) ||
         CHILD_SUPERSEDABLE_STATUSES.has(item.status);
     if (statusReady) return false;
+    if (headChanged && obsoleteHeadCondition(item, outboxById) !== null) return false;
     const settlement = definitiveBlockedSettlement(
       item,
       outboxById,
       timelineIndex,
+      confirmationSettlements,
     );
     if (settlement !== null) {
       if (settlement.proposalProof !== null) {
@@ -389,8 +460,9 @@ export function crossRootPullRequestCutoverActivation(root, activation) {
     ...activation,
     participants: activation.participants.filter(
       (participant) =>
-        participant.itemId === root.itemId ||
-        !CHILD_TERMINAL_STATUSES.has(participant.status),
+        participant.status !== "cancelled" &&
+        (participant.itemId === root.itemId ||
+          !CHILD_TERMINAL_STATUSES.has(participant.status)),
     ),
   };
 }
@@ -487,15 +559,16 @@ export function applyReadyPullRequestSourceCutover({
   now,
   timelineEvents,
 }) {
-  let rootResult = activation.headChanged
+  let rootResult = activation.headChanged && root.status !== "cancelled"
     ? { ...root, decisionContext: null }
     : root;
   for (const participant of activation.participants) {
     const activeOutbox = unstartedIntent(participant, outboxById);
-    if (activeOutbox !== null) {
-      outboxById.set(
-        activeOutbox.intentId,
-        failSupersededIntent(activeOutbox, nextInputRevision, now),
+    const obsoleteCondition = activation.headChanged ? obsoleteHeadCondition(participant, outboxById) : null;
+    const supersededIntent = activeOutbox ?? obsoleteCondition;
+    if (supersededIntent !== null) {
+      if (activeOutbox !== null) outboxById.set(
+        activeOutbox.intentId, failSupersededIntent(activeOutbox, nextInputRevision, now),
       );
       timelineEvents.push({
         itemId: participant.itemId,
@@ -503,8 +576,8 @@ export function applyReadyPullRequestSourceCutover({
         at: now,
         actorId: "work-ledger-system",
         details: {
-          intentId: activeOutbox.intentId,
-          reason: "pr_source_superseded_before_dispatch",
+          intentId: supersededIntent.intentId,
+          reason: obsoleteCondition === null ? "pr_source_superseded_before_dispatch" : "pr_head_condition_superseded",
           nextInputRevision,
         },
       });
@@ -660,11 +733,24 @@ function operationalPullRequestSourceObservation(root) {
 }
 
 function assertCrossRootCutoverChain(root, predecessor) {
-  const pendingSequence = crossRootPullRequestCutoverCandidate(root)
-    ?.sourceSequence;
-  const predecessorSequence = operationalPullRequestSourceObservation(
+  const candidate = crossRootPullRequestCutoverCandidate(root);
+  const pendingSequence = candidate?.sourceSequence;
+  let predecessorSequence = operationalPullRequestSourceObservation(
     predecessor,
   ).sourceSequence;
+  const source = predecessor.source;
+  const previous = source.revisions[source.activeRevision - 2];
+  // A later scope departure cannot invalidate an already registered same-Head
+  // chain. Only the immediately preceding accepted observation may anchor it;
+  // normal authority, settlement and CAS checks still govern activation.
+  if (predecessorSequence >= pendingSequence && source.pendingRevision === null &&
+      source.scope.kind === "automatic" && source.scope.active === false &&
+      source.current.event.eventType === "pull_request.left_scope" &&
+      source.scope.lastLifecycleEventId === source.current.eventId &&
+      previous?.disposition === "accepted" && previous.headRefOid === source.current.headRefOid &&
+      source.current.headRefOid === root.source.revisions[candidate.inputRevision - 1].headRefOid) {
+    predecessorSequence = sourceObservationForRevision(source, previous.revision).sourceSequence;
+  }
   if (
     predecessor.kind !== "source_root" ||
     predecessor.source?.kind !== "pull_request" ||
@@ -686,6 +772,7 @@ function planCrossRootPullRequestSourceReconciliation({
   predecessorItemId,
   clock,
   timelineLimit,
+  confirmationSettlements,
 }) {
   if (root.status !== "blocked") {
     throw conflict("跨来源 PR cutover 状态无效");
@@ -740,6 +827,8 @@ function planCrossRootPullRequestSourceReconciliation({
     outboxById,
     {
       forceHeadChanged: true,
+      replacementRoot: root,
+      confirmationSettlements,
       timelineIndex: createPullRequestCutoverTimelineIndex(
         state.timeline,
         timelineLimit,
@@ -749,6 +838,7 @@ function planCrossRootPullRequestSourceReconciliation({
   if (
     activation.blockers.some(
       (blocker) =>
+        blocker.status !== "cancelled" &&
         crossRootPullRequestCutoverPendingId(blocker) !== root.itemId,
     )
   ) {
@@ -831,7 +921,7 @@ function planCrossRootPullRequestSourceReconciliation({
       },
     });
   }
-  const activated = activatePendingPullRequestWorkSource(root.source);
+  const activated = activatePendingPullRequestWorkSource(root.source, { attemptAtActivation: root.attempt });
   const next = {
     ...root,
     source: activated.source,
@@ -857,6 +947,11 @@ function planCrossRootPullRequestSourceReconciliation({
       headRevision: next.source.headRevision,
       headRefOid: next.source.current.headRefOid,
       predecessorItemId,
+      ...(root.source.current.headRefOid === next.source.current.headRefOid ? {} : {
+        previousHeadRefOid: root.source.current.headRefOid,
+        previousActiveRevision: root.source.activeRevision,
+        decisionAttemptOffset: root.attempt,
+      }),
     },
   });
   if (!arePullRequestCutoverProofsRetained({
@@ -890,8 +985,9 @@ export function planPullRequestSourceReconciliation({
   input,
   clock,
   timelineLimit,
+  confirmationSettlements = null,
 }) {
-  const command = normalizeCommand(input);
+  const command = normalizePullRequestSourceReconciliationCommand(input);
   const root = requireWorkLedgerItem(state, command.itemId);
   if (root.kind !== "source_root" || root.source?.kind !== "pull_request") {
     throw conflict("工作项不是 PR 来源根");
@@ -905,6 +1001,7 @@ export function planPullRequestSourceReconciliation({
       predecessorItemId,
       clock,
       timelineLimit,
+      confirmationSettlements,
     });
   }
   if (
@@ -938,6 +1035,7 @@ export function planPullRequestSourceReconciliation({
     state.items,
     outboxById,
     {
+      confirmationSettlements,
       timelineIndex: createPullRequestCutoverTimelineIndex(
         state.timeline,
         timelineLimit,
@@ -971,7 +1069,7 @@ export function planPullRequestSourceReconciliation({
     now,
     timelineEvents,
   });
-  const activated = activatePendingPullRequestWorkSource(root.source);
+  const activated = activatePendingPullRequestWorkSource(root.source, { attemptAtActivation: root.attempt });
   const next = {
     ...locallySettledRoot,
     source: activated.source,
@@ -996,6 +1094,11 @@ export function planPullRequestSourceReconciliation({
       activeRevision: next.source.activeRevision,
       headRevision: pendingHeadRevision,
       headRefOid: next.source.current.headRefOid,
+      ...(root.source.current.headRefOid === next.source.current.headRefOid ? {} : {
+        previousHeadRefOid: root.source.current.headRefOid,
+        previousActiveRevision: root.source.activeRevision,
+        decisionAttemptOffset: root.attempt,
+      }),
     },
   });
   if (!arePullRequestCutoverProofsRetained({

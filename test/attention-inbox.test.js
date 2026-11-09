@@ -86,6 +86,248 @@ async function readyInbox({
   return { inbox, store, lease };
 }
 
+test("reading an exact question status never answers it or exposes its contents", async () => {
+  const { inbox, store } = await readyInbox();
+  const request = await inbox.create(attentionRequest());
+  const writes = store.writeCount;
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), {
+    requestId: request.requestId, status: "pending",
+  });
+  assert.equal(await inbox.readStatus({ requestId: `attention-${"f".repeat(64)}` }), null);
+  assert.equal(store.writeCount, writes);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  await inbox.answer({ requestId: request.requestId, expectedRevision: request.revision,
+    contentDigest: request.contentDigest, answer: { type: "choice", choiceId: "yes" } });
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), {
+    requestId: request.requestId, status: "answered",
+  });
+  await assert.rejects(inbox.readStatus({ requestId: "invalid" }), { code: "INVALID_ATTENTION_REQUEST" });
+  await assert.rejects(inbox.readStatus({ requestId: request.requestId, extra: true }), { code: "INVALID_ATTENTION_REQUEST" });
+});
+
+test("exact status follows automatic retirement without producing an answer", async () => {
+  let retired = false;
+  const { inbox } = await readyInbox({ authority: { isCurrent: async () => !retired,
+    readAttentionRequestRetirement: async () => retired
+      ? { status: "cancelled", workItemRevision: 3, reason: "issue_source_left_scope" } : null } });
+  const request = await inbox.create(attentionRequest());
+  retired = true;
+  assert.equal((await inbox.readStatus({ requestId: request.requestId })).status, "pending");
+  await inbox.archiveRetired();
+  assert.deepEqual(await inbox.readStatus({ requestId: request.requestId }), { requestId: request.requestId, status: "archived" });
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+});
+
+test("maintenance failures stay readable without blocking business questions or creating answers", async () => {
+  const { inbox, store } = await readyInbox();
+  const maintenance = await inbox.create(attentionRequest({
+    requestKey: "session-failure",
+    context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+    choices: [{ id: "configured-retry", label: "修复后重试" }],
+  }));
+  const business = await inbox.create(attentionRequest({ requestKey: "business-question" }));
+  const before = structuredClone(store.value);
+  assert.equal((await inbox.next()).requestId, business.requestId);
+  const faults = await inbox.listMaintenance();
+  assert.equal(faults.total, 1);
+  assert.equal(faults.items[0].requestId, maintenance.requestId);
+  assert.equal(faults.items[0].maintenanceCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  assert.deepEqual(store.value, before, "reading maintenance must not answer, delete or retry tasks");
+  await inbox.answer(response(faults.items[0], { type: "choice", choiceId: "configured-retry" }));
+  assert.equal((await inbox.listMaintenance()).total, 0);
+  assert.equal((await inbox.readOutbox()).items.length, 1);
+});
+
+test("U3 projected recovery identity groups new maintenance after restart without localized text", async () => {
+  const { inbox, store } = await readyInbox();
+  const maintenance = await inbox.create(attentionRequest({ requestKey: "new-recovery",
+    recoveryCode: "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED", question: "Updated question",
+    context: [{ label: "Updated label", value: "Updated reason" }],
+    choices: [{ id: "configured-retry", label: "Updated retry" }] }));
+  const business = await inbox.create(attentionRequest({ requestKey: "new-business", recoveryCode: null,
+    context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+    choices: [{ id: "configured-retry", label: "修复后重试" }] }));
+  const restarted = (await readyInbox({ store, clock: tickingClock(Date.parse("2026-08-02T02:00:00.000Z")) })).inbox;
+  assert.equal((await restarted.next()).requestId, business.requestId);
+  assert.equal((await restarted.next()).maintenanceCode, null);
+  const faults = await restarted.listMaintenance();
+  assert.equal(faults.total, 1);
+  assert.equal(faults.items[0].requestId, maintenance.requestId);
+  assert.equal(faults.items[0].maintenanceCode, "STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED");
+  await restarted.answer(response(faults.items[0], { type: "choice", choiceId: "configured-retry" }));
+  assert.equal((await restarted.readOutbox()).items.length, 1);
+});
+
+test("maintenance lists validate one batch and omit stale task bindings without writes", async () => {
+  const batches = [];
+  const { inbox, store } = await readyInbox({ authority: {
+    async isCurrent() { return true; },
+    async areAttentionRequestsCurrent(bindings) { batches.push(bindings); return [true, false]; },
+  } });
+  const requests = [];
+  for (const requestKey of ["current-fault", "stale-fault"]) {
+    requests.push(await inbox.create(attentionRequest({ requestKey,
+      context: [{ label: "判断依据", value: "系统已安全停止（STRUCTURED_PROVIDER_SESSION_RECOVERY_FAILED）" }],
+      choices: [{ id: "configured-retry", label: "修复后重试" }],
+    })));
+  }
+  const before = structuredClone(store.value);
+  const writes = store.writeCount;
+  const faults = await inbox.listMaintenance();
+  assert.deepEqual(batches, [["current-fault", "stale-fault"].map((requestKey) => ({
+    requestKey, producer: attentionRequest().producer,
+  }))]);
+  assert.equal(faults.total, 1);
+  assert.deepEqual(faults.items.map(({ requestId }) => requestId), [requests[0].requestId]);
+  assert.equal(store.writeCount, writes);
+  assert.deepEqual(store.value, before);
+});
+
+test("retired producer questions are archived without an answer, outbox effect, or history loss", async () => {
+  const authority = {
+    isCurrent: async ({ requestKey }) => requestKey === "current-question",
+    readAttentionRequestRetirement: async ({ requestKey }) =>
+      requestKey === "retired-question"
+        ? { status: "cancelled", workItemRevision: 17, reason: "issue_source_left_scope" }
+        : null,
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  const retired = await inbox.create(attentionRequest({ requestKey: "retired-question" }));
+  const current = await inbox.create(attentionRequest({ requestKey: "current-question" }));
+  await inbox.later(response(current, { type: "later" }));
+  const original = structuredClone(store.value.items[0]);
+  const result = await inbox.archiveRetired();
+
+  assert.deepEqual(result, { archived: 1 });
+  assert.equal(store.value.items.length, 2);
+  const archived = store.value.items[0];
+  assert.equal(archived.status, "archived");
+  assert.equal(archived.question, original.question);
+  assert.deepEqual(archived.context, original.context);
+  assert.deepEqual(archived.timeline[0], original.timeline[0]);
+  assert.equal(archived.timeline[1].type, "archived");
+  assert.equal(archived.archive.reason, "issue_source_left_scope");
+  assert.equal(archived.result, null);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  assert.equal((await inbox.next()).requestId, current.requestId);
+  assert.equal((await inbox.create(attentionRequest({ requestKey: "retired-question" }))).status, "archived");
+  await assert.rejects(inbox.answer(response(retired, { type: "text", text: "late answer" })), {
+    code: "ATTENTION_REQUEST_STALE",
+  });
+
+  const writes = store.writeCount;
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 0 });
+  assert.equal(store.writeCount, writes);
+  const recovered = await readyInbox({ store, authority });
+  assert.equal((await recovered.inbox.next()).requestId, current.requestId);
+  assert.equal(store.value.items[0].status, "archived");
+});
+
+test("temporary authority loss and unavailable retirement evidence do not archive questions", async () => {
+  for (const unavailable of [false, true]) {
+    const authority = {
+      isCurrent: async () => false,
+      async readAttentionRequestRetirement() {
+        if (unavailable) throw new Error("ledger unavailable");
+        return null;
+      },
+    };
+    const { inbox, store } = await readyInbox({ authority });
+    await inbox.create(attentionRequest());
+    const original = structuredClone(store.value);
+    if (unavailable) await assert.rejects(inbox.archiveRetired(), /ledger unavailable/);
+    else assert.deepEqual(await inbox.archiveRetired(), { archived: 0 });
+    assert.deepEqual(store.value, original);
+  }
+});
+
+test("automatic maintenance retry archives the question without inventing an answer", async () => {
+  const retirement = { status: "retry_wait", workItemRevision: 17, reason: "system_maintenance_auto_retry" };
+  const authority = { isCurrent: async () => false, readAttentionRequestRetirement: async () => retirement };
+  const { inbox, store } = await readyInbox({ authority });
+  await inbox.create(attentionRequest());
+  const original = structuredClone(store.value.items[0]);
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+  assert.equal(store.value.items[0].question, original.question);
+  assert.equal(store.value.items[0].result, null);
+  assert.equal(store.value.items[0].archive.reason, retirement.reason);
+  assert.equal((await inbox.readOutbox()).items.length, 0);
+  await readyInbox({ store, authority });
+  assert.equal(store.value.items[0].status, "archived");
+});
+
+test("automatic retirement holds the inbox lease and preserves a rejection committed before it", async () => {
+  let startRetry, finishRetry;
+  const entered = new Promise(resolve => { startRetry = resolve; });
+  const finish = new Promise(resolve => { finishRetry = resolve; });
+  let current = true;
+  let keys;
+  const authority = { isCurrent: async () => current,
+    async retrySystemMaintenanceQuestions({ requestKeys }) {
+      keys = requestKeys;
+      startRetry();
+      await finish;
+      current = false;
+      return { retried: requestKeys.length };
+    },
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  const rejected = await inbox.create(attentionRequest({ requestKey: `work-intent-${"a".repeat(64)}` }));
+  const pending = await inbox.create(attentionRequest({ requestKey: `work-intent-${"b".repeat(64)}` }));
+  await inbox.reject(response(rejected, { type: "reject", reason: "stop" }));
+  const before = structuredClone(store.value.items[0]);
+  const retry = inbox.retrySystemQuestions({ limit: 10 });
+  await entered;
+  const lateRejection = inbox.reject(response(pending, { type: "reject", reason: "late" }));
+  finishRetry();
+  assert.deepEqual(await retry, { retried: 1 });
+  await assert.rejects(lateRejection, { code: "ATTENTION_REQUEST_STALE" });
+  assert.deepEqual(keys, [`work-intent-${"b".repeat(64)}`]);
+  assert.deepEqual(store.value.items[0], before);
+  assert.equal((await inbox.readOutbox()).items.length, 1);
+});
+
+test("failed archive persistence preserves pending questions and permits a safe retry", async () => {
+  const authority = {
+    isCurrent: async () => false,
+    readAttentionRequestRetirement: async () => ({
+      status: "superseded", workItemRevision: 9, reason: "issue_assignment_superseded",
+    }),
+  };
+  const { inbox, store } = await readyInbox({ authority });
+  await inbox.create(attentionRequest());
+  store.failWriteAt = store.writeCount + 1;
+  await assert.rejects(inbox.archiveRetired(), /disk unavailable/);
+  assert.equal(store.value.items[0].status, "pending");
+  store.failWriteAt = null;
+  assert.deepEqual(await inbox.archiveRetired(), { archived: 1 });
+});
+
+test("archive migration retains schema 1 answers and rejects tampered retirement evidence", async () => {
+  const { inbox, store } = await readyInbox();
+  const answered = await inbox.create(attentionRequest());
+  await inbox.answer(response(answered, { type: "text", text: "existing answer" }));
+  await inbox.create(attentionRequest({ requestKey: "retired-question" }));
+  const existingResult = structuredClone(store.value.items[0].result);
+  store.value.schemaVersion = 1;
+  for (const item of store.value.items) delete item.archive;
+  const recovered = await readyInbox({ store, clock: tickingClock(Date.parse("2026-08-03T00:00:00.000Z")), authority: {
+    isCurrent: async () => false,
+    readAttentionRequestRetirement: async () => ({
+      status: "completed", workItemRevision: 5, reason: "intent_delivered",
+    }),
+  } });
+  assert.deepEqual(await recovered.inbox.archiveRetired(), { archived: 1 });
+  assert.equal(store.value.schemaVersion, 2);
+  assert.deepEqual(store.value.items[0].result, existingResult);
+  assert.equal((await recovered.inbox.readOutbox()).items.length, 1);
+  const corrupted = structuredClone(store.value);
+  corrupted.items[1].archive.reason = "changed without updating evidence";
+  await assert.rejects(readyInbox({ store: new MemoryStore(corrupted) }), {
+    code: "ATTENTION_STATE_CORRUPTED",
+  });
+});
+
 test("stale producer authority hides a pending request and rejects late answers", async () => {
   const checks = [];
   const authority = {
@@ -201,6 +443,7 @@ test("a trusted producer persists a content-addressed request before it is visib
     question: attentionRequest().question,
     context: attentionRequest().context,
     choices: attentionRequest().choices,
+    maintenanceCode: null,
     revision: 1,
     contentDigest: created.contentDigest,
     createdAt: "2026-08-02T01:00:00.000Z",

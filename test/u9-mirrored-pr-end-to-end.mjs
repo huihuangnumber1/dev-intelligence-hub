@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
+import { windowsGitImplementationCandidates } from "../src/lib/windows-git-implementation.js";
 
 import { createApplication } from "../src/composition-root.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
@@ -60,13 +61,7 @@ function locateGit() {
   const candidate = result.stdout.split(/\r?\n/u).find(Boolean);
   if (!candidate || !path.isAbsolute(candidate)) return null;
   if (process.platform !== "win32") return path.resolve(candidate);
-  const implementation = path.join(
-    path.dirname(path.dirname(candidate)),
-    "mingw64",
-    "bin",
-    "git.exe",
-  );
-  return existsSync(implementation) ? path.resolve(implementation) : null;
+  return windowsGitImplementationCandidates(candidate).find(existsSync) ?? null;
 }
 
 async function git(gitCommand, cwd, args) {
@@ -283,7 +278,7 @@ class FixedSandbox {
     return {
       exitCode: 0,
       signal: null,
-      stdout: "1 fixed test passed",
+      stdout: "TAP version 13\nok 1 - fixed test\n1..1\n# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0",
       stderr: "",
       durationMs: 1,
       imageId: `sha256:${"a".repeat(64)}`,
@@ -1214,7 +1209,12 @@ async function waitForJob(application, predicate, runHousekeeping, limit = 20) {
     await runHousekeeping();
     const jobs = await application.codeJobReader.listNewest({ limit: 20 });
     const match = jobs.items.find(predicate);
-    if (match) return application.codeJobReader.getDetail({ jobId: match.jobId });
+    if (match) {
+      // Proposal polling precedes code execution in housekeeping. A job that
+      // just finished needs the next poll before its role can submit delivery.
+      await runHousekeeping();
+      return application.codeJobReader.getDetail({ jobId: match.jobId });
+    }
   }
   throw new Error("timed out waiting for the mirrored Code Job");
 }
@@ -1356,12 +1356,14 @@ test(
     application = await startApplication();
     t.after(async () => application?.close());
 
+    const roleCycles = [];
     const runRole = async (roleId) => {
       const result = await application.workCoordination.runCycle({
         trigger: `u9:${roleId}`,
         includeWork: true,
         roleId,
       });
+      roleCycles.push({ roleId, work: result.stages.work });
       advance();
       return result;
     };
@@ -1469,6 +1471,7 @@ test(
     await runRole("tester");
     await runHousekeeping();
     next = await application.confirmationQueue.next();
+    assert.ok(next.item, `missing verification confirmation: ${JSON.stringify(roleCycles.slice(-4))}`);
     assert.equal(next.item.kind, "local.code-job-create");
     const createdVerification = await application.confirmationQueue.approve(
       next.item.id,
@@ -2390,11 +2393,24 @@ test(
       true,
     );
     assert.equal(
-      archivedDetails.every(({ historyAvailable, observations, terminalDetail }) =>
-        historyAvailable === false && observations.length === 0 && terminalDetail === null
+      archivedDetails.every(({ historyAvailable, observations }) =>
+        historyAvailable === false && observations.length === 0
       ),
       true,
     );
+    assert.ok(finalCodeJobDetails.some(({ terminalDetail }) => terminalDetail?.completionReport));
+    for (const { job, terminalDetail } of archivedDetails) {
+      const original = finalCodeJobDetails.find(({ job: before }) => before.jobId === job.jobId);
+      const report = original.terminalDetail?.completionReport;
+      assert.deepEqual(terminalDetail, report ? {
+        schemaVersion: 1,
+        outcome: original.terminalDetail.outcome,
+        completedActionId: original.terminalDetail.completedActionId,
+        workspaceRevision: original.terminalDetail.workspaceRevision,
+        evidence: original.terminalDetail.evidence,
+        completionReport: report,
+      } : null);
+    }
     assert.deepEqual(
       archivedProjection(archivedDetails),
       stateBeforeFinalArchive.codeJobs,

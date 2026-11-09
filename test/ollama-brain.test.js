@@ -40,6 +40,28 @@ function ollamaResponse(assessment = validAssessment) {
   });
 }
 
+test("mail digest batches retain all groups and summarize an oversized body through its end", async () => {
+  const seen = [];
+  const brain = new OllamaBrain({ contextTokens: 8_192, async fetch(_url, options) {
+    const request = JSON.parse(options.body);
+    const facts = JSON.parse(request.messages[1].content);
+    seen.push(facts);
+    return jsonResponse({ message: { content: JSON.stringify({ summaries: facts.map((fact) => ({
+      groupId: fact.groupId, important: true, summary: "字段方案待确认", highlights: [], actionRequired: "确认方案",
+    })) }) } });
+  } });
+  const groups = Array.from({ length: 15 }, (_, index) => ({ groupId: `mail-${index}`, source: "mail",
+    context: "邮件主题", messages: [{ author: "同事", content: `确认字段 ${index}`, updatedAt: "" }] }));
+  const long = { groupId: "long", source: "mail", context: "完整邮件",
+    messages: [{ author: "同事", content: `${"正文段落".repeat(4_000)}END_OF_MAIL`, updatedAt: "" }] };
+  const results = await brain.summarizeDingTalk([...groups, long]);
+  assert.deepEqual(new Set(results.map((entry) => entry.groupId)), new Set([...groups, long].map((entry) => entry.groupId)));
+  const fragments = seen.flat().filter((fact) => fact.groupId === "long" && fact.messages[0].author === "同事");
+  assert.equal(fragments.flatMap((fact) => fact.messages.map((entry) => entry.content)).join(""), long.messages[0].content);
+  assert.ok(seen.length > 3);
+  assert.ok(seen.every((batch) => Buffer.byteLength(JSON.stringify(batch)) < 11_000));
+});
+
 function uncertainPullRequest(overrides = {}) {
   return {
     id: "github:pr:acme/repo#42",
@@ -308,8 +330,41 @@ test("summarizes every DingTalk conversation with a constrained batch schema", a
   assert.deepEqual(result, expected);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].format.properties.summaries.type, "array");
+  assert.equal(requests[0].format.properties.summaries.minItems, 1);
+  assert.equal(requests[0].format.properties.summaries.maxItems, 1);
+  assert.deepEqual(requests[0].format.properties.summaries.items.properties.groupId.enum, ["group-a"]);
   assert.match(requests[0].messages[0].content, /不能把最后一条消息直接当作摘要/);
+  assert.match(requests[0].messages[0].content, /不重要.*important.*false.*不能省略/);
   assert.deepEqual(JSON.parse(requests[0].messages[1].content), conversations);
+});
+
+test("DingTalk schema requires all current groups, including unimportant conversations, on both attempts", async () => {
+  const requests = [];
+  const conversations = ["work", "reaction", "small-talk"].map((groupId) => ({
+    groupId, context: groupId, messages: [{ author: "张三", content: groupId, updatedAt: "" }],
+  }));
+  const expected = conversations.map(({ groupId }, index) => ({
+    groupId, important: index === 0, summary: index === 0 ? "发布完成" : "无工作行动",
+    highlights: [], actionRequired: "",
+  }));
+  const brain = new OllamaBrain({
+    fetch: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return jsonResponse({ message: { content: JSON.stringify({
+        summaries: requests.length === 1 ? expected.slice(0, 1) : expected,
+      }) } });
+    },
+  });
+  assert.deepEqual(await brain.summarizeDingTalk(conversations), expected);
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    const summaries = request.format.properties.summaries;
+    assert.equal(summaries.minItems, conversations.length);
+    assert.equal(summaries.maxItems, conversations.length);
+    assert.deepEqual(summaries.items.properties.groupId.enum, conversations.map(({ groupId }) => groupId));
+    assert.deepEqual(JSON.parse(request.messages[1].content), conversations);
+  }
+  assert.match(requests[1].messages[0].content, /上一次响应/);
 });
 
 test("rejects a DingTalk digest that omits an input conversation", async () => {

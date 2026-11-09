@@ -5,6 +5,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -19,9 +20,28 @@ import { createConflictPreparationBinding } from "../src/domain/conflict-prepara
 import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { mergeConfig } from "../src/lib/config.js";
 import { StateStore } from "../src/lib/state-store.js";
+import { ControlledGitService } from "../src/services/controlled-git-service.js";
 
 const image =
   "node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32";
+
+test("Windows-only production composition needs no Docker service or configuration", { skip: process.platform !== "win32" }, async (t) => {
+  const value = await fixture(t);
+  const config = enabledConfig(value.root);
+  delete config.docker;
+  config.profiles = { native: {
+    kind: "windows-test", nodeExecutable: process.execPath,
+    nodeSha256: createHash("sha256").update(await readFile(process.execPath)).digest("hex"),
+    timeoutMs: 30_000,
+    asset: { schemaVersion: 1, title: "Windows tests", description: "Real assertions", version: 1, source: "import assert from 'node:assert/strict'; assert.equal(1,1); console.log('# tests 1\\n# pass 1\\n# fail 0');" },
+  } };
+  config.requiredProfilesByWorkspace = { dashboard: ["native"] };
+  const runtime = await createCodeExecutorRuntime(config, { sourceBaseRoot: value.sourceBaseRoot, runtimeRoot: value.runtimeRoot, store: value.store });
+  assert.equal(runtime.sandbox.dockerRunner, null);
+  assert.match(runtime.sandbox.getProfileFingerprint("native"), /^[a-f0-9]{64}$/);
+  assert.equal(typeof runtime.settledVerificationReader.read, 'function');
+  assert.equal(await runtime.settledVerificationReader.read({ jobId: 'missing', job: {} }), null);
+});
 
 async function fixture(t) {
   const root = await mkdtemp(path.join(tmpdir(), "code-executor-runtime-"));
@@ -288,6 +308,11 @@ test("enabled runtime resolves local workspaces and recovers before use", async 
     /^[a-f0-9]{64}$/,
   );
   assert.equal(Object.isFrozen(runtime.authority.workspaces[0]), true);
+  assert.deepEqual(runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src"] }), runtime.authority);
+  assert.throws(() => runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["extra"] }),
+    { code: "INVALID_CODE_EXECUTOR_CONFIG" });
+  assert.throws(() => runtime.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src", "src"] }),
+    { code: "INVALID_CODE_EXECUTOR_CONFIG" });
   assert.deepEqual(runtime.changePackageTargets, [
     {
       workspaceId: "dashboard",
@@ -390,11 +415,23 @@ test("configured Controlled Git exposes only frozen production ports", async (t)
   const config = enabledConfig(setup.root);
   Object.assign(config, await productionConflictGitConfig(setup));
 
+  config.brokerLimits = { maxFiles: 10_000, maxDirectories: 11_000, maxFileBytes: 20_000_000, maxTotalBytes: 150_000_000 };
+  let actualLimits;
   const runtime = await createCodeExecutorRuntime(config, {
     runtimeRoot: setup.runtimeRoot,
     sourceBaseRoot: setup.sourceBaseRoot,
     store: setup.store,
+    controlledGitDependencies: { controlledGitServiceFactory(settings) {
+      actualLimits = settings.limits;
+      return new ControlledGitService(settings);
+    } },
   });
+
+  assert.deepEqual(actualLimits, { maxFiles: 10_000, maxDirectories: 11_000, maxBlobBytes: 20_000_000, maxTotalBytes: 150_000_000 });
+  await assert.rejects(createCodeExecutorRuntime(config, {
+    runtimeRoot: setup.runtimeRoot, sourceBaseRoot: setup.sourceBaseRoot, store: setup.store,
+    controlledGitDependencies: { limits: { maxTotalBytes: 999_999_999 } },
+  }), error => error.code === "INVALID_CODE_EXECUTOR_CONFIG");
 
   assert.deepEqual(runtime.authority.workspaces[0].capabilities, [
     "directory_snapshot",
@@ -410,6 +447,7 @@ test("configured Controlled Git exposes only frozen production ports", async (t)
     "create",
     "find",
     "verify",
+    "readSealed",
   ]);
   assert.deepEqual(Object.keys(runtime.controlledCommitPublisher), ["publish"]);
   assert.equal(Object.isFrozen(runtime.conflictPreparationVerifier), true);
@@ -672,6 +710,12 @@ test("workspace authority binds source, exclusions, writes, and fixed profiles",
   const changedExclusions = structuredClone(base);
   changedExclusions.workspaces[0].excludePaths = ["src/private"];
   const third = await makeRuntime(changedExclusions, "exclude");
+  const addedWrites = structuredClone(base);
+  addedWrites.workspaces[0].writablePaths.push("docs/one.cpp");
+  const fourth = await makeRuntime(addedWrites, "added-writes");
+  assert.notEqual(first.authority.workspaces[0].authorityDigest, fourth.authority.workspaces[0].authorityDigest);
+  assert.deepEqual(fourth.inspectAuthorityForWritablePaths({ workspaceId: "dashboard", writablePaths: ["src"] }),
+    first.authority);
 
   assert.notEqual(
     first.authority.workspaces[0].authorityDigest,

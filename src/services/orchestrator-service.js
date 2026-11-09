@@ -1,4 +1,8 @@
+import { structuredPrTriage, isExternalRereview, hasRequiredReviewDeliverable, requiredReviewDeliverables, requiresReviewDelivery } from "../domain/pr-review-work-policy.js";
 import { createHash } from "node:crypto";
+import { permitsReviewPublicationSettlementIntent } from "./review-publication-settlement.js";
+import { coordinatorGoalControl, permitsCoordinatorCancellation } from "../domain/work-goal-ownership.js";
+import { canonicalJsonDigest } from "../lib/canonical-json-digest.js";
 
 import { deliveryAcceptanceContractDigest } from "../domain/delivery-evidence-contract.js";
 import {
@@ -430,25 +434,102 @@ function hasConsistentContextGraph(packet) {
     graph.contentDigest === binding?.graphContentDigest;
 }
 
+function observationAdvanced(original, fresh) {
+  return typeof original === "string" && typeof fresh === "string" &&
+    Number.isFinite(Date.parse(original)) && Number.isFinite(Date.parse(fresh)) &&
+    new Date(original).toISOString() === original &&
+    new Date(fresh).toISOString() === fresh && Date.parse(fresh) > Date.parse(original);
+}
+
+function rebasePullRequestObservations(rebased, fresh) {
+  const originalPr = rebased.context?.code?.pullRequest;
+  const freshPr = fresh.context?.code?.pullRequest;
+  if (
+    !originalPr || !freshPr ||
+    !SHA256.test(originalPr.identityDigest) ||
+    originalPr.identityDigest !== freshPr.identityDigest ||
+    !SHA256.test(originalPr.materialDigest) ||
+    originalPr.materialDigest !== freshPr.materialDigest
+  ) return;
+
+  if (observationAdvanced(originalPr.observedAt, freshPr.observedAt) &&
+      originalPr.summary?.contentDigest === originalPr.contentDigest &&
+      freshPr.summary?.contentDigest === freshPr.contentDigest) {
+    originalPr.observedAt = freshPr.observedAt;
+    originalPr.contentDigest = freshPr.contentDigest;
+    originalPr.summary.contentDigest = freshPr.summary.contentDigest;
+  }
+  for (const dataClass of ["requirements", "code"]) {
+    const originalFacts = rebased.context[dataClass]?.facts;
+    const freshFacts = fresh.context[dataClass]?.facts;
+    if (!Array.isArray(originalFacts) || !Array.isArray(freshFacts) ||
+        originalFacts.length !== freshFacts.length) continue;
+    for (let index = 0; index < originalFacts.length; index += 1) {
+      if (observationAdvanced(originalFacts[index].observedAt, freshFacts[index].observedAt)) {
+        originalFacts[index].observedAt = freshFacts[index].observedAt;
+      }
+    }
+  }
+}
+
+function hasValidDiagnosticDigest(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { contentDigest, ...material } = value;
+  return typeof contentDigest === "string" && SHA256.test(contentDigest) &&
+    canonicalJsonDigest(material) === contentDigest;
+}
+
+function rebaseCiDiagnosticObservations(rebased, fresh) {
+  const original = rebased.context?.code?.ciDiagnostics;
+  const current = fresh.context?.code?.ciDiagnostics;
+  if (!hasValidDiagnosticDigest(original) || !hasValidDiagnosticDigest(current) ||
+      original.schemaVersion !== 1 || current.schemaVersion !== 1 ||
+      original.repository !== current.repository || original.headRefOid !== current.headRefOid ||
+      !Array.isArray(original.reports) || !Array.isArray(current.reports) ||
+      original.reports.length !== current.reports.length || original.reports.length > 3) return;
+  for (let index = 0; index < original.reports.length; index += 1) {
+    const previous = original.reports[index];
+    const next = current.reports[index];
+    if (sameValue(previous, next)) continue;
+    if (!hasValidDiagnosticDigest(previous) || !hasValidDiagnosticDigest(next) ||
+        previous.schemaVersion !== 1 || previous.state !== "available" ||
+        !["SUCCESS", "FAILURE", "UNSTABLE", "ABORTED", "NOT_BUILT"].includes(previous.result) ||
+        previous.repository !== original.repository || previous.headRefOid !== original.headRefOid ||
+        previous.checkout?.matched !== true || previous.checkout.sha !== original.headRefOid ||
+        typeof previous.materialDigest !== "string" || !SHA256.test(previous.materialDigest) ||
+        !observationAdvanced(previous.observedAt, next.observedAt)) return;
+    const { observedAt: previousAt, contentDigest: previousDigest, ...previousMaterial } = previous;
+    const { observedAt: nextAt, contentDigest: nextDigest, ...nextMaterial } = next;
+    if (!sameValue(previousMaterial, nextMaterial)) return;
+    original.reports[index] = checkedClone(next);
+  }
+  const { contentDigest, ...material } = original;
+  original.contentDigest = canonicalJsonDigest(material);
+}
+
 function assertPacketIsFresh(original, fresh) {
   const normalizedFresh = checkedClone(fresh);
   if (sameValue(original, normalizedFresh)) return normalizedFresh;
   if (
     !hasConsistentContextGraph(original) ||
     !hasConsistentContextGraph(normalizedFresh) ||
-    normalizedFresh.binding.graphRevision <= original.binding.graphRevision ||
+    normalizedFresh.binding.graphRevision < original.binding.graphRevision ||
+    (normalizedFresh.binding.graphRevision === original.binding.graphRevision &&
+      normalizedFresh.binding.graphContentDigest !== original.binding.graphContentDigest) ||
     original.contextDigest !== roleContextDigest(original) ||
     normalizedFresh.contextDigest !== roleContextDigest(normalizedFresh)
   ) {
     throw stale("Role context changed before the requested action could execute");
   }
-  // Only global graph metadata may advance without changing this role's inputs.
-  // Validate both digests before recomputing; all scoped fields still compare.
+  // Rebase graph metadata and identical PR/build evidence observed again.
+  // Complete material digests and every other scoped field still compare.
   const rebased = checkedClone(original);
   rebased.binding.graphRevision = normalizedFresh.binding.graphRevision;
   rebased.binding.graphContentDigest = normalizedFresh.binding.graphContentDigest;
   rebased.context.requirements.graph.revision = normalizedFresh.context.requirements.graph.revision;
   rebased.context.requirements.graph.contentDigest = normalizedFresh.context.requirements.graph.contentDigest;
+  rebasePullRequestObservations(rebased, normalizedFresh);
+  rebaseCiDiagnosticObservations(rebased, normalizedFresh);
   rebased.contextDigest = roleContextDigest(rebased);
   if (!sameValue(rebased, normalizedFresh)) {
     throw stale("Role context changed before the requested action could execute");
@@ -540,36 +621,94 @@ function directChildIds(packet) {
   return new Set(coordination.directChildren.map(({ taskId }) => taskId));
 }
 
-function structuredPrTriage(packet) {
-  const event = packet.context?.code?.sourceEvent ?? packet.context?.code?.event;
-  if (
-    event?.eventType !== "pull_request.owner_requested" ||
-    event?.source?.provider !== "local-owner" ||
-    event?.payload?.workType !== "general" ||
-    !["development", "pr-review"].includes(
-      event?.payload?.suggestedCapability,
-    ) ||
-    typeof event?.payload?.nextAction !== "string" ||
-    typeof event?.payload?.expectedHeadRefOid !== "string"
-  ) {
-    return null;
-  }
-  return event.payload;
+function reviewChildResponsibility(task) {
+  return task.responsibility.type === "role" &&
+    ["pr-engineer", "orchestrator"].includes(task.responsibility.id);
 }
 
-function assertStructuredPrTriageAction(packet, children, action) {
-  const triage = structuredPrTriage(packet);
+function malformedReviewChildWithSettledDeliveries(task) {
+  const expected = latestContract(task).expectedDeliverables;
+  const latestDeliveries = new Map(task.deliveries.map((delivery) => [delivery.deliverableId, delivery]));
+  return reviewChildResponsibility(task) && expected.length > 0 &&
+    expected.every(({ kind }) => kind === "text-report") &&
+    task.deliveries.every(({ status }) => status !== "accepted") &&
+    [...latestDeliveries.values()].every(({ status }) => status !== "submitted");
+}
+
+function cancelledMalformedReviewChild(task) {
+  return task.status === "cancelled" && malformedReviewChildWithSettledDeliveries(task);
+}
+
+function cancelledConflictChildWithoutDelivery(task) {
+  return task.status === "cancelled" && task.responsibility.type === "role" &&
+    task.responsibility.id === "developer" && task.deliveries.length === 0;
+}
+
+function verifiedReviewReplacement(packet, action, tasksById, children) {
+  if (!requiresReviewDelivery(packet.context, action)) return null;
+  const recovery = packet.context.code?.reviewPublicationRecovery;
+  if (recovery?.requiresTaskControlChecks !== true || !children.has(recovery.childTaskId)) return null;
+  const old = tasksById.get(recovery.childTaskId);
+  const visible = packet.context.requirements.coordination.directChildren.find(child => child.taskId === old.taskId);
+  const candidate = recovery.candidates.find(candidate => candidate.replacementChildKey === action.childKey &&
+    requiredReviewDeliverables(action.acceptanceContract).some(slot => slot.deliverableId === candidate.deliverableId));
+  if (!candidate || old.revision !== recovery.childTaskRevision || visible?.ledgerStatus !== "blocked" || !visible.decisionFailure ||
+      old.responsibility.type !== "role" || old.responsibility.id !== "pr-engineer" || old.deliveries.length !== 0 ||
+      !hasRequiredReviewDeliverable(latestContract(old)) || [...children].some(taskId => taskId !== old.taskId &&
+        (!["cancelled", "superseded"].includes(tasksById.get(taskId).status) || tasksById.get(taskId).deliveries.length !== 0))) return null;
+  return { taskId: old.taskId, expectedTaskRevision: old.revision, reason: action.reason };
+}
+
+function assertStructuredPrTriageAction(packet, children, action, tasksById, automaticMode, capabilityRoles) {
+  const triage = structuredPrTriage(packet.context);
   if (triage === null) return;
-  if (children.size === 0 && action.type !== "decompose") {
+  if (!automaticMode && children.size === 0 && action.type !== "decompose") {
     throw denied("Initial structured PR triage must be decomposed");
   }
+  const controlledChild = children.has(action.sourceTaskId) ? tasksById.get(action.sourceTaskId) : null;
+  const childLedgerStatus = packet.context.requirements.coordination.directChildren.find(
+    ({ taskId }) => taskId === action.sourceTaskId)?.ledgerStatus;
+  if (!automaticMode && isExternalRereview(packet.context) && action.type === "pause" && controlledChild &&
+      ["queued", "retry_wait", "blocked"].includes(childLedgerStatus) &&
+      malformedReviewChildWithSettledDeliveries(controlledChild)) {
+    throw denied("A settled malformed external rereview child must be cancelled before authoritative replacement");
+  }
+  if (isExternalRereview(packet.context) && action.type === "cancel" && controlledChild?.status === "paused" &&
+      reviewChildResponsibility(controlledChild)) {
+    throw denied("Automatic rereview correction must preserve an intentionally paused Review child");
+  }
   if (action.type !== "decompose") return;
-  if (children.size !== 0) {
+  const reviewReplacement = verifiedReviewReplacement(packet, action, tasksById, children);
+  if (requiresReviewDelivery(packet.context, action) && !reviewReplacement &&
+      (packet.context.code?.reviewPublicationRecovery || [...children].some(taskId => {
+        const child = tasksById.get(taskId);
+        const visible = packet.context.requirements.coordination.directChildren.find(value => value.taskId === taskId);
+        return visible?.ledgerStatus === "blocked" && child.responsibility.type === "role" &&
+          child.responsibility.id === "pr-engineer" && hasRequiredReviewDeliverable(latestContract(child));
+      }))) throw denied("Blocked authoritative Review replacement requires an exact current host recovery candidate");
+  if (automaticMode && [...children].some((taskId) => {
+    const child = tasksById.get(taskId);
+    return child.status === "paused" && child.responsibility.type === "role" &&
+      (child.responsibility.id === capabilityRoles.get(action.capability) ||
+       (action.capability === "pr-review" && reviewChildResponsibility(child)));
+  })) {
+    throw denied("Automatic coordination must preserve an intentionally paused child");
+  }
+  const replaceCancelledConflict = !automaticMode && triage.nextAction === "resolve_conflict" &&
+    triage.suggestedCapability === "development" &&
+    [...children].every((taskId) => cancelledConflictChildWithoutDelivery(tasksById.get(taskId)));
+  if (!automaticMode && children.size !== 0 && !replaceCancelledConflict && !reviewReplacement && !(isExternalRereview(packet.context) &&
+      [...children].every((taskId) => cancelledMalformedReviewChild(tasksById.get(taskId))))) {
     throw denied("Structured PR triage permits only one direct child");
   }
-  if (action.capability !== triage.suggestedCapability) {
+  if (!automaticMode && action.capability !== triage.suggestedCapability) {
     throw denied("Structured PR triage capability does not match trusted intake");
   }
+  if (requiresReviewDelivery(packet.context, action) &&
+      !hasRequiredReviewDeliverable(action.acceptanceContract)) {
+    throw denied("External rereview requires a required authoritative Review delivery");
+  }
+  return reviewReplacement;
 }
 
 function hasVisibleSubmittedDelivery(packet, taskId, revision) {
@@ -615,10 +754,15 @@ function assertActionSource(action, graph, tasksById, bindingTask, children) {
   return source;
 }
 
-function roleForCapability(capabilityRoles, capability) {
+function specialistRoleForCapability(capabilityRoles, capability) {
   const targetRoleId = capabilityRoles.get(capability);
   if (!targetRoleId) {
     throw denied(`No trusted role is configured for capability ${capability}`);
+  }
+  // Root coordination has no specialist delivery path. Reject before creating
+  // or assigning a child whose required contract this role cannot fulfill.
+  if (targetRoleId === ORCHESTRATOR_ROLE_ID) {
+    throw denied("The root orchestrator cannot be assigned a specialist child contract");
   }
   return targetRoleId;
 }
@@ -1063,6 +1207,7 @@ function planDecomposition({
   children,
   tasksById,
   capabilityRoles,
+  reviewReplacement,
 }) {
   if (source.taskId !== rootId) {
     throw denied("Only the configured root task can be decomposed");
@@ -1110,7 +1255,7 @@ function planDecomposition({
       work: action.work,
       target: {
         type: "role",
-        id: roleForCapability(capabilityRoles, action.capability),
+        id: specialistRoleForCapability(capabilityRoles, action.capability),
       },
       dependsOnTaskIds: dependencyIds,
       acceptanceContract: action.acceptanceContract,
@@ -1120,6 +1265,7 @@ function planDecomposition({
         { taskId: source.taskId, revision: source.revision },
         ...action.dependsOn.map(({ taskId, revision }) => ({ taskId, revision })),
       ].sort((left, right) => compareText(left.taskId, right.taskId)),
+      ...(reviewReplacement ? { reviewReplacement } : {}),
     },
     recover: null,
     result: projectActionResult(action.type, rootId, source.taskId, {
@@ -1138,7 +1284,7 @@ function planAssignment({ action, source, rootId, children, capabilityRoles }) {
       taskId: source.taskId,
       target: {
         type: "role",
-        id: roleForCapability(capabilityRoles, action.capability),
+        id: specialistRoleForCapability(capabilityRoles, action.capability),
       },
       reason: action.reason,
       expectedGraphRevision: action.expectedGraphRevision,
@@ -1176,6 +1322,10 @@ async function planDeliveryDecision({
   const submitted = latestSubmitted(source, action.submittedDeliveryRevision);
   let verifiedEvidence = false;
   if (action.type === "accept_delivery") {
+    if (isExternalRereview(packet.context) && reviewChildResponsibility(source) &&
+        !hasRequiredReviewDeliverable(latestContract(source))) {
+      throw denied("External rereview cannot be accepted from a local report");
+    }
     const acceptedInputs = deriveAcceptedInputs(source, tasksById);
     const externalEvidence = nonReservedEvidence(submitted.evidence);
     parseWorkInputsEvidence(source, submitted.evidence, acceptedInputs);
@@ -1251,6 +1401,9 @@ function planTaskControl({ action, source, rootId }) {
       reason: action.reason,
       expectedGraphRevision: action.expectedGraphRevision,
       expectedTaskRevision: action.sourceTaskRevision,
+      ...(action.type === "pause" && action.waitForChildren === true
+        ? { waitForChildren: true }
+        : {}),
     },
     recover: null,
     result: projectActionResult(action.type, rootId, source.taskId),
@@ -1308,6 +1461,7 @@ export class OrchestratorService {
   #clock;
   #capabilityRoles;
   #admitAction;
+  #automaticMode;
 
   constructor({
     contextAssembler,
@@ -1322,6 +1476,7 @@ export class OrchestratorService {
     clock = () => new Date(),
     capabilityRoles = {},
     actionAdmissionGate,
+    automaticMode = false,
   } = {}) {
     this.#contextAssembler = requirePort(
       contextAssembler,
@@ -1352,6 +1507,7 @@ export class OrchestratorService {
     this.#clock = clock;
     this.#capabilityRoles = normalizeCapabilityRoles(capabilityRoles);
     this.#admitAction = actionAdmissionRun(actionAdmissionGate);
+    this.#automaticMode = automaticMode === true;
     Object.freeze(this);
   }
 
@@ -1408,6 +1564,7 @@ export class OrchestratorService {
     if (intent.type === "orchestrate") {
       return this.#executeOrchestration({
         worker,
+        item,
         packet,
         intent,
         graph,
@@ -1457,6 +1614,7 @@ export class OrchestratorService {
 
   async #executeOrchestration({
     worker,
+    item,
     packet,
     intent,
     graph,
@@ -1464,9 +1622,12 @@ export class OrchestratorService {
     bindingTask,
   }) {
     assertOrchestrator(worker, bindingTask);
+    if (!permitsReviewPublicationSettlementIntent(packet.context, intent)) {
+      throw denied("Historical Review settlement only permits accepting its exact published delivery");
+    }
     const children = directChildIds(packet);
     const action = intent.action;
-    assertStructuredPrTriageAction(packet, children, action);
+    const reviewReplacement = assertStructuredPrTriageAction(packet, children, action, tasksById, this.#automaticMode, this.#capabilityRoles);
     const source = assertActionSource(
       action,
       graph,
@@ -1475,6 +1636,13 @@ export class OrchestratorService {
       children,
     );
     const rootId = bindingTask.taskId;
+    const goalControl = coordinatorGoalControl({ rootTaskId: rootId, parentTaskId: bindingTask.parentTaskId,
+      event: item.value?.source?.current?.event ?? item.value?.event, source: item.value?.source ?? null,
+      childTaskIds: [...children] });
+    if (action.type === "cancel" && !["cancelled", "completed", "superseded"].includes(source.status) &&
+        !permitsCoordinatorCancellation(goalControl, source.taskId)) {
+      throw denied("The coordinator may replace child plans, but cannot cancel the owner's goal");
+    }
     const plan = await createOrchestrationPlan({
       action,
       source,
@@ -1485,6 +1653,7 @@ export class OrchestratorService {
       tasksById,
       summary: intent.summary,
       capabilityRoles: this.#capabilityRoles,
+      reviewReplacement,
       evidenceVerifier: this.#evidenceVerifier,
       evidenceVerificationTimeoutMs: this.#evidenceVerificationTimeoutMs,
       graphReader: this.#graphReader,

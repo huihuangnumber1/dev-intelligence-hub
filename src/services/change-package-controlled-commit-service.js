@@ -6,7 +6,8 @@ import {
   normalizeChangePackageControlledCommitRequest,
   sameChangePackageControlledCommitReceipt,
 } from "../domain/change-package-controlled-commit.js";
-import { normalizeChangePackageManifest } from "../domain/change-package-contract.js";
+import { normalizeChangePackageManifest, hasChangePackageChanges } from "../domain/change-package-contract.js";
+import { isHeadRepairExecutionSource } from "../domain/code-execution-source.js";
 import { digestValue } from "../domain/code-executor-contract.js";
 import {
   normalizeControlledCommitEvidence,
@@ -19,6 +20,10 @@ const STATE_KEY = CHANGE_PACKAGE_CONTROLLED_COMMIT_STATE_KEY;
 const MAX_DELIVERIES = 1_000;
 const EVIDENCE_ID = /^controlled-git-commit-[a-f0-9]{64}$/u;
 const STATUSES = new Set(["intent", "evidence", "committed"]);
+
+function isEmptyRepairPackage(request, manifest) {
+  return isHeadRepairExecutionSource(request.executionSource) && !hasChangePackageChanges(manifest);
+}
 
 export class ChangePackageControlledCommitServiceError extends Error {
   constructor(code, message, { cause } = {}) {
@@ -258,7 +263,7 @@ export class ChangePackageControlledCommitService {
     );
     this.#builder = requirePort(
       controlledCommitBuilder,
-      ["create", "find", "verify"],
+      ["create", "find", "verify", ...(typeof Object.getOwnPropertyDescriptor(controlledCommitBuilder, "readSealed")?.value === "function" ? ["readSealed"] : [])],
       "controlledCommitBuilder",
     );
     this.#store = requirePort(store, ["read", "write"], "store");
@@ -287,17 +292,34 @@ export class ChangePackageControlledCommitService {
           this.#ready = true;
           let committed = 0;
           let pending = 0;
+          const stalePreparationDeliveryIds = [];
+          const emptyChangeDeliveryIds = [];
           for (const original of [...this.#state.deliveries]) {
             const request = normalizeChangePackageControlledCommitRequest(
               original.request,
             );
             const manifest = await this.#loadManifest(request);
             const record = findRecord(this.#state, request.deliveryId);
-            const recovered = await this.#recoverRecord(
-              record,
-              request,
-              manifest,
-            );
+            // Empty repair packages cannot produce a controlled commit. Retain
+            // historical unexecuted intents without blocking unrelated startup.
+            if (record.status === "intent" && isEmptyRepairPackage(request, manifest)) {
+              emptyChangeDeliveryIds.push(request.deliveryId);
+              pending += 1;
+              continue;
+            }
+            let recovered;
+            try {
+              recovered = record.status === "committed" && this.#builder.readSealed
+                ? await this.#verifyCommitted(record, request, manifest, { localOnly: true })
+                : await this.#recoverRecord(record, request, manifest);
+            } catch (error) {
+              // Historical preparation drift is not current delivery authority.
+              // deliver() still verifies the record before returning a receipt.
+              if (error?.code !== "CONTROLLED_GIT_BOUNDARY_CHANGED") throw error;
+              stalePreparationDeliveryIds.push(request.deliveryId);
+              pending += 1;
+              continue;
+            }
             if (recovered.status === "committed") committed += 1;
             else pending += 1;
           }
@@ -305,6 +327,10 @@ export class ChangePackageControlledCommitService {
             deliveries: this.#state.deliveries.length,
             committed,
             pending,
+            ...(emptyChangeDeliveryIds.length > 0 ? { emptyChangeDeliveryIds: Object.freeze(emptyChangeDeliveryIds) } : {}),
+            ...(stalePreparationDeliveryIds.length > 0
+              ? { stalePreparationDeliveryIds: Object.freeze(stalePreparationDeliveryIds) }
+              : {}),
           });
         } catch (error) {
           this.#ready = false;
@@ -327,6 +353,9 @@ export class ChangePackageControlledCommitService {
     }
     return this.#run(async () => {
       const manifest = await this.#loadManifest(request);
+      if (isEmptyRepairPackage(request, manifest)) {
+        throw serviceError("CONTROLLED_COMMIT_DELIVERY_NO_CHANGES", "代码包没有实际变更，不能创建修复提交");
+      }
       let record = findRecord(this.#state, request.deliveryId);
       if (record !== null && !sameValue(record.request, requestProjection(request))) {
         throw serviceError(
@@ -431,11 +460,11 @@ export class ChangePackageControlledCommitService {
     });
   }
 
-  async #verifyCommitted(record, request, manifest) {
+  async #verifyCommitted(record, request, manifest, { localOnly = false } = {}) {
     const verified = this.#normalizeBoundEvidence(
       request,
       manifest,
-      await this.#builder.verify({ evidenceId: record.evidenceId }),
+      await (localOnly ? this.#builder.readSealed : this.#builder.verify)({ evidenceId: record.evidenceId }),
     );
     const expected = createChangePackageControlledCommitReceipt(
       requestProjection(request),

@@ -185,7 +185,7 @@ test("manager-authorized CLI restores a real backup and is idempotent", async (t
   assert.equal(await readFile(statePath, "utf8"), state.toString("utf8"));
   assert.deepEqual(
     JSON.parse(await readFile(executorStatePath, "utf8")),
-    { schemaVersion: 2, revision: 0, sessions: {} },
+    { schemaVersion: 3, revision: 0, sessions: {} },
   );
   assert.equal(await readFile(artifactPath, "utf8"), artifact.toString("utf8"));
 

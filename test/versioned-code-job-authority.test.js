@@ -11,10 +11,12 @@ import {
   normalizeCodeJobGrant,
 } from "../src/domain/code-job-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { normalizeBoundWorkProposal } from "../src/domain/work-proposal-contract.js";
 import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { ActionAdmissionGate } from "../src/lib/action-admission-gate.js";
+import { digestValue } from "../src/domain/code-executor-contract.js";
+import { normalizeBrainConfig } from "../src/services/brain-router.js";
 import { canonicalJsonDigest } from "../src/lib/canonical-json-digest.js";
 import {
   CodeJobGrantFactory,
@@ -331,7 +333,7 @@ function legacyGrant(configurations) {
   return createCodeJobGrant(legacyContent);
 }
 
-function proposal(config, { conflicts = null } = {}) {
+function proposal(config, { conflicts = null, operation = "modify" } = {}) {
   const event = normalizeWorkflowEvent({
     schemaVersion: 1,
     eventType: "pull_request.updated",
@@ -416,7 +418,7 @@ function proposal(config, { conflicts = null } = {}) {
     intent: {
       schemaVersion: 1,
       type: "propose_code_action",
-      operation: "modify",
+      operation,
       objective: "修复并发覆盖",
       acceptanceCriteria: ["回归测试通过"],
       evidence: ["revision 未校验"],
@@ -443,6 +445,45 @@ function acceptingInputAuthorityVerifier() {
   };
 }
 
+test("default-denied DingTalk keeps an old task binding verifiable, describable and quiescent without old config rows", async () => {
+  let fenced = false;
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide(_input, authorization) { await authorization.beforeGenerate(); return { action: { type: "complete" } }; },
+    describe(roleId) { return { model: roles[roleId].taskBrain.model }; },
+    async withEntityQuiescence({ roleId }, operation) {
+      assert.equal(roleId, "developer");
+      fenced = true;
+      return { executed: true, result: await operation() };
+    },
+  }) });
+  try {
+    const current = (await context.authority.create(proposal(context.startup))).grant;
+    const brain = structuredClone(normalizeBrainConfig(context.startup.employees.roles.developer.taskBrain));
+    assert.equal(brain.remoteData.dingtalk, false);
+    delete brain.remoteData.dingtalk;
+    const { grantDigest, ...fields } = current;
+    const historical = createCodeJobGrant({ ...fields, brainDigest: digestValue({
+      schemaVersion: 2, roleId: "developer", taskBrain: brain,
+      provider: context.startup.brainProviders[brain.provider],
+    }) });
+    assert.notEqual(current.brainDigest, historical.brainDigest);
+    assert.deepEqual(await context.authority.verify(historical), historical);
+    assert.deepEqual(await context.authority.verify(current), current);
+    assert.equal((await context.authority.describe("developer", historical.brainDigest)).model, brain.model);
+    assert.deepEqual(await context.authority.withEntityQuiescence({ roleId: "developer",
+      brainDigest: historical.brainDigest, entityKey: "github:pull_request:acme/repo#42" },
+    async () => { assert.equal(fenced, true); return "held"; }), { executed: true, result: "held" });
+    await context.authority.decide({ roleId: "developer" }, {
+      brainDigest: historical.brainDigest, beforeGenerate: () => context.authority.verify(historical),
+    });
+    const revoked = structuredClone(context.startup);
+    revoked.employees.roles.developer.taskBrain.remoteData.code = !brain.remoteData.code;
+    context.activate(revoked);
+    await assert.rejects(context.authority.verify(historical), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    await assert.rejects(context.authority.describe("developer", historical.brainDigest), { code: "INVALID_CODE_JOB_AUTHORITY" });
+  } finally { await context.authority.close(); }
+});
+
 function fixture({
   brainDirectoryFactory,
   actionAdmissionGate,
@@ -450,8 +491,10 @@ function fixture({
   inputAuthorityVerifier = acceptingInputAuthorityVerifier(),
   conflictPreparationVerifier,
   executorAuthorityValue = executorAuthority(),
+  runtimeFactory,
 } = {}) {
   const startup = configuration();
+  const runtime = runtimeFactory?.(startup);
   let current = active(startup);
   const versions = [current];
   let snapshotReads = 0;
@@ -472,7 +515,8 @@ function fixture({
         return { versions: structuredClone(versions) };
       },
     },
-    executorAuthority: executorAuthorityValue,
+    executorAuthority: runtime?.authority ?? executorAuthorityValue,
+    ...(runtime ? { inspectAuthorityForWritablePaths: runtime.inspectAuthorityForWritablePaths } : {}),
     startupConfiguration: startup,
     actionAdmissionGate: admissionGate,
     inputAuthorityVerifier,
@@ -492,6 +536,7 @@ function fixture({
       versions.push(current);
     },
     restart() {
+      const restartedRuntime = runtimeFactory?.(current.configuration);
       const restartGate = new ActionAdmissionGate();
       restartGate.bindEffective({
         version: current.version,
@@ -506,7 +551,8 @@ function fixture({
             return { versions: structuredClone(versions) };
           },
         },
-        executorAuthority: executorAuthorityValue,
+        executorAuthority: restartedRuntime?.authority ?? executorAuthorityValue,
+        ...(restartedRuntime ? { inspectAuthorityForWritablePaths: restartedRuntime.inspectAuthorityForWritablePaths } : {}),
         startupConfiguration: current.configuration,
         actionAdmissionGate: restartGate,
         inputAuthorityVerifier,
@@ -518,6 +564,115 @@ function fixture({
   };
 }
 
+function inspectRuntime(config) {
+  const workspace = executorAuthority().workspaces[0];
+  const writablePaths = config.codeExecutor.workspaces[0].writablePaths;
+  const boundary = { schemaVersion: 3, workspaceId: workspace.id, sourceRoot: "D:/fixture/repository",
+    capabilities: workspace.capabilities, gitSnapshot: { boundaryDigest: "a".repeat(64) },
+    excludePaths: workspace.excludePaths, requiredProfiles: workspace.requiredProfiles };
+  const authority = { workspaces: [{ ...workspace, writablePaths,
+    authorityDigest: digestValue({ ...boundary, writablePaths }) }] };
+  return { authority, inspectAuthorityForWritablePaths: ({ workspaceId, writablePaths: previous }) => {
+    assert.equal(workspaceId, workspace.id);
+    return { workspaces: [{ ...workspace, writablePaths: previous,
+      authorityDigest: digestValue({ ...boundary, writablePaths: previous }) }] };
+  } };
+}
+
+test("inspect checkpoints survive additive writable paths after a runtime restart without changing grants", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const inspect = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const modify = (await context.authority.create(proposal(context.startup))).grant;
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp", "docs/two.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try {
+    assert.deepEqual(await restarted.verify(inspect), inspect);
+    await assert.rejects(restarted.verify(modify), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    const fresh = (await restarted.create(proposal(added, { operation: "inspect" }))).grant;
+    assert.notEqual(fresh.workspaceAuthorityDigest, inspect.workspaceAuthorityDigest);
+    assert.deepEqual(await restarted.verify(fresh), fresh);
+  } finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect compatibility never resurrects paths removed and restored in configuration history", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const removed = structuredClone(context.startup);
+  removed.codeExecutor.workspaces[0].writablePaths = ["src"];
+  context.activate(removed);
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try { await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" }); }
+  finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect projection caches preserve epochs when earlier write lists changed ordering", async () => {
+  const context = fixture({ runtimeFactory: inspectRuntime });
+  const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+  const reordered = structuredClone(context.startup);
+  reordered.codeExecutor.workspaces[0].writablePaths.reverse();
+  context.activate(reordered);
+  context.activate(context.startup);
+  const added = structuredClone(context.startup);
+  added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+  context.activate(added);
+  const restarted = context.restart();
+  try { assert.deepEqual(await restarted.verify(grant), grant); }
+  finally { await restarted.close(); await context.authority.close(); }
+});
+
+test("inspect write extensions preserve all other authority and current input fences", async t => {
+  const cases = {
+    exclusions: config => { config.codeExecutor.workspaces[0].excludePaths.push("private"); },
+    source: config => { config.codeExecutor.workspaces[0].sourceRoot = "other"; },
+    profile: config => { config.codeExecutor.profiles["node-tests"].timeoutMs += 1000; },
+    role: config => { config.employees.roles.developer.enabled = false; },
+    policy: config => { config.workCoordination.policy.version++; },
+    repository: config => { config.workCoordination.policy.workspaceByRepository["acme/repo"] = "auxiliary"; },
+    model: config => { config.employees.roles.developer.taskBrain.model = "replacement"; },
+    provider: config => { config.brainProviders[config.employees.roles.developer.taskBrain.provider].baseUrl = "http://127.0.0.1:9999"; },
+    git: config => { config.codeExecutor.gitCommand = "C:\\Other\\ucrt64\\bin\\git.exe"; },
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    await t.test(name, async () => {
+      const context = fixture({ runtimeFactory: inspectRuntime });
+      const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+      const changed = structuredClone(context.startup);
+      change(changed);
+      context.activate(changed);
+      const restored = structuredClone(context.startup);
+      restored.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+      context.activate(restored);
+      const restarted = context.restart();
+      try { await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" }); }
+      finally { await restarted.close(); await context.authority.close(); }
+    });
+  }
+  await t.test("current source input", async () => {
+    let inputValid = true;
+    const context = fixture({ runtimeFactory: inspectRuntime, inputAuthorityVerifier: {
+      verify(binding) {
+        if (!inputValid) throw Object.assign(new Error("input changed"), { code: "INVALID_CODE_JOB_AUTHORITY" });
+        return structuredClone(binding);
+      },
+    } });
+    const grant = (await context.authority.create(proposal(context.startup, { operation: "inspect" }))).grant;
+    const added = structuredClone(context.startup);
+    added.codeExecutor.workspaces[0].writablePaths.push("docs/one.cpp");
+    context.activate(added);
+    const restarted = context.restart();
+    try {
+      assert.deepEqual(await restarted.verify(grant), grant);
+      inputValid = false;
+      await assert.rejects(restarted.verify(grant), { code: "INVALID_CODE_JOB_AUTHORITY" });
+    } finally { await restarted.close(); await context.authority.close(); }
+  });
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise((settle) => {
@@ -525,6 +680,137 @@ function deferred() {
   });
   return { promise, resolve };
 }
+
+test("code reading description follows the active and historically sealed brain", async () => {
+  const descriptions = [];
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide() {},
+    describe(roleId) {
+      descriptions.push(roles[roleId].taskBrain.model);
+      return { supportsCodeReading: roles[roleId].taskBrain.model !== "new-local-model",
+        model: roles[roleId].taskBrain.model };
+    },
+  }) });
+  const oldGrant = (await context.authority.create(proposal(context.startup))).grant;
+  assert.deepEqual(await context.authority.describe("developer", oldGrant.brainDigest), {
+    supportsCodeReading: true, model: context.startup.employees.roles.developer.taskBrain.model,
+  });
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.developer.taskBrain.model = "new-local-model";
+  context.activate(changed);
+  const newGrant = (await context.authority.create(proposal(changed))).grant;
+  assert.equal((await context.authority.describe("developer")).supportsCodeReading, false);
+  assert.equal((await context.authority.describe("developer", newGrant.brainDigest)).supportsCodeReading, false);
+  assert.equal((await context.authority.describe("developer", oldGrant.brainDigest)).supportsCodeReading, true);
+  assert.deepEqual(descriptions, [context.startup.employees.roles.developer.taskBrain.model,
+    "new-local-model", "new-local-model", context.startup.employees.roles.developer.taskBrain.model]);
+});
+
+test("obsolete execution quiescence follows the historically sealed brain without admitting stale code execution", async () => {
+  const calls = [];
+  const context = fixture({ brainDirectoryFactory: ({ roles }) => ({
+    async decide() { assert.fail('cleanup must never dispatch a model'); },
+    describe() { return { supportsCodeExecution: true }; },
+    async withEntityQuiescence(input, operation) {
+      calls.push({ model: roles.developer.taskBrain.model, ...input });
+      return { executed: true, result: await operation() };
+    },
+  }) });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+  const changed = structuredClone(context.startup);
+  changed.employees.roles.developer.taskBrain.model = 'new-model';
+  context.activate(changed);
+  const result = await context.authority.withEntityQuiescence({ roleId: 'developer', brainDigest: grant.brainDigest,
+    entityKey: 'github:pull_request:acme/repo#42' }, () => 'cleanup');
+  assert.deepEqual(result, { executed: true, result: 'cleanup' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, context.startup.employees.roles.developer.taskBrain.model);
+  assert.equal(calls[0].entityKey, 'github:pull_request:acme/repo#42');
+  await context.authority.close();
+});
+
+test("continuous cancellation signal passes through versioned admission without serialization", async () => {
+  let seen;
+  const context = fixture({ brainDirectoryFactory: () => ({
+    async decide(value, authorization) { seen = authorization.signal; await authorization.beforeGenerate(); return value; },
+  }) });
+  const grant = (await context.authority.create(proposal(context.startup))).grant;
+  const controller = new AbortController();
+  assert.deepEqual(await context.authority.decide({ roleId: "developer" }, {
+    beforeGenerate: async () => {}, brainDigest: grant.brainDigest, signal: controller.signal,
+  }), { roleId: "developer" });
+  assert.equal(seen, controller.signal);
+  await context.authority.close();
+});
+
+test("code reading description supports legacy directories without invoking describe accessors", async () => {
+  let getters = 0;
+  const context = fixture({ brainDirectoryFactory: () => ({
+    async decide() {},
+    get describe() { getters += 1; throw new Error("must not invoke getter"); },
+  }) });
+  assert.deepEqual(await context.authority.describe("developer"), { supportsCodeReading: false });
+  assert.equal(getters, 0);
+});
+
+test("code reading description rejects invalid or disabled authority before constructing a directory", async (t) => {
+  for (const mode of ["invalid role", "invalid digest", "disabled role", "executor changed", "closed"]) {
+    await t.test(mode, async () => {
+      let directories = 0;
+      const context = fixture({ brainDirectoryFactory: () => {
+        directories += 1;
+        return { async decide() {}, describe: () => ({ supportsCodeReading: true }) };
+      } });
+      const changed = structuredClone(context.startup);
+      if (mode === "disabled role") changed.employees.roles.developer.enabled = false;
+      if (mode === "executor changed") changed.codeExecutor.docker.executable = "changed";
+      if (["disabled role", "executor changed"].includes(mode)) context.activate(changed);
+      if (mode === "closed") await context.authority.close();
+      await assert.rejects(context.authority.describe(mode === "invalid role" ? "../developer" : "developer",
+        mode === "invalid digest" ? "not-a-digest" : undefined));
+      assert.equal(directories, 0);
+    });
+  }
+});
+
+test("code reading description checks role authority again after asynchronous description", async () => {
+  let context;
+  context = fixture({ brainDirectoryFactory: () => ({
+    async decide() {},
+    async describe() {
+      const changed = structuredClone(context.startup);
+      changed.employees.roles.developer.enabled = false;
+      context.activate(changed);
+      return { supportsCodeReading: true };
+    },
+  }) });
+  await assert.rejects(context.authority.describe("developer"), { code: "INVALID_CODE_JOB_AUTHORITY" });
+});
+
+test("review repair authority requires enablement and binds only its trusted Head mirror", async () => {
+  const context = fixture();
+  const enabled = structuredClone(context.startup);
+  enabled.githubActions.automaticOwnPrRepair = true;
+  context.activate(enabled);
+  const { contentDigest: _digest, ...ordinary } = proposal(context.startup);
+  const bound = normalizeBoundWorkProposal({ ...ordinary, binding: { ...ordinary.binding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding: ordinary.binding.inputBinding, writablePaths: ["src", "test"] }),
+  } });
+  const sealed = (await context.authority.create(bound)).grant;
+  assert.equal(sealed.executionSource.kind, "review_repair");
+  assert.deepEqual(await context.authority.verify(sealed), sealed);
+  const unrelated = structuredClone(enabled);
+  unrelated.codeExecutor.conflictPreparation.headMirrorsByRepository["contributor/other"] = "D:\\changed-unrelated.git";
+  context.activate(unrelated);
+  assert.deepEqual(await context.restart().verify(sealed), sealed);
+  const disabled = structuredClone(unrelated);
+  disabled.githubActions.automaticOwnPrRepair = false;
+  context.activate(disabled);
+  await assert.rejects(context.authority.create(bound));
+  await assert.rejects(context.restart().verify(sealed));
+  context.activate(unrelated);
+  await assert.rejects(context.restart().verify(sealed));
+});
 
 function activateHistory(context, targetVersion, change) {
   for (let version = 2; version <= targetVersion; version += 1) {

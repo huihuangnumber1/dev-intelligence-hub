@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { requiresBrainMaintenance } from "./brain-failure-recovery.js";
 
 const REQUEST_TYPES = new Set([
   "ask_user",
@@ -308,11 +309,13 @@ export function normalizeAttentionRequest(value) {
   const error = invalidRequest();
   assertAttentionAllowedKeys(
     value,
-    ["requestKey", "type", "producer", "question", "context", "choices"],
+    ["requestKey", "type", "producer", "question", "context", "choices", "recoveryCode"],
     ["requestKey", "type", "producer", "question"],
     error,
   );
   if (!REQUEST_TYPES.has(value.type)) throw error;
+  if (Object.hasOwn(value, "recoveryCode") && value.recoveryCode !== null &&
+      !requiresBrainMaintenance(value.recoveryCode)) throw error;
   const request = {
     requestKey: boundedAttentionText(value.requestKey, "requestKey", {
       maximumBytes: 128,
@@ -320,6 +323,7 @@ export function normalizeAttentionRequest(value) {
       error,
     }),
     type: value.type,
+    ...(Object.hasOwn(value, "recoveryCode") ? { recoveryCode: value.recoveryCode } : {}),
     producer: normalizeProducer(value.producer, error),
     question: boundedAttentionText(value.question, "question", {
       maximumBytes: 4_096,

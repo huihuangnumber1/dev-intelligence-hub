@@ -22,12 +22,15 @@ import {
 } from "../domain/code-execution-policy.js";
 import {
   codeExecutionSourceWritablePaths,
+  isHeadRepairExecutionSource,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
 } from "../domain/code-execution-source.js";
 import { sameConflictPreparationBinding } from "../domain/conflict-preparation-binding.js";
 import { normalizePullRequestExecutionBinding } from "../domain/pull-request-execution-binding.js";
 import { workspaceRevisionFromFileHashes } from "../domain/workspace-revision.js";
+import { throwIfPreparationAborted, isPreparationAbort, withoutPreparationCancellation } from "../lib/preparation-cancellation.js";
+import { gitSnapshotFailureDiagnostic } from "../adapters/git-object-snapshotter.js";
 
 const DEFAULT_LIMITS = Object.freeze({
   maxFiles: 5_000,
@@ -46,6 +49,7 @@ function sha256(value) {
 }
 
 function safeError(error, fallbackCode, fallbackMessage) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   return new CodeExecutionError(fallbackCode, fallbackMessage);
 }
@@ -73,7 +77,8 @@ function decodeText(value) {
     throw new CodeExecutionError("TEXT_REQUIRED", "只能读取或写入纯文本文件");
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(value);
+    // Keep a BOM in the content so UTF-8 round trips match the audited bytes.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(value);
   } catch {
     throw new CodeExecutionError("TEXT_REQUIRED", "只能读取或写入纯文本文件");
   }
@@ -368,6 +373,7 @@ function normalizeConflictMaterializationReceipt(
 }
 
 function conflictMaterializationFailure(error) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   const code = typeof error?.code === "string" &&
       error.code.startsWith("CONTROLLED_GIT_")
@@ -440,6 +446,7 @@ function normalizeGitSnapshotReceipt(value, { workspace, inputBinding, limits })
 }
 
 function gitSnapshotFailure(error) {
+  if (isPreparationAbort(error)) return error;
   if (error instanceof CodeExecutionError) return error;
   const limitCodes = new Set([
     "FILE_COUNT_LIMIT",
@@ -451,7 +458,8 @@ function gitSnapshotFailure(error) {
     : typeof error?.code === "string" && error.code.startsWith("GIT_")
       ? error.code
       : "GIT_HEAD_SNAPSHOT_FAILED";
-  return new CodeExecutionError(code, "无法从指定 Git Head 创建代码快照");
+  const diagnostic = gitSnapshotFailureDiagnostic(error);
+  return new CodeExecutionError(code, "无法从指定 Git Head 创建代码快照" + (diagnostic ? `；${diagnostic}` : ""));
 }
 
 export class CodeWorkspaceBroker {
@@ -572,6 +580,7 @@ export class CodeWorkspaceBroker {
   async createExecution(request) {
     return guarded(
       async () => {
+        throwIfPreparationAborted();
         const {
           workspaceId,
           executionId,
@@ -580,6 +589,11 @@ export class CodeWorkspaceBroker {
           hasExecutionSource,
         } = normalizeCreateExecutionRequest(request);
         const workspace = this.#workspace(workspaceId);
+        if (isHeadRepairExecutionSource(executionSource) &&
+            JSON.stringify(codeExecutionSourceWritablePaths(executionSource)) !==
+            JSON.stringify([...workspace.policy.writablePaths].sort((left, right) => left.localeCompare(right, "en")))) {
+          throw new CodeExecutionError("INVALID_EXECUTION_REQUEST", "Review repair 写范围与工作区配置不一致");
+        }
         validateExecutionId(executionId);
         const key = this.#executionKey(workspaceId, executionId);
         return this.#enqueueExecutionLifecycle(key, async () => {
@@ -619,7 +633,7 @@ export class CodeWorkspaceBroker {
           const baseline = new Map();
           const copyState = { fileCount: 0, totalBytes: 0 };
           try {
-            if (hasExecutionSource) {
+            if (hasExecutionSource && executionSource.kind === "conflict_preparation") {
               if (this.conflictMaterializer === null) {
                 throw new CodeExecutionError(
                   "CONFLICT_PREPARATION_MATERIALIZER_UNAVAILABLE",
@@ -727,7 +741,7 @@ export class CodeWorkspaceBroker {
             }
           } catch (error) {
             try {
-              await this.#discardExecutionDirectory(workspaceId, executionId);
+              await withoutPreparationCancellation(() => this.#discardExecutionDirectory(workspaceId, executionId));
             } catch (cleanupError) {
               const failure = new CodeExecutionError(
                 "EXECUTION_STORAGE_UNAVAILABLE",
@@ -749,7 +763,7 @@ export class CodeWorkspaceBroker {
             workspace,
             root: executionRoot,
             baseline,
-            exactWritablePaths: hasExecutionSource
+            exactWritablePaths: hasExecutionSource && executionSource.kind === "conflict_preparation"
               ? new Set(codeExecutionSourceWritablePaths(executionSource))
               : null,
             sourceRevision,
@@ -1268,8 +1282,10 @@ export class CodeWorkspaceBroker {
   }
 
   async #currentFileHashes(execution) {
+    throwIfPreparationAborted();
     const fileHashes = new Map();
     for (const relativePath of await this.#collectFiles(execution, "")) {
+      throwIfPreparationAborted();
       const file = await this.#readFileBuffer(execution, relativePath);
       fileHashes.set(relativePath, sha256(file.value));
     }
@@ -1340,9 +1356,11 @@ export class CodeWorkspaceBroker {
     let totalBytes = 0;
     let directoryCount = 0;
     const visit = async (directory, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directory, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const relativePath = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;
@@ -1449,9 +1467,11 @@ export class CodeWorkspaceBroker {
     let totalBytes = 0;
     let directoryCount = 0;
     const visit = async (directory, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directory, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const relativePath = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;
@@ -1529,6 +1549,7 @@ export class CodeWorkspaceBroker {
     baseline,
     copyState,
   }) {
+    throwIfPreparationAborted();
     const sourceStats = await lstat(sourceDirectory);
     if (sourceStats.isSymbolicLink()) {
       throw new CodeExecutionError("SYMLINK_REJECTED", "源工作区包含符号链接");
@@ -1540,6 +1561,7 @@ export class CodeWorkspaceBroker {
     const entries = await readdir(sourceDirectory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      throwIfPreparationAborted();
       const relativePath = relativeDirectory
         ? `${relativeDirectory}/${entry.name}`
         : entry.name;
@@ -1629,6 +1651,7 @@ export class CodeWorkspaceBroker {
   }
 
   async #collectFiles(execution, relativePath) {
+    throwIfPreparationAborted();
     const scope = await this.#inspect(execution, relativePath);
     if (scope.stats.isFile()) return [relativePath];
     if (!scope.stats.isDirectory()) {
@@ -1636,9 +1659,11 @@ export class CodeWorkspaceBroker {
     }
     const files = [];
     const visit = async (directoryPath, relativeDirectory) => {
+      throwIfPreparationAborted();
       const entries = await readdir(directoryPath, { withFileTypes: true });
       entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
+        throwIfPreparationAborted();
         const childRelative = relativeDirectory
           ? `${relativeDirectory}/${entry.name}`
           : entry.name;

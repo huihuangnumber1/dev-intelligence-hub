@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { ciRepairSource } from './support/ci-repair-fixture.js';
 
 import { createChangePackage } from "../src/domain/change-package-contract.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { digestValue } from "../src/domain/code-executor-contract.js";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
 import {
@@ -193,6 +194,44 @@ function hasControlledEvidenceError(error) {
 function mutableClone(value) {
   return structuredClone(value);
 }
+
+test("Windows controlled commit evidence preserves native test identity and binds its digest", () => {
+  const source = executionSource();
+  const profile = passedProfile("windows-tests", WORKSPACE_REVISION);
+  delete profile.imageId;
+  Object.assign(profile, { runtimeIdentity: { schemaVersion: 1, kind: "windows-process", executionId: "session-1-attempt-2", actionId: profile.actionId,
+    pid: 4567, processStartTimeUtcTicks: String(639013000000000000n), executableSha256: "d".repeat(64) }, assetVersion: 2, verificationKind: "test" });
+  const manifest = manifestFor(source, { passedProfiles: [profile] });
+  const evidence = createControlledCommitEvidence(evidenceInput({ source, manifest }));
+  assert.equal(evidence.schemaVersion, 2);
+  assert.deepEqual(normalizeControlledCommitEvidence(evidence), evidence);
+  assert.equal(evidence.tests.profiles[0].runtimeIdentity.pid, 4567);
+  assert.equal(Object.hasOwn(evidence.tests.profiles[0], "imageId"), false);
+  const tampered = mutableClone(evidence);
+  tampered.tests.profiles[0].runtimeIdentity.pid += 1;
+  assert.throws(() => normalizeControlledCommitEvidence(tampered), hasControlledEvidenceError);
+});
+
+for (const sourceKind of ['review_repair', 'ci_repair']) test(`${sourceKind} evidence binds actual changed files and one exact Head parent`, () => {
+  const binding = pullRequestBinding(gitTarget());
+  const source = sourceKind === 'ci_repair' ? ciRepairSource(binding, ['src', 'test'])
+    : createReviewRepairCodeExecutionSource({ inputBinding: binding, writablePaths: ["src", "test"] });
+  const manifest = manifestFor(source, { modified: [{ path: "src/value.js", beforeSha256: "1".repeat(64), content: Buffer.from("fixed\n") }] });
+  const finalTreeOid = oid("5");
+  const commit = commitFor({ source, manifest, finalTreeOid, overrides: { parents: [source.inputBinding.headRefOid] } });
+  const input = evidenceInput({ source, manifest, commit, resolution: { resolvedPaths: ["src/value.js"], finalTreeOid } });
+  const evidence = createControlledCommitEvidence(input);
+  assert.equal(evidence.executionSource.kind, sourceKind);
+  assert.equal(Object.hasOwn(evidence.resolution, "preparationId"), false);
+  assert.deepEqual(evidence.commit.parents, [source.inputBinding.headRefOid]);
+  assert.match(createControlledCommitMessage({ executionSource: source, manifest }), sourceKind === 'ci_repair' ? /controlled CI repair/ : /controlled review repair/);
+  assert.deepEqual(normalizeControlledCommitEvidence(evidence), evidence);
+  for (const changed of [
+    { ...input, commit: { ...commit, parents: [source.inputBinding.gitTarget.baseRefOid] } },
+    { ...input, commit: { ...commit, parents: [source.inputBinding.headRefOid, source.inputBinding.gitTarget.baseRefOid] } },
+    { ...input, resolution: { resolvedPaths: ["src/other.js"], finalTreeOid } },
+  ]) assert.throws(() => createControlledCommitEvidence(changed));
+});
 
 test("creates deterministic, detached, deeply frozen controlled commit evidence", () => {
   const input = evidenceInput();

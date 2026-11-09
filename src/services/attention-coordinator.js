@@ -36,6 +36,7 @@ export class AttentionCoordinator {
     const hasOptions = options !== undefined;
     const deferred = normalizeUnifiedDeferredOptions(options);
     let externalQueueRevision = 0;
+    let automaticReviews = {};
     if (this.#externalNext) {
       let external;
       if (hasOptions) {
@@ -46,6 +47,11 @@ export class AttentionCoordinator {
       externalQueueRevision = Number.isSafeInteger(external?.queueRevision)
         ? external.queueRevision
         : 0;
+      if (external?.automaticReviewEnabled === true) {
+        automaticReviews = { automaticReviewEnabled: true,
+          systemManagedCount: Number.isSafeInteger(external.systemManagedCount) && external.systemManagedCount >= 0
+            ? external.systemManagedCount : 0 };
+      }
       if (external?.item) {
         return structuredClone({
           available: true,
@@ -56,6 +62,7 @@ export class AttentionCoordinator {
           externalEnabled: true,
           externalQueueRevision,
           item: external.item,
+          ...automaticReviews,
         });
       }
     }
@@ -67,7 +74,7 @@ export class AttentionCoordinator {
         : await this.#internalNext();
     }
     if (!internal) {
-      return emptyProjection(externalQueueRevision, this.#externalEnabled);
+      return { ...emptyProjection(externalQueueRevision, this.#externalEnabled), ...automaticReviews };
     }
     return structuredClone({
       available: true,
@@ -76,6 +83,7 @@ export class AttentionCoordinator {
       externalEnabled: this.#externalEnabled,
       externalQueueRevision,
       item: internal,
+      ...automaticReviews,
     });
   }
 }

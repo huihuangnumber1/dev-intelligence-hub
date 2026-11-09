@@ -55,6 +55,8 @@ test("supports every PR and Issue workflow event plus trusted owner intake", () 
     ...expectedTypes,
     "owner_request.created",
     "pull_request.owner_requested",
+    "pull_request.internal_review_requested",
+    "pull_request.role_handoff",
     "issue.owner_requested",
   ]);
   for (const eventType of expectedTypes) {
@@ -80,6 +82,27 @@ test("PR and Issue events retain business fields that are also used by owner req
     const normalized = normalizeWorkflowEvent(event({ eventType, payload }));
     assert.deepEqual(normalized.payload, payload);
   }
+});
+
+test("internal repair review sources bind their server provenance and exact published Head", () => {
+  const headRefOid = "a".repeat(40);
+  const input = event({
+    eventType: "pull_request.internal_review_requested",
+    source: { provider: "internal-review-repair", scopeId: "internal-review:11111111-1111-4111-8111-111111111111" },
+    payload: {
+      state: "open", workType: "pull_request", headRefOid, gitTargetAvailable: true,
+      gitTarget: { schemaVersion: 1, provider: "github", sourceAccountId: "local-owner", baseRepository: "acme/command-center",
+        baseRefName: "main", baseRefOid: "b".repeat(40), headRepository: "acme/command-center", headRefName: "fix/repair", headRefOid },
+      internalReview: { kind: "own_pr_repair", headRefOid, feedbackDigest: "c".repeat(64),
+        publicationConfirmationId: "publication:1", controlledCommitEvidenceId: "controlled-commit:1" },
+    },
+  });
+  assert.equal(normalizeWorkflowEvent(input).payload.internalReview.headRefOid, headRefOid);
+  for (const forged of [
+    { ...input, source: { provider: "github", scopeId: "local-owner" } },
+    { ...input, eventType: "pull_request.updated" },
+    { ...input, payload: { ...input.payload, internalReview: { ...input.payload.internalReview, headRefOid: "d".repeat(40) } } },
+  ]) assertInvalid(() => normalizeWorkflowEvent(forged));
 });
 
 test("issue evidence digests must be canonical SHA-256 values", () => {

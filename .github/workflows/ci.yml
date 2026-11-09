@@ -72,6 +72,8 @@ jobs:
             'codex-login-credential-broker.test.js'
             'manage-mydashboard.integration.test.js'
             'windows-codex-credential-file.test.js'
+            'windows-fixed-test-runner.test.js'
+            'windows-test-launcher.test.js'
           )
           $portableTests = @(
             Get-Item 'test/00-u9-priority.mjs'
@@ -80,10 +82,23 @@ jobs:
           ) | Where-Object { $_.Name -notin $hostOnlyFiles } |
             Sort-Object FullName -Unique |
             ForEach-Object FullName
-          $env:MYDASHBOARD_SKIP_HOST_TESTS = 'true'
-          node --test --test-concurrency=2 --test-reporter=tap $portableTests
+          # Mixed suites retain their portable assertions. Only real host
+          # lifecycles stay with the configured-workstation npm test gate.
+          $hostOnlyNames = @(
+            '^default (?:non-versioned|versioned) Code Job owns one (?:real|lazy real) offline CLI lifecycle$'
+            '^real offline CLI teardown survives an injected post-start failure$'
+            '^real Windows asset, broker, journal and executor produce a restartable completed proof \('
+            '^gh-login production-shaped pipeline runs a controlled executable and recovers post-create failure$'
+            '^gh-login production factory constructs from sealed production ports$'
+            '^Windows production root creation binds parent ACL trust to its creation handle across ABA$'
+          )
+          $hostSkipPattern = $hostOnlyNames -join '|'
+          node --test --test-concurrency=2 --test-reporter=tap --test-skip-pattern $hostSkipPattern $portableTests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node --test --test-concurrency=1 --test-reporter=tap test/open-source-distribution.mjs
+          # The hosted command job cannot launch an independent Windows service.
+          # Keep payload installation/composition checks here; npm test also
+          # exercises the real manager lifecycle on the configured workstation.
+          node --test --test-concurrency=1 --test-reporter=tap --test-skip-pattern 'the clean payload starts, reports status, and stops through its trusted manager' test/open-source-distribution.mjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @"
           ### Host-level validation

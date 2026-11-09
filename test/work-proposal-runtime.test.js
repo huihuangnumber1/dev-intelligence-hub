@@ -185,6 +185,7 @@ test("runtime owns one guard and exposes only least-authority frozen ports", asy
     "getResult",
     "getResultForProposal",
     "listEvidenceCandidates",
+    "listReviewPublicationSources",
   ]);
   assert.equal(Object.isFrozen(runtime), true);
   assert.equal(Object.isFrozen(runtime.producer), true);

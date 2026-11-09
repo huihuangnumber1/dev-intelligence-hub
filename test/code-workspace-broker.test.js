@@ -15,8 +15,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createConflictPreparationBinding } from "../src/domain/conflict-preparation-binding.js";
-import { createConflictCodeExecutionSource } from "../src/domain/code-execution-source.js";
+import { createConflictCodeExecutionSource, createReviewRepairCodeExecutionSource } from "../src/domain/code-execution-source.js";
 import { CodeWorkspaceBroker } from "../src/services/code-workspace-broker.js";
+import { withPreparationCancellation, preparationSignal } from "../src/lib/preparation-cancellation.js";
 
 async function fixture(t, {
   files = { "src/app.js": "export const value = 1;\n" },
@@ -341,6 +342,58 @@ test("a sanitized copy supports bounded edits and reports changes without touchi
   await assert.rejects(access(path.join(sourceRoot, "docs", "notes.md")));
 });
 
+test("UTF-8 BOM reads preserve content bytes and hash through an unchanged write", async (t) => {
+  const original = Buffer.from("\ufeff// 采集上下文\r\nexport const value = 1;\r\n", "utf8");
+  const { broker, sourceRoot } = await fixture(t, {
+    files: { "src/app.js": original },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "bom-run",
+  });
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+
+  assert.equal(current.content, original.toString("utf8"));
+  assert.equal(Buffer.byteLength(current.content, "utf8"), current.bytes);
+  assert.equal(current.bytes, original.length);
+  assert.equal(current.sha256, createHash("sha256").update(original).digest("hex"));
+
+  const written = await broker.writeFile({
+    ...execution,
+    path: "src/app.js",
+    content: current.content,
+    expectedSha256: current.sha256,
+    expectedWorkspaceRevision: execution.workspaceRevision,
+  });
+  assert.equal(written.workspaceRevision, execution.workspaceRevision);
+  assert.deepEqual(
+    await readFile(path.join(await broker.getSandboxWorkspacePath(execution), "src", "app.js")),
+    original,
+  );
+  assert.deepEqual(await readFile(path.join(sourceRoot, "src", "app.js")), original);
+  const manifest = await broker.getChangeManifest(execution);
+  assert.deepEqual(manifest.modified, []);
+});
+
+test("text reads still reject malformed UTF-8 and NUL bytes after a BOM", async (t) => {
+  const { broker } = await fixture(t, {
+    files: {
+      "src/invalid.cpp": Buffer.from([0xef, 0xbb, 0xbf, 0xc3, 0x28]),
+      "src/binary.cpp": Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x00, 0x62]),
+    },
+  });
+  const execution = await broker.createExecution({
+    workspaceId: "dashboard",
+    executionId: "invalid-text-run",
+  });
+  for (const file of ["src/invalid.cpp", "src/binary.cpp"]) {
+    await assert.rejects(
+      broker.readFile({ ...execution, path: file }),
+      (error) => error.code === "TEXT_REQUIRED",
+    );
+  }
+});
+
 test("a PR-bound execution materializes only its sealed Git Head and echoes a detached binding", async (t) => {
   const boundaryDigest = "f".repeat(64);
   const snapshotter = fixedSnapshotter({
@@ -399,6 +452,27 @@ test("a PR-bound execution materializes only its sealed Git Head and echoes a de
       expectedGitExecutableGid: 0,
     },
   ]);
+});
+
+test("review repair snapshots the Head and permits configured descendants without conflict materialization", async (t) => {
+  const snapshotter = fixedSnapshotter({ "src/app.js": "original Head\n" });
+  let conflictCalls = 0;
+  const { broker, sourceRoot } = await fixture(t, { gitSnapshotter: snapshotter,
+    gitBoundaryDigest: "f".repeat(64), writablePaths: ["src", "test"],
+    conflictMaterializer: { materialize() { conflictCalls += 1; throw new Error("wrong port"); } },
+  });
+  const inputBinding = conflictExecutionSource().inputBinding;
+  const executionSource = createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src", "test"] });
+  const execution = await broker.createExecution({ workspaceId: "dashboard", executionId: "review-repair", inputBinding, executionSource });
+  assert.equal(snapshotter.calls.length, 1);
+  assert.equal(conflictCalls, 0);
+  const current = await broker.readFile({ ...execution, path: "src/app.js" });
+  await broker.writeFile({ ...execution, path: "src/app.js", content: "fixed Head\n", expectedSha256: current.sha256 });
+  await broker.writeFile({ ...execution, path: "test/review.test.js", content: "regression\n", expectedSha256: null });
+  assert.equal(await readFile(path.join(sourceRoot, "src", "app.js"), "utf8"), "export const value = 1;\n");
+  await assert.rejects(broker.createExecution({ workspaceId: "dashboard", executionId: "wrong-scope", inputBinding,
+    executionSource: createReviewRepairCodeExecutionSource({ inputBinding, writablePaths: ["src"] }) }),
+    (error) => error.code === "INVALID_EXECUTION_REQUEST");
 });
 
 test("a conflict execution uses only its bound materializer and exact-file write scope", async (t) => {
@@ -479,6 +553,32 @@ test("a conflict execution uses only its bound materializer and exact-file write
     (error) => error.code === "INVALID_EXECUTION_REQUEST",
   );
   assert.equal(materializer.calls.length, 1);
+});
+
+test("cancelled Git and sealed conflict preparation cleans the actual owned tree before rejecting", async t => {
+  for (const kind of ["head", "conflict", "uncertain-cleanup"]) await t.test(kind, async t => {
+    const controller = new AbortController(), source = conflictExecutionSource();
+    const materializer = kind === "head" ? fixedSnapshotter({ "src/app.js": "prepared\n" }) :
+      fixedConflictMaterializer({ "src/value.js": "prepared\n" });
+    const materialize = materializer.materialize.bind(materializer);
+    materializer.materialize = async request => { const receipt = await materialize(request); controller.abort(); return receipt; };
+    let cleanup = false;
+    const { broker, scratchRoot, sourceRoot } = await fixture(t, { files: { "src/original.js": "untouched\n" },
+      writablePaths: ["src"], ...(kind === "head" ? { gitSnapshotter: materializer, gitBoundaryDigest: "f".repeat(64) } : { conflictMaterializer: materializer }),
+      removeDirectory: async (...args) => {
+        cleanup = true;
+        assert.equal(preparationSignal(), null, "abort cannot cancel owned cleanup");
+        if (kind === "uncertain-cleanup") throw new Error("locked scratch file");
+        return rm(...args);
+      } });
+    await assert.rejects(withPreparationCancellation(controller.signal, () => broker.createExecution({ workspaceId: "dashboard", executionId: "aborted",
+      inputBinding: source.inputBinding, ...(kind === "head" ? {} : { executionSource: source }) })),
+      { code: kind === "uncertain-cleanup" ? "EXECUTION_STORAGE_UNAVAILABLE" : "CODE_PREPARATION_ABORTED" });
+    assert.equal(cleanup, true);
+    assert.equal(broker.executions.size, 0);
+    if (kind !== "uncertain-cleanup") await assert.rejects(access(path.join(scratchRoot, "dashboard", "aborted")), { code: "ENOENT" });
+    assert.equal(await readFile(path.join(sourceRoot, "src", "original.js"), "utf8"), "untouched\n");
+  });
 });
 
 test("conflict receipt evidence rejects same-size content replacement", async (t) => {

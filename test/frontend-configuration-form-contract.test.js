@@ -119,6 +119,57 @@ function machinePaths(markup, attribute) {
   );
 }
 
+test("Windows profile resources can be added when absent and edited as structured fields", () => {
+  const configuration = configurationWithCredentialReferences();
+  configuration.codeExecutor = {
+    enabled: true,
+    workspaces: [{ id: "dashboard", sourceRoot: "D:/workspace" }],
+    requiredProfilesByWorkspace: { dashboard: ["native"] },
+    profiles: { native: {
+      kind: "windows-test", nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "a".repeat(64), timeoutMs: 30_000,
+      asset: { schemaVersion: 1, title: "Native checks", description: "Native assertions", version: 1, source: "console.log('ok');" },
+    } },
+  };
+  const initial = createConfigurationFormState(configuration);
+  const markup = renderConfigurationSettingsSkeleton({ state: initial });
+  const path = ["codeExecutor", "profiles", "native", "resources"];
+  assert.equal(machinePaths(markup, "data-configuration-collection").some((value) => JSON.stringify(value) === JSON.stringify(path)), true);
+  assert.match(markup, /新增固定资源/u);
+  assert.equal(Object.hasOwn(configurationDocumentFromForm(initial).configuration.codeExecutor.profiles.native, "resources"), false);
+  const state = applyConfigurationStructureOperation(initial, {
+    operation: "add", path, value: { name: "fixture", sourcePath: "D:/fixtures", sha256: "c".repeat(64), kind: "directory" },
+  });
+  const edited = renderConfigurationSettingsSkeleton({ state });
+  for (const field of ["name", "sourcePath", "sha256", "kind"]) controlForPath(edited, [...path, 0, field]);
+  assert.match(selectForPath(edited, [...path, 0, "kind"]), /<option value="directory" selected>/u);
+  assert.equal(configurationDocumentFromForm(state).ok, true);
+
+  const containerConfiguration = configurationWithCredentialReferences();
+  containerConfiguration.codeExecutor.profiles = { container: { kind: "node-script", image: `node@sha256:${"e".repeat(64)}`, timeoutMs: 30_000, asset: configuration.codeExecutor.profiles.native.asset } };
+  containerConfiguration.codeExecutor.enabled = false;
+  delete containerConfiguration.codeExecutor.requiredProfilesByWorkspace;
+  const containerMarkup = renderConfigurationSettingsSkeleton({ state: createConfigurationFormState(containerConfiguration) });
+  assert.equal(machinePaths(containerMarkup, "data-configuration-collection").some((value) => value.at(-1) === "resources"), false);
+});
+
+test("own PR repair checkbox renders its scope with accessible help", () => {
+  const configuration = configurationWithCredentialReferences();
+  configuration.githubActions.automaticOwnPrRepair = false;
+  const markup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(configuration),
+  });
+  assert.match(markup, /自动修复我的 PR/u);
+  const ownRepairControl = [...markup.matchAll(/<input[^>]+>/g)]
+    .map(([control]) => control)
+    .find((control) => control.includes("data-configuration-field=") && control.includes("automaticOwnPrRepair"));
+  assert.ok(ownRepairControl);
+  assert.match(ownRepairControl, /type="checkbox"/);
+  assert.doesNotMatch(ownRepairControl, / checked/);
+  const helpId = ownRepairControl.match(/aria-describedby="([^"]+)"/)?.[1];
+  assert.ok(helpId);
+  assert.match(markup, new RegExp(`id="${helpId}"[^>]*>[^<]*无需逐项确认`));
+});
+
 function primitivePaths(value, path = [], result = []) {
   if (value === null || typeof value !== "object") {
     result.push(path);
@@ -333,12 +384,21 @@ test("CLI provider controls and templates render exact process limits", () => {
   assert.match(templateTimeout, / min="1000"/);
   assert.match(templateTimeout, / max="3600000"/);
 
-  assert.match(markup, /<option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option>/);
+  assert.match(markup, /<option value="codex-login" selected>Codex 受管登录（兼容）<\/option>/);
+  assert.match(markup, /<option value="codex-native-login">Codex 原生登录（会话由 CLI 保存）<\/option>/);
   assert.match(markup, /<option value="api-key">环境变量 API Key<\/option>/);
   assert.match(
     markup,
-    /data-configuration-template-field="\[&quot;brainProviders&quot;,&quot;codex-cli&quot;,&quot;credentialMode&quot;\]" data-configuration-edit-kind="text"><option value="codex-login" selected>Codex 当前登录（受管代理，推荐）<\/option><option value="api-key">环境变量 API Key<\/option>/,
+    /data-configuration-template-field="\[&quot;brainProviders&quot;,&quot;codex-cli&quot;,&quot;credentialMode&quot;\]" data-configuration-edit-kind="text"><option value="codex-login" selected>Codex 受管登录（兼容）<\/option><option value="codex-native-login">Codex 原生登录（会话由 CLI 保存）<\/option><option value="api-key">环境变量 API Key<\/option>/,
   );
+
+  const native = configurationWithCliProvider();
+  native.brainProviders["employee-cli"].credentialMode = "codex-native-login";
+  const nativeMarkup = renderConfigurationSettingsSkeleton({
+    state: createConfigurationFormState(native),
+  });
+  assert.match(nativeMarkup, /<option value="codex-native-login" selected>Codex 原生登录（会话由 CLI 保存）<\/option>/);
+  assert.match(nativeMarkup, /CODEX_HOME/);
 
   const legacy = configurationWithCliProvider();
   legacy.brainProviders["employee-cli"].credentialMode = undefined;

@@ -73,6 +73,18 @@ test("creates separately approved, fully displayed plans for every PR action", (
   );
 });
 
+test("review repair original-branch push accepts only its exact single-parent evidence", () => {
+  const binding = inputBinding();
+  const evidence = controlledCommitEvidence(binding, { reviewRepair: true });
+  const plan = planFor({ type: "push", controlledCommitEvidence: evidence }, { binding });
+  assert.deepEqual(plan.action.controlledCommitEvidence.commit.parents, [binding.headRefOid]);
+  assert.equal(plan.action.remote.refName, binding.gitTarget.headRefName);
+  assert.deepEqual(normalizePullRequestExternalActionEnvelope(executionEnvelope(plan)).action, plan.action);
+  assert.throws(() => planFor({ type: "push", controlledCommitEvidence: evidence }, {
+    binding: inputBinding({ inputRevision: binding.inputRevision + 1 }),
+  }));
+});
+
 test("generic Review keeps the existing work-proposal Review execution contract", () => {
   const binding = inputBinding();
   const generic = planFor({

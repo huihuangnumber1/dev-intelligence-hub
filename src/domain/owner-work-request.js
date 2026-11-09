@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { normalizeWorkflowEvent } from "./workflow-events.js";
+import { normalizeInternalReviewMetadata } from "./internal-repair-review.js";
 
 export const OWNER_WORK_REQUEST_EVENT_TYPE = "owner_request.created";
 export const OWNER_WORK_REQUEST_DEFAULT_RULE_ID =
@@ -79,6 +81,8 @@ const REQUEST_KEYS = Object.freeze([
   "acceptanceCriteria",
 ]);
 const PULL_REQUEST_KEYS = Object.freeze([...REQUEST_KEYS, "pullRequest"]);
+const INTERNAL_REVIEW_REQUEST_KEYS = Object.freeze([...PULL_REQUEST_KEYS, "internalReview"]);
+const INTERNAL_REVIEW_RULE_ID = "system-internal-repair-review-to-pr-engineer";
 const ISSUE_KEYS = Object.freeze([...REQUEST_KEYS, "issue"]);
 const PERSON_PULL_REQUEST_KEYS = Object.freeze([
   ...REQUEST_KEYS,
@@ -274,9 +278,10 @@ export function createPrTriageWorkRequest({
 
 export function normalizeOwnerWorkRequest(value) {
   const version = value?.schemaVersion;
-  exactKeys(
-    value,
-    version === 5
+  const hasReviewPurpose = value !== null && typeof value === "object" && Object.hasOwn(value, "reviewPurpose");
+  const requestKeys = version === 7
+      ? INTERNAL_REVIEW_REQUEST_KEYS
+      : version === 5
       ? ORCHESTRATED_PULL_REQUEST_KEYS
       : version === 6
       ? ISSUE_KEYS
@@ -284,11 +289,12 @@ export function normalizeOwnerWorkRequest(value) {
       ? PULL_REQUEST_KEYS
       : [3, 4].includes(version)
         ? PERSON_PULL_REQUEST_KEYS
-        : REQUEST_KEYS,
-    "所有者工作请求",
-  );
+        : REQUEST_KEYS;
+  exactKeys(value, [...requestKeys, ...(hasReviewPurpose ? ["reviewPurpose"] : [])], "所有者工作请求");
+  if (hasReviewPurpose &&
+      (![2, 4, 5].includes(version) || !["standard_current_pr_code_review/v1", "independent_review/v1"].includes(value.reviewPurpose))) throw invalid("Review purpose 无效");
   if (
-    ![1, 2, 3, 4, 5, 6].includes(version) ||
+    ![1, 2, 3, 4, 5, 6, 7].includes(version) ||
     typeof value.requestId !== "string" ||
     !REQUEST_ID.test(value.requestId) ||
     !OWNER_WORK_REQUEST_TYPES.includes(value.workType) ||
@@ -297,9 +303,9 @@ export function normalizeOwnerWorkRequest(value) {
     throw invalid();
   }
   if (
-    version === 2 && !["pull_request", "development"].includes(value.workType)
+    version === 2 && !["pull_request", "development", "testing"].includes(value.workType)
   ) {
-    throw invalid("PR Review 或开发分流必须提供结构化 PR 目标");
+    throw invalid("PR Review、开发或测试分流必须提供结构化 PR 目标");
   }
   if (version === 5 && value.workType !== "general") {
     throw invalid("主控 PR 请求必须使用 general 工作类型");
@@ -307,6 +313,7 @@ export function normalizeOwnerWorkRequest(value) {
   if (version === 6 && value.workType === "pull_request") {
     throw invalid("Issue 不能使用 PR Review 工作类型");
   }
+  if (version === 7 && value.workType !== "pull_request") throw invalid("内部复审必须使用 PR 工作类型");
   if (
     version === 5 &&
     (
@@ -347,8 +354,9 @@ export function normalizeOwnerWorkRequest(value) {
       MAX_DESCRIPTION_BYTES,
     ),
     acceptanceCriteria,
+    ...(Object.hasOwn(value, "reviewPurpose") ? { reviewPurpose: value.reviewPurpose } : {}),
   };
-  if ([2, 3, 4, 5].includes(version)) {
+  if ([2, 3, 4, 5, 7].includes(version)) {
     exactKeys(value.pullRequest, PULL_REQUEST_TARGET_KEYS, "pullRequest");
     const repository = value.pullRequest.repository;
     const match = typeof repository === "string"
@@ -370,6 +378,7 @@ export function normalizeOwnerWorkRequest(value) {
       number: value.pullRequest.number,
     };
   }
+  if (version === 7) normalized.internalReview = normalizeInternalReviewMetadata(value.internalReview);
   if (version === 6) {
     exactKeys(value.issue, PULL_REQUEST_TARGET_KEYS, "issue");
     const repository = value.issue.repository;
@@ -497,7 +506,7 @@ export function createOwnerPullRequestEvent(
   occurredAt,
 ) {
   const request = normalizeOwnerWorkRequest(requestValue);
-  if (![2, 3, 4, 5].includes(request.schemaVersion)) {
+  if (![2, 3, 4, 5, 7].includes(request.schemaVersion)) {
     throw invalid("PR 推进请求无效");
   }
   exactKeys(
@@ -515,17 +524,18 @@ export function createOwnerPullRequestEvent(
     resolved.gitTarget === null ||
     typeof resolved.gitTarget !== "object" ||
     (request.schemaVersion === 5 &&
-      resolved.gitTarget.headRefOid !== request.triage.expectedHeadRefOid)
+      resolved.gitTarget.headRefOid !== request.triage.expectedHeadRefOid) ||
+    (request.schemaVersion === 7 && resolved.gitTarget.headRefOid !== request.internalReview.headRefOid)
   ) {
     throw invalid("PR 解析结果与请求不一致");
   }
   return normalizeWorkflowEvent({
     schemaVersion: 1,
-    eventType: "pull_request.owner_requested",
+    eventType: request.schemaVersion === 7 ? "pull_request.internal_review_requested" : "pull_request.owner_requested",
     occurredAt,
     source: {
-      provider: "local-owner",
-      scopeId: `owner-request:${request.requestId}`,
+      provider: request.schemaVersion === 7 ? "internal-review-repair" : "local-owner",
+      scopeId: `${request.schemaVersion === 7 ? "internal-review" : "owner-request"}:${request.requestId}`,
     },
     subject: {
       id: `github:pr:${request.pullRequest.repository}#${request.pullRequest.number}`,
@@ -542,6 +552,8 @@ export function createOwnerPullRequestEvent(
       state: resolved.state,
       gitTargetAvailable: true,
       gitTarget: structuredClone(resolved.gitTarget),
+      ...(Object.hasOwn(request, "reviewPurpose") ? { reviewPurpose: request.reviewPurpose } : {}),
+      ...(request.schemaVersion === 7 ? { internalReview: structuredClone(request.internalReview) } : {}),
       ...(request.schemaVersion === 5
         ? {
             nextAction: request.triage.nextAction,
@@ -609,11 +621,16 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
       event.eventId === eventValue.eventId &&
       event.contentDigest === eventValue.contentDigest &&
       event.occurredAt === at &&
-      event.source.scopeId === `owner-request:${request.requestId}` &&
+      event.source.scopeId === `${request.schemaVersion === 7 ? "internal-review" : "owner-request"}:${request.requestId}` &&
+      (request.schemaVersion !== 7 || (event.eventType === "pull_request.internal_review_requested" &&
+        event.source.provider === "internal-review-repair" &&
+        isDeepStrictEqual(event.payload.internalReview, request.internalReview) &&
+        event.payload.headRefOid === request.internalReview.headRefOid)) &&
       event.subject.repository === request.pullRequest.repository &&
       event.subject.number === request.pullRequest.number &&
       event.payload.description === request.description &&
       event.payload.workType === request.workType &&
+      event.payload.reviewPurpose === request.reviewPurpose &&
       event.payload.priority === request.priority &&
       JSON.stringify(event.payload.acceptanceCriteria) ===
         JSON.stringify(request.acceptanceCriteria) &&
@@ -637,6 +654,7 @@ export function ownerWorkRequestEventMatches(requestValue, eventValue, at) {
 export function withOwnerWorkRequestDefaultRoute(definition) {
   const systemRuleIds = new Set([
     OWNER_WORK_REQUEST_DEFAULT_RULE_ID,
+    INTERNAL_REVIEW_RULE_ID,
     ...OWNER_PULL_REQUEST_CAPABILITY_ROUTES.map(({ ruleId }) => ruleId),
     ...OWNER_CAPABILITY_ROUTES.map(({ ruleId }) => ruleId),
   ]);
@@ -648,6 +666,11 @@ export function withOwnerWorkRequestDefaultRoute(definition) {
   return {
     ...definition,
     rules: [
+      { id: INTERNAL_REVIEW_RULE_ID, source: "root", enabled: true, priority: 10_000, fallback: false,
+        condition: { op: "all", conditions: [
+          { op: "equals", path: "eventType", value: "pull_request.internal_review_requested" },
+          { op: "equals", path: "source.provider", value: "internal-review-repair" },
+        ] }, targets: [{ type: "role", id: "pr-engineer" }], onMatch: "stop" },
       ...OWNER_CAPABILITY_ROUTES.map(({ ruleId, workType, roleId }) => ({
         id: ruleId,
         source: "root",

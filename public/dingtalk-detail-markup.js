@@ -21,7 +21,7 @@ export function dingtalkDetailMarkup(item) {
     .map((highlight) => `<li>${escapeHtml(highlight)}</li>`)
     .join("");
   const sourceMessages = (item.sourceMessages || [])
-    .slice(0, 12)
+    .slice(0, item.kind === "mail" ? undefined : 12)
     .map(messageMarkup)
     .join("");
   return `
@@ -29,6 +29,7 @@ export function dingtalkDetailMarkup(item) {
       <div class="dingtalk-digest-block">
         <h3>总结</h3>
         <p>${escapeHtml(item.summary || item.title)}</p>
+        ${item.bodyIncomplete ? "<p>部分邮件正文不完整，请在邮箱核对完整内容与附件。</p>" : ""}
       </div>
       ${highlights ? `<div class="dingtalk-digest-block"><h3>关键信息</h3><ul>${highlights}</ul></div>` : ""}
       <div class="dingtalk-digest-block dingtalk-action-required">

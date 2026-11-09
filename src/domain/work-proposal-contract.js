@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import { normalizeDeliveryEvidenceTarget } from "./delivery-evidence-contract.js";
 
+export const MAX_WORK_PROPOSAL_LEASE_DURATION_MS = 24 * 60 * 60 * 1_000;
+
 const INVALID_TEXT_CONTROL = /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const DANGEROUS_KEYS = new Set(["__proto__", "prototype", "constructor"]);
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
@@ -453,7 +455,7 @@ export function normalizeWorkProposalClaimRequest(value) {
     leaseDurationMs: safeWorkProposalInteger(
       fields.get("leaseDurationMs"),
       "leaseDurationMs",
-      { minimum: 1_000, maximum: 300_000, error },
+      { minimum: 1_000, maximum: MAX_WORK_PROPOSAL_LEASE_DURATION_MS, error },
     ),
     excludeProposalIds,
   };

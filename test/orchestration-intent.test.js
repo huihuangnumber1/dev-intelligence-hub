@@ -120,6 +120,7 @@ test("normalizes every bounded orchestration intent without trusted authority", 
       ],
     },
     common("pause"),
+    { ...common("pause"), waitForChildren: true },
     common("resume"),
     common("cancel"),
   ];
@@ -147,12 +148,15 @@ test("normalizes every bounded orchestration intent without trusted authority", 
     normalizeOrchestrationIntent(decomposeIntent()).dependsOn.map(({ taskId }) => taskId),
     ["work-item-design", "work-item-requirements"],
   );
-  assert.equal(ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.length, 8);
+  assert.equal(ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf.length, 9);
   assert.equal(
     ORCHESTRATION_INTENT_JSON_SCHEMA.oneOf[0].properties.reason.maxLength,
     1_024,
   );
   assert.equal(Object.isFrozen(ORCHESTRATION_INTENT_JSON_SCHEMA), true);
+  assertInvalid(() => normalizeOrchestrationIntent({
+    ...common("pause"), waitForChildren: false,
+  }));
 });
 
 test("orchestration digests are deterministic and detached from caller mutation", () => {

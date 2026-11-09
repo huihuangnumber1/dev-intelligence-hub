@@ -121,7 +121,7 @@ function changedConfiguration() {
   return changed;
 }
 
-function configurationWithReusableTest({ version = 1, source = "assert.ok(true);" } = {}) {
+function configurationWithReusableTest({ version = 1, source = "assert.ok(true);", kind = "node-script" } = {}) {
   const value = configuration();
   value.codeExecutor = {
     enabled: true,
@@ -132,8 +132,8 @@ function configurationWithReusableTest({ version = 1, source = "assert.ok(true);
     workspaces: [{ id: "dashboard", sourceRoot: "." }],
     profiles: {
       "reusable-smoke": {
-        kind: "node-script",
-        image: `node:22-alpine@sha256:${"a".repeat(64)}`,
+        kind,
+        ...(kind === "node-script" ? { image: `node:22-alpine@sha256:${"a".repeat(64)}` } : { nodeExecutable: "C:/Program Files/nodejs/node.exe", nodeSha256: "a".repeat(64) }),
         timeoutMs: 30_000,
         asset: {
           schemaVersion: 1,
@@ -925,12 +925,14 @@ test("activation is revision-bound, audited, projected, and idempotent", async (
 });
 
 test("script asset changes require a higher asset version on draft activation", async () => {
+  for (const kind of ["node-script", "windows-test", "windows-build"]) {
   const { configurations } = await readyStore();
   await configurations.importBootstrap({
-    configuration: configurationWithReusableTest(),
+    configuration: configurationWithReusableTest({ kind }),
     importedBy: "bootstrap-file",
   });
   const unchangedVersion = configurationWithReusableTest({
+    kind,
     source: "assert.equal(2 + 2, 4);",
   });
   const draft = await configurations.createDraft({
@@ -950,6 +952,7 @@ test("script asset changes require a higher asset version on draft activation", 
   );
 
   const bumped = configurationWithReusableTest({
+    kind,
     version: 2,
     source: "assert.equal(2 + 2, 4);",
   });
@@ -974,6 +977,7 @@ test("script asset changes require a higher asset version on draft activation", 
     activated.active.configuration.codeExecutor.profiles["reusable-smoke"].asset.version,
     2,
   );
+  }
 });
 
 test("a draft from an older Active baseline cannot be disguised as a new activation", async () => {

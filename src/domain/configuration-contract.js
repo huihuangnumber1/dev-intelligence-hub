@@ -1,4 +1,6 @@
 import nodePath from "node:path";
+import { isWindowsGitImplementationPath } from "../lib/windows-git-implementation.js";
+import { isWindowsTestProfile, normalizeWindowsTestProfile } from "./windows-test-profile.js";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -21,6 +23,7 @@ const MAX_ARRAY_ITEMS = 4_096;
 const MAX_OBJECT_FIELDS = 4_096;
 const INVALID_TEXT_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const SAFE_ID = /^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$/;
+const SAFE_PROFILE_ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SAFE_ROLE_ID = /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/;
 const SAFE_ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const SAFE_GITHUB_LOGIN =
@@ -36,12 +39,7 @@ const SECRET_VALUE =
 const URL_USERINFO = /:\/\/[^/@\s:]+:[^/@\s]+@/;
 
 function isTrustedWindowsGitImplementation(value) {
-  if (process.platform !== "win32") return true;
-  const normalized = value.replaceAll("\\", "/").toLowerCase();
-  return (
-    /^[a-z]:\//u.test(normalized) &&
-    /\/mingw(?:32|64)\/bin\/git\.exe$/u.test(normalized)
-  );
+  return process.platform !== "win32" || isWindowsGitImplementationPath(value);
 }
 
 const TOP_LEVEL_FIELDS = Object.freeze([
@@ -73,6 +71,8 @@ const LEGACY_BRAIN_FIELDS = Object.freeze([
   "numCtx",
   "contextTokens",
   "maxAssessmentsPerRefresh",
+  "primaryBrain",
+  "allowRemoteDingTalkSummary",
 ]);
 const PROVIDER_FIELDS = Object.freeze([
   "kind",
@@ -81,6 +81,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "protocol",
   "responseFormat",
   "credentialMode",
+  "maxConcurrentTurns",
   "timeoutMs",
   "maxResponseBytes",
   "maxRequestBytes",
@@ -88,7 +89,7 @@ const PROVIDER_FIELDS = Object.freeze([
   "remote",
 ]);
 const CLI_PROVIDER_KINDS = new Set(["codex-cli", "claude-cli"]);
-const CLI_CREDENTIAL_MODES = new Set(["api-key", "codex-login"]);
+const CLI_CREDENTIAL_MODES = new Set(["api-key", "codex-login", "codex-native-login"]);
 const SUPPORTED_PROVIDER_KINDS = new Set([
   "ollama",
   "openai-compatible",
@@ -469,7 +470,10 @@ function normalizeConflictPreparation(value) {
 
 function normalizeLegacyBrain(value, path, { partial = false } = {}) {
   const required = partial ? [] : ["enabled", "provider", "model", "baseUrl"];
-  const config = fields(value, path, LEGACY_BRAIN_FIELDS, required);
+  const allowedFields = path === "brain"
+    ? LEGACY_BRAIN_FIELDS
+    : LEGACY_BRAIN_FIELDS.filter((name) => !["primaryBrain", "allowRemoteDingTalkSummary"].includes(name));
+  const config = fields(value, path, allowedFields, required);
   const normalized = {
     ...optional(config, "enabled", (entry) => boolean(entry, `${path}.enabled`)),
     ...optional(config, "provider", (entry) => {
@@ -479,6 +483,10 @@ function normalizeLegacyBrain(value, path, { partial = false } = {}) {
     }),
     ...optional(config, "model", (entry) => text(entry, `${path}.model`, 256)),
     ...optional(config, "baseUrl", (entry) => endpoint(entry, `${path}.baseUrl`).value),
+    ...(path === "brain" ? {
+      ...optional(config, "primaryBrain", (entry) => normalizeAssignedBrain(entry, `${path}.primaryBrain`, { allowDingTalk: true })),
+      ...optional(config, "allowRemoteDingTalkSummary", (entry) => boolean(entry, `${path}.allowRemoteDingTalkSummary`)),
+    } : {}),
   };
   for (const name of [
     "timeoutMs",
@@ -496,14 +504,15 @@ function normalizeLegacyBrain(value, path, { partial = false } = {}) {
   return normalized;
 }
 
-function normalizeRemoteData(value, path) {
-  const config = fields(value, path, DATA_CLASSES, DATA_CLASSES);
+function normalizeRemoteData(value, path, { allowDingTalk = false } = {}) {
+  const classes = allowDingTalk ? [...DATA_CLASSES, "dingtalk"] : DATA_CLASSES;
+  const config = fields(value, path, classes, DATA_CLASSES);
   return Object.fromEntries(
-    DATA_CLASSES.map((name) => [name, boolean(config[name], `${path}.${name}`)]),
+    classes.filter((name) => Object.hasOwn(config, name)).map((name) => [name, boolean(config[name], `${path}.${name}`)]),
   );
 }
 
-function normalizeAssignedBrain(value, path) {
+function normalizeAssignedBrain(value, path, { allowDingTalk = false } = {}) {
   const config = fields(
     value,
     path,
@@ -520,7 +529,7 @@ function normalizeAssignedBrain(value, path) {
       }
       return effort;
     }),
-    remoteData: normalizeRemoteData(config.remoteData, `${path}.remoteData`),
+    remoteData: normalizeRemoteData(config.remoteData, `${path}.remoteData`, { allowDingTalk }),
   };
 }
 
@@ -546,6 +555,12 @@ function normalizeProvider(value, path, id) {
       throw invalid(path, "CLI 大脑字段组合无效");
     }
     const normalized = { kind, remote: true };
+    if (Object.hasOwn(config, "maxConcurrentTurns")) {
+      if (kind !== "codex-cli" || config.credentialMode !== "codex-native-login") {
+        throw invalid(`${path}.maxConcurrentTurns`, "并发容量仅用于原生 Codex 登录");
+      }
+      normalized.maxConcurrentTurns = integer(config.maxConcurrentTurns, `${path}.maxConcurrentTurns`, 1, 4);
+    }
     if (Object.hasOwn(config, "credentialMode")) {
       const credentialMode = text(config.credentialMode, `${path}.credentialMode`, 32);
       if (
@@ -571,6 +586,7 @@ function normalizeProvider(value, path, id) {
   if (Object.hasOwn(config, "credentialMode")) {
     throw invalid(`${path}.credentialMode`, "仅 CLI 大脑支持认证方式");
   }
+  if (Object.hasOwn(config, "maxConcurrentTurns")) throw invalid(`${path}.maxConcurrentTurns`, "并发容量仅用于原生 Codex 登录");
   if (!Object.hasOwn(config, "baseUrl")) {
     throw invalid(`${path}.baseUrl`, "缺少必需字段");
   }
@@ -731,6 +747,7 @@ function normalizePrReviewer(value, path) {
     "jobLimit",
     "allowRemoteCodeContext",
     "brain",
+    "primaryBrain",
   ];
   const config = fields(value, path, allowed, [
     "enabled",
@@ -782,6 +799,7 @@ function normalizePrReviewer(value, path) {
       `${path}.allowRemoteCodeContext`,
     ),
     brain: normalizeLegacyBrain(config.brain, `${path}.brain`, { partial: true }),
+    ...optional(config, "primaryBrain", (entry) => normalizeAssignedBrain(entry, `${path}.primaryBrain`)),
   };
 }
 
@@ -821,7 +839,7 @@ function normalizeCodeExecutor(value) {
   const enabled = boolean(config.enabled, `${path}.enabled`);
   if (
     enabled &&
-    ["docker", "workspaces", "profiles", "requiredProfilesByWorkspace"].some(
+    ["workspaces", "profiles", "requiredProfilesByWorkspace"].some(
       (name) => !Object.hasOwn(config, name),
     )
   ) {
@@ -935,7 +953,7 @@ function normalizeCodeExecutor(value) {
   ) {
     throw invalid(
       `${path}.gitCommand`,
-      "Windows Git 必须直接使用 mingw64/bin/git.exe 实现",
+      "Windows Git 必须直接使用 mingw64/bin/git.exe 或 ucrt64/bin/git.exe 实现",
     );
   }
   const profileIds = new Set();
@@ -944,8 +962,12 @@ function normalizeCodeExecutor(value) {
       config.profiles,
       `${path}.profiles`,
       (profile, profilePath, id) => {
-        safeId(id, profilePath);
+        text(id, profilePath, 64, { pattern: SAFE_PROFILE_ID });
         profileIds.add(id);
+        if (isWindowsTestProfile(profile)) {
+          try { return normalizeWindowsTestProfile(profile); }
+          catch { throw invalid(profilePath, "Windows 测试资产或执行文件绑定无效"); }
+        }
         const isScript = profile?.kind === "node-script";
         const item = fields(
           profile,
@@ -1006,6 +1028,9 @@ function normalizeCodeExecutor(value) {
       { maximum: 100 },
     );
     if (enabled && profileIds.size === 0) throw invalid(`${path}.profiles`);
+    if (enabled && Object.values(normalized.profiles).some((profile) => !isWindowsTestProfile(profile)) && !Object.hasOwn(normalized, "docker")) {
+      throw invalid(`${path}.docker`, "Docker profiles 缺少执行器边界配置");
+    }
   }
   if (Object.hasOwn(config, "requiredProfilesByWorkspace")) {
     normalized.requiredProfilesByWorkspace = namedMap(
@@ -1018,7 +1043,7 @@ function normalizeCodeExecutor(value) {
           profilesPath,
           100,
           (profileId, profilePath) => {
-            const id = safeId(profileId, profilePath);
+            const id = text(profileId, profilePath, 64, { pattern: SAFE_PROFILE_ID });
             if (!profileIds.has(id)) throw invalid(profilePath);
             return id;
           },
@@ -1102,6 +1127,9 @@ function normalizeGithubActions(value) {
     "networkEnv",
     "timeoutMs",
     "enabledActions",
+    "automaticReview",
+    "assignAfterAutomaticReview",
+    "automaticOwnPrRepair",
   ];
   const config = fields(value, path, allowed, ["enabled"]);
   const enabled = boolean(config.enabled, `${path}.enabled`);
@@ -1127,6 +1155,9 @@ function normalizeGithubActions(value) {
   }
   const normalized = {
     enabled,
+    ...optional(config, "automaticReview", (entry) => boolean(entry, `${path}.automaticReview`)),
+    ...optional(config, "assignAfterAutomaticReview", (entry) => boolean(entry, `${path}.assignAfterAutomaticReview`)),
+    ...optional(config, "automaticOwnPrRepair", (entry) => boolean(entry, `${path}.automaticOwnPrRepair`)),
     ...(Object.hasOwn(config, "credentialMode") ? { credentialMode } : {}),
     ...optional(config, "actorAccountId", (entry) =>
       text(entry, `${path}.actorAccountId`, 40, {
@@ -1460,11 +1491,14 @@ function normalizeDingTalk(value) {
   const config = fields(
     value,
     path,
-    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
+    ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun", "mailEnabled"],
     ["enabled", "selfUserId", "notifyMinimumScore", "maxNotificationsPerRun"],
   );
   return {
     enabled: boolean(config.enabled, `${path}.enabled`),
+    ...(Object.hasOwn(config, "mailEnabled")
+      ? { mailEnabled: boolean(config.mailEnabled, `${path}.mailEnabled`) }
+      : {}),
     selfUserId: text(config.selfUserId, `${path}.selfUserId`, 128),
     notifyMinimumScore: integer(
       config.notifyMinimumScore,
@@ -1519,8 +1553,14 @@ function normalizeGithubRead(value) {
 
 function assertProviderReferences(document) {
   const providers = new Set(Object.keys(document.brainProviders));
+  const nativeCapacities = new Set(Object.values(document.brainProviders)
+    .filter((provider) => provider.kind === "codex-cli" && provider.credentialMode === "codex-native-login")
+    .map((provider) => provider.maxConcurrentTurns ?? 1));
+  if (nativeCapacities.size > 1) throw invalid("brainProviders", "共享原生 Codex 登录的并发容量必须一致");
   const references = [
     ["brain.provider", document.brain.provider],
+    ...(document.brain.primaryBrain ? [["brain.primaryBrain.provider", document.brain.primaryBrain.provider]] : []),
+    ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain.provider", document.employees.prReviewer.primaryBrain.provider]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [
         `employees.roles.${id}.brain.provider`,
@@ -1544,6 +1584,8 @@ function assertProviderReferences(document) {
     if (!providers.has(provider)) throw invalid(path, "引用了未知 Provider");
   }
   const assignedBrains = [
+    ...(document.brain.primaryBrain ? [["brain.primaryBrain", document.brain.primaryBrain]] : []),
+    ...(document.employees.prReviewer.primaryBrain ? [["employees.prReviewer.primaryBrain", document.employees.prReviewer.primaryBrain]] : []),
     ...Object.entries(document.employees.roles).flatMap(([id, role]) => [
       [`employees.roles.${id}.brain`, role.brain],
       ...(role.taskBrain
@@ -1565,6 +1607,25 @@ function assertProviderReferences(document) {
         "仅 Codex CLI 岗位大脑支持推理档位",
       );
     }
+  }
+  const primary = document.employees.prReviewer.primaryBrain;
+  if (primary && (!document.employees.prReviewer.allowRemoteCodeContext ||
+      (document.brainProviders[primary.provider].remote &&
+        (primary.remoteData.code !== true || primary.remoteData.requirements !== true)))) {
+    throw invalid("employees.prReviewer.primaryBrain", "远程 PR 推进主模型需要显式授权需求和代码上下文");
+  }
+  const digestBrain = document.brain.primaryBrain;
+  if (document.brain.allowRemoteDingTalkSummary === true) {
+    if (!digestBrain || document.brainProviders[digestBrain.provider].remote !== true || digestBrain.remoteData.dingtalk !== true) {
+      throw invalid("brain.allowRemoteDingTalkSummary", "Luna 钉钉摘要必须显式授权钉钉数据范围");
+    }
+    if (digestBrain.remoteData.requirements || digestBrain.remoteData.code || digestBrain.remoteData.memory) {
+      throw invalid("brain.primaryBrain.remoteData", "钉钉摘要主模型只能访问钉钉数据");
+    }
+  } else if (digestBrain?.remoteData.dingtalk === true) {
+    throw invalid("brain.primaryBrain.remoteData.dingtalk", "远程钉钉摘要需要显式授权");
+  } else if (digestBrain) {
+    throw invalid("brain.allowRemoteDingTalkSummary", "配置钉钉摘要主模型时必须显式授权钉钉数据范围");
   }
 }
 
@@ -1768,6 +1829,12 @@ function setDirection(before, after) {
 
 function authorityDirection(change) {
   const { path, before, after } = change;
+  if (path === "brain.allowRemoteDingTalkSummary" || path === "brain.primaryBrain.remoteData.dingtalk") {
+    return { tightening: before === true && after !== true, expansion: before !== true && after === true };
+  }
+  if (path === "brain.primaryBrain") {
+    return { tightening: before !== undefined && after === undefined, expansion: before === undefined && after !== undefined };
+  }
   if (path === "githubRead") {
     const effectiveEnabled = (value, present) =>
       present ? value?.enabled === true : true;
@@ -1787,11 +1854,18 @@ function authorityDirection(change) {
     );
     return { tightening: direction.removed, expansion: direction.added };
   }
+  if (["githubActions.automaticReview", "githubActions.assignAfterAutomaticReview", "githubActions.automaticOwnPrRepair", "dingtalk.mailEnabled"].includes(path)) {
+    const effective = (value) => path.endsWith("assignAfterAutomaticReview") ? value !== false : value === true;
+    return { tightening: effective(before) && !effective(after), expansion: !effective(before) && effective(after) };
+  }
   if (path === "githubActions.credentialMode") {
     return {
       tightening: before !== after,
       expansion: before !== after,
     };
+  }
+  if (path.startsWith("brainProviders.") && path.endsWith(".maxConcurrentTurns")) {
+    return { tightening: (after ?? 1) < (before ?? 1), expansion: (after ?? 1) > (before ?? 1) };
   }
   const providerIdentity =
     path.startsWith("brainProviders.") &&
@@ -1810,7 +1884,7 @@ function authorityDirection(change) {
   }
   if (
     path === "brain.provider" ||
-    /\.(?:brain|localBrain|taskBrain)\.provider$/.test(path)
+    /\.(?:brain|localBrain|taskBrain|primaryBrain)\.provider$/.test(path)
   ) {
     return {
       tightening: before !== undefined && before !== after,
@@ -1821,7 +1895,7 @@ function authorityDirection(change) {
     const direction = setDirection(before, after);
     return { tightening: direction.removed, expansion: direction.added };
   }
-  if (/^employees\.roles\.[^.]+\.taskBrain$/.test(path)) {
+  if (/^employees\.roles\.[^.]+\.taskBrain$/.test(path) || path === "employees.prReviewer.primaryBrain") {
     return {
       tightening: before !== undefined && before !== after,
       expansion: after !== undefined && before !== after,
@@ -1892,6 +1966,7 @@ function authorityDirection(change) {
 
 function requiresInfrastructureRestart(path) {
   return (
+    path === "dingtalk.mailEnabled" ||
     path === "port" ||
     path === "githubLogin" ||
     (path === "githubRead" ||
@@ -1907,7 +1982,10 @@ function requiresInfrastructureRestart(path) {
     path.startsWith("githubActions.tokenEnv") ||
     path.startsWith("githubActions.ghCommand") ||
     path.startsWith("githubActions.networkEnv") ||
-    path === "githubActions.enabledActions"
+    path === "githubActions.enabledActions" ||
+    path === "githubActions.automaticReview" ||
+    path === "githubActions.assignAfterAutomaticReview" ||
+    path === "githubActions.automaticOwnPrRepair"
   );
 }
 

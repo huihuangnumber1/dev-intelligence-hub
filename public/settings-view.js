@@ -34,14 +34,24 @@ function issueIndex(issues) {
   return result;
 }
 
-function fieldAccessibility(path, issue, context) {
-  if (!issue) return { attributes: "", error: "" };
-  const id = `configuration-error-${pathDomId(path)}`;
-  const first = context.firstInvalidRendered ? "" : " data-configuration-first-invalid";
-  context.firstInvalidRendered = true;
+function fieldAccessibility(path, issue, context, help) {
+  const descriptionIds = [];
+  let invalid = "";
+  let error = "";
+  if (issue) {
+    const id = `configuration-error-${pathDomId(path)}`;
+    const first = context.firstInvalidRendered ? "" : " data-configuration-first-invalid";
+    context.firstInvalidRendered = true;
+    descriptionIds.push(id);
+    invalid = ` aria-invalid="true"${first}`;
+    error = `<span id="${escapeHtml(id)}" class="configuration-field-error">${escapeHtml(issue.message)}</span>`;
+  }
+  const helpId = `configuration-help-${pathDomId(path)}`;
+  if (help) descriptionIds.push(helpId);
   return {
-    attributes: ` aria-invalid="true" aria-describedby="${escapeHtml(id)}"${first}`,
-    error: `<span id="${escapeHtml(id)}" class="configuration-field-error">${escapeHtml(issue.message)}</span>`,
+    attributes: `${invalid}${descriptionIds.length > 0 ? ` aria-describedby="${escapeHtml(descriptionIds.join(" "))}"` : ""}`,
+    error,
+    help: help ? `<small id="${escapeHtml(helpId)}" class="configuration-help">${escapeHtml(help)}</small>` : "",
   };
 }
 
@@ -177,7 +187,7 @@ function renderField(path, value, context, { template = false } = {}) {
       return templateScalarControl(path, descriptor, value);
     }
     if (descriptor.control === "checkbox") {
-      return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="checkbox" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="boolean"${value ? " checked" : ""}></label>`;
+      return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="checkbox" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="boolean"${value ? " checked" : ""}>${descriptor.help ? `<small class="configuration-help">${escapeHtml(descriptor.help)}</small>` : ""}</label>`;
     }
     if (descriptor.control === "select") {
       const options = descriptor.options
@@ -201,7 +211,7 @@ function renderField(path, value, context, { template = false } = {}) {
     return `<label class="configuration-structured-field"><span>${escapeHtml(descriptor.label)}</span><input type="${type}" value="${escapeHtml(value ?? "")}" data-configuration-template-field="${templatePath}" data-configuration-edit-kind="${escapeHtml(editKind)}"${range}${readOnly}></label>`;
   }
   const issue = context.issues.get(pathText(path));
-  const accessibility = fieldAccessibility(path, issue, context);
+  const accessibility = fieldAccessibility(path, issue, context, descriptor.help);
   const environmentHelp =
     descriptor.control === "env-reference" && !issue
       ? ' aria-describedby="configuration-env-reference-help"'
@@ -216,6 +226,7 @@ function renderField(path, value, context, { template = false } = {}) {
     <span>${escapeHtml(descriptor.label)}</span>
     ${control}
     ${accessibility.error}
+    ${accessibility.help}
   </label>`;
 }
 
@@ -343,7 +354,10 @@ function optionalCollections(path, value, context) {
       (descriptor) =>
         descriptor.optional &&
         descriptor.pattern.length === path.length + 1 &&
-        descriptor.pattern.slice(0, -1).every((segment, index) => segment === `${path[index]}`) &&
+        descriptor.pattern.slice(0, -1).every((segment, index) =>
+          segment === `${path[index]}` || segment === "*" || (segment === "#" && /^\d+$/u.test(`${path[index]}`)),
+        ) &&
+        (!descriptor.profileKinds || descriptor.profileKinds.includes(value.kind)) &&
         !Object.hasOwn(value, descriptor.pattern.at(-1)),
     )
     .map((descriptor) => {

@@ -51,6 +51,9 @@ const GITHUB_ACTION_CONFIG_KEYS = new Set([
   "networkEnv",
   "timeoutMs",
   "enabledActions",
+  "automaticReview",
+  "assignAfterAutomaticReview",
+  "automaticOwnPrRepair",
 ]);
 const GITHUB_EXTERNAL_ACTIONS = new Set(
   Object.keys(PULL_REQUEST_EXTERNAL_CONFIRMATION_KINDS),
@@ -193,13 +196,15 @@ function normalizeEnabledConfig(config) {
   }
   const enabledActionsSource = dataProperty(githubActions, "enabledActions");
   const enabledActions = normalizeEnabledActions(enabledActionsSource);
+  const automaticOwnPrRepair = dataProperty(githubActions, "automaticOwnPrRepair");
+  if (automaticOwnPrRepair !== undefined && typeof automaticOwnPrRepair !== "boolean") throw invalidConfig("自动修复开关必须是布尔值");
 
   return Object.freeze({
     actorAccountId,
     ghCommand,
     credentialMode,
     ...(credentialMode === "token-env" ? { tokenEnv } : {}),
-    enabledActions,
+    enabledActions: Object.freeze([...new Set([...enabledActions, ...(automaticOwnPrRepair === true ? ["push"] : [])])]),
     reviewEnabled:
       enabledActionsSource === undefined || enabledActions.includes("review"),
     networkEnv: normalizeNetworkEnv(dataProperty(githubActions, "networkEnv")),
@@ -455,6 +460,9 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
       ghCommand: enabledConfig.ghCommand,
       credentialSource,
       networkEnv: enabledConfig.networkEnv,
+      ...(dataProperty(dependencies, "automaticReviewGuard") === undefined ? {} : {
+        automaticReviewGuard: assertPort(dataProperty(dependencies, "automaticReviewGuard"), ["verify"], "automaticReviewGuard"),
+      }),
       ...(inputAuthorityVerifier === null
         ? {}
         : { inputAuthorityVerifier }),
@@ -521,6 +529,10 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
   );
 
   try {
+    const coordination = dataProperty(config, "workCoordination");
+    const automaticReviewEnabled = enabledConfig?.reviewEnabled === true &&
+      isPlainRecord(coordination) && dataProperty(coordination, "enabled") === true &&
+      dataProperty(dataProperty(config, "githubActions"), "automaticReview") === true;
     const queueOptions = {
       store,
       executor,
@@ -541,6 +553,8 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
           ...MEMORY_PROJECTION_SOURCE_METHODS,
           ...RECOVERY_STATUS_READER_METHODS,
           ...REVIEW_HANDOFF_METHODS,
+          "readSettlement",
+          ...(automaticReviewEnabled ? ["nextForHuman"] : []),
         ]),
       ],
       "queue",
@@ -551,6 +565,7 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
     return Object.freeze({
       queue: Object.freeze({
         ...createQueueFacade(queue, USER_QUEUE_METHODS),
+        ...(automaticReviewEnabled ? { next: options => queue.nextForHuman(options) } : {}),
         historyReader,
       }),
       historyReader,
@@ -562,6 +577,11 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
                 ? githubExecutor.assignAssignee(input, options)
                 : actionAdmissionGate.run(() =>
                     githubExecutor.assignAssignee(input, options)),
+            ...(typeof githubExecutor.assignReviewOutcome === "function" ? {
+              assignReviewOutcome: (input, options) => actionAdmissionGate === null
+                ? githubExecutor.assignReviewOutcome(input, options)
+                : actionAdmissionGate.run(() => githubExecutor.assignReviewOutcome(input, options)),
+            } : {}),
           })
         : null,
       producerQueue: createQueueFacade(queue, PRODUCER_QUEUE_METHODS),
@@ -577,6 +597,10 @@ export async function createConfirmationRuntime(config, dependencies = {}) {
         queue,
         RECOVERY_STATUS_READER_METHODS,
       ),
+      confirmationSettlementReader: Object.freeze({
+        read: (input) => queue.readSettlement(input),
+        readMany: (input) => queue.readSettlements(input),
+      }),
       close,
     });
   } catch (error) {

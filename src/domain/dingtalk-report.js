@@ -84,7 +84,7 @@ function changedItems(items, previousBaseline) {
 }
 
 function itemLine(item) {
-  const label = item.kind === "todo"
+  const label = item.kind === "mail" ? "邮件" : item.kind === "todo"
     ? "待办"
     : item.kind === "mention"
       ? "@我"
@@ -92,7 +92,7 @@ function itemLine(item) {
         ? "公告"
         : "会话";
   const content = text(item.actionRequired || item.summary || item.title, 140);
-  return `- [${label}] ${content || "有一项新动态"}`;
+  return `- [${label}] ${content || "有一项新动态"}${item.bodyIncomplete ? "（正文不完整，请到邮箱核对）" : ""}`;
 }
 
 function titleFor(slot) {
@@ -167,6 +167,7 @@ export function createDingTalkReport(
       todos: todos.length,
       overdue: overdue.length,
       conversations: importantConversations.length,
+      mail: items.filter((item) => item.kind === "mail").length,
       changed: changed.length,
     }),
     baseline: Object.freeze(reportBaseline(items)),

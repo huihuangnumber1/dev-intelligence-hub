@@ -7,8 +7,14 @@ import {
 } from "./configuration-view-support.js";
 import {
   createConfirmationDialogOwnership,
+  createExternalConfirmationReconciler,
+  createInternalConfirmationReconciler,
   createSessionDeferredConfirmationStore,
 } from "./confirmation-dialog-support.js";
+import { postAttentionDuringFactRefresh } from "./attention-submission.js";
+import { internalAttentionDisplay } from "./internal-attention-display.js";
+import { maintenanceAttentionMarkup } from "./maintenance-attention.js";
+import { summarizeDashboardErrors } from "./status-error-summary.js";
 import { bindConfigurationFormController } from "./configuration-form-controller.js";
 import {
   configurationDocumentFromForm,
@@ -20,12 +26,13 @@ import {
   githubTargetUrl,
 } from "./github-target-link.js";
 import { githubItemDetailMarkup } from "./github-item-detail.js";
+import { issuePrDetailMarkup, issuePrSummary } from "./issue-pr-status.js";
 import { renderConfigurationSettingsSkeleton } from "./settings-view.js";
 import { renderSystemStatus } from "./system-status-view.js";
 import { announcementDetailMarkup } from "./announcement-markup.js";
 import { dingtalkDetailMarkup } from "./dingtalk-detail-markup.js";
 import {
-  manualWorkAssignmentMarkup,
+  bindManualWorkAssignment,
   createManualWorkAssignmentAttempts,
 } from "./manual-work-assignment.js";
 import {
@@ -39,6 +46,7 @@ import {
 } from "./review-handoff-routing.js";
 import { createWorkflowView } from "./workflow-view.js";
 import { createWorkView } from "./work-view.js";
+import { createTaskRunsView } from "./task-runs-view.js";
 import {
   createPrEmployeeRecoveryIntent,
   isPrEmployeeRecoveryIntentCurrent,
@@ -67,6 +75,9 @@ const configurationActivationActions = Object.freeze({
   }),
 });
 
+const lanReadOnly = location.hostname !== "127.0.0.1";
+const localViews = new Set(["signals", "memory", "configuration"]);
+if (lanReadOnly) document.body.classList.add("lan-read-only");
 const content = document.querySelector("#content");
 const refreshButton = document.querySelector("#refresh-button");
 const lastUpdated = document.querySelector("#last-updated");
@@ -82,6 +93,11 @@ const confirmationCloseButton = confirmationDialog.querySelector(
 );
 const confirmationDialogOwnership = createConfirmationDialogOwnership();
 const pageTitle = document.querySelector("#page-title");
+const taskRunsView = createTaskRunsView({
+  container: document.querySelector("#task-runs"),
+  dialog: document.querySelector("#task-run-dialog"),
+  embedded: true,
+});
 
 let dashboard = null;
 let employeeRoles = [];
@@ -90,6 +106,9 @@ let employeeRolesError = "";
 let employeeRolesRequestSequence = 0;
 let lastAppliedEmployeeRolesRequest = 0;
 let employeeRolesAbortController = null;
+let maintenanceAttention = { items: [], total: 0, loaded: false, error: "" };
+let maintenanceRequestSequence = 0;
+let maintenanceReadInFlight = null;
 const manualWorkAssignmentAttempts = createManualWorkAssignmentAttempts();
 let currentView = "overview";
 let itemIndex = new Map();
@@ -240,6 +259,7 @@ function attentionNextUrl() {
 }
 
 const viewTitles = {
+  workbench: "任务工作台",
   overview: "今天需要你推动什么",
   prs: "Pull Requests",
   issues: "分配给我的 Issues",
@@ -263,12 +283,14 @@ function isConfigurationBackedView(view = currentView) {
 }
 
 const workflowView = createWorkflowView({
+  requestIdFactory: lanReadOnly ? () => "lan-read-only" : undefined,
   onChange() {
     if (dashboard && currentView === "workflow") render();
   },
 });
 
 const workView = createWorkView({
+  requestIdFactory: lanReadOnly ? () => "lan-read-only" : undefined,
   onChange() {
     if (dashboard && currentView === "work") render();
   },
@@ -325,6 +347,7 @@ function kindLabel(item) {
     conversation: "CHAT",
     announcement: "NOTICE",
     message: "TODAY",
+    mail: "邮件",
   }[item.kind] || item.kind.toUpperCase();
 }
 
@@ -354,7 +377,7 @@ function employeeStateLabel(value) {
   return {
     disabled: "未启用",
     paused: "已暂停",
-    observing: "主动观察中",
+    observing: "已启用",
     working: "正在工作",
     waiting_user: "等待你确认",
     degraded: "部分能力异常",
@@ -427,6 +450,7 @@ function workItem(item) {
   const source = item.repo
     ? `${escapeHtml(item.repo)} #${item.number}`
     : escapeHtml(item.context || kindLabel(item));
+  const issueProgress = issuePrSummary(item);
   return `
     <button class="work-item" data-item-id="${escapeHtml(item.id)}">
       <span class="priority ${priorityClass}">${item.score ?? "—"}</span>
@@ -437,6 +461,7 @@ function workItem(item) {
           <span>${source}</span>
           <span>${relativeTime(item.updatedAt)}</span>
         </span>
+        ${issueProgress ? `<span class="item-progress">${escapeHtml(issueProgress.label)} · 关闭判断：${escapeHtml(issueProgress.closeAdvice)}</span>` : ""}
       </span>
       <span class="reason ${reasonClass}">${escapeHtml(reason)}</span>
     </button>`;
@@ -505,7 +530,9 @@ function metrics(counts) {
 
 function employeeJob(job) {
   jobIndex.set(job.id, job);
-  const summary = job.summary || job.triggerReason || job.error || "等待员工处理";
+  const summary = job.status === "superseded"
+    ? "历史快照：后续 PR 状态已替代这次判断"
+    : job.summary || job.triggerReason || job.error || "等待员工处理";
   return `
     <button class="employee-job" data-job-id="${escapeHtml(job.id)}">
       <span class="employee-job-main">
@@ -516,6 +543,14 @@ function employeeJob(job) {
     </button>`;
 }
 
+const historicalPrJobStatuses = new Set([
+  "published",
+  "accepted",
+  "rejected",
+  "dismissed",
+  "superseded",
+]);
+
 function employeePanel({ expanded = false } = {}) {
   const employee = dashboard.employee;
   if (!employee?.role) {
@@ -525,8 +560,14 @@ function employeePanel({ expanded = false } = {}) {
     </section>`;
   }
   const { role } = employee;
-  const activeJob = employee.jobs.find((job) => job.status === "running");
-  const recentJobs = expanded ? employee.jobs : employee.jobs.slice(0, 3);
+  const currentJobs = employee.jobs.filter(
+    (job) => !historicalPrJobStatuses.has(job.status),
+  );
+  const historicalJobs = employee.jobs.filter((job) =>
+    historicalPrJobStatuses.has(job.status),
+  );
+  const activeJob = currentJobs.find((job) => job.status === "running");
+  const recentJobs = expanded ? currentJobs : currentJobs.slice(0, 3);
   const brain = role.brain?.provider
     ? `${role.brain.provider} / ${role.brain.model || "默认模型"}${role.brain.remoteCodeContext ? " · 代码上下文将发送到远程服务" : ""}`
     : "未配置大脑";
@@ -560,8 +601,11 @@ function employeePanel({ expanded = false } = {}) {
       ${
         recentJobs.length
           ? `<div class="employee-jobs">${recentJobs.map(employeeJob).join("")}</div>`
-          : `<div class="empty">员工正在持续观察，尚未发现需要启动的新作业。</div>`
+          : `<div class="empty">当前没有需要推进的 PR 作业。</div>`
       }
+      ${expanded && historicalJobs.length
+        ? `<details class="employee-job-history"><summary>历史作业（${historicalJobs.length}）</summary><div class="employee-jobs">${historicalJobs.map(employeeJob).join("")}</div></details>`
+        : ""}
     </section>`;
 }
 
@@ -733,8 +777,11 @@ function confirmationPendingMarkup() {
     return '<div class="empty">正在读取下一项确认…</div>';
   }
   const [entry] = pendingConfirmations();
+  const managed = confirmationQueueState.systemManagedCount || 0;
+  const automaticStatus = managed > 0
+    ? `<p class="confirmation-note">系统正在自动处理 ${managed} 项 Review，无需你确认。进展可在岗位任务和确认历史查看。</p>` : "";
   if (!entry) {
-    return '<div class="empty">当前没有需要你处理的确认。</div>';
+    return automaticStatus || '<div class="empty">当前没有需要你处理的确认。</div>';
   }
   const item = entry.item || entry.job;
   const title = item.display?.title || item.title || "待确认事项";
@@ -755,7 +802,7 @@ function confirmationPendingMarkup() {
     : entry.kind === "review_draft"
       ? "接受或驳回只处理这份本地 Review 草稿，不会直接写入 GitHub；如果存在受控发布动作，它会作为另一项授权单独确认。"
     : "确认或驳回后，结果会进入下方“只读确认历史”；选择“稍后”仍保留在待确认队列。";
-  return `<article class="confirmation-pending-item">
+  return `${automaticStatus}<article class="confirmation-pending-item">
     <div class="confirmation-history-row-heading">
       <strong>${escapeHtml(title)}</strong>
       <span class="status-pill status-waiting_user">下一项</span>
@@ -786,6 +833,8 @@ function confirmationHistoryItemMarkup(item) {
       <span class="status-pill status-${escapeHtml(item.status)}">${escapeHtml(confirmationHistoryStatusLabel(item.status))}</span>
     </div>
     <p>${escapeHtml(item.summary || "")}</p>
+    ${item.automaticReview ? `<p><strong>自动 Review · ${escapeHtml({ APPROVE: "通过", REQUEST_CHANGES: "需修改", COMMENT: "评论" }[item.automaticReview.event] || "待核对")}</strong> · Head ${escapeHtml(item.automaticReview.headRefOid.slice(0, 8))} · <a href="${escapeHtml(item.automaticReview.url)}" target="_blank" rel="noreferrer">在 GitHub 查看</a></p>` : ""}
+    ${item.automaticOwnPrRepair ? `<p><strong>自动修复我的 PR · ${item.automaticOwnPrRepair.stage === "push" ? "更新原 PR" : "创建开发任务"}</strong></p>` : ""}
     <small>${escapeHtml(confirmationHistoryKindLabel(item.kind))} · ${escapeHtml(roleId)} · ${escapeHtml(workItemId)} · ${escapeHtml(relativeTime(item.updatedAt))}${item.retryable ? " · 可再次逐项确认" : ""}</small>
     ${item.diagnosticCode ? `<code class="confirmation-history-diagnostic">诊断：${escapeHtml(item.diagnosticCode)}</code>` : ""}
     ${item.ownerDecision?.type === "seal_unknown_and_forbid_replay" ? '<small class="confirmation-history-resolution">已承认结果未知并封存（禁止重放）</small>' : ""}
@@ -866,7 +915,7 @@ function confirmationCenterView() {
   return `<section class="section confirmation-center" aria-labelledby="confirmation-center-title">
     <div class="section-heading">
       <h2 id="confirmation-center-title">确认中心</h2>
-      <span>授权与咨询始终逐项处理</span>
+      <span>自动 Review 可在历史记录中追踪；其他授权与咨询逐项处理</span>
     </div>
     <div class="confirmation-center-grid">
       <section class="confirmation-center-panel" id="confirmation-pending-panel" aria-labelledby="confirmation-pending-title">
@@ -887,6 +936,7 @@ function confirmationCenterView() {
           <label for="confirmation-history-status">状态<select id="confirmation-history-status" name="status">${statusOptions}</select></label>
           <label for="confirmation-history-kind">类型<select id="confirmation-history-kind" name="kind">${kindOptions}</select></label>
           <label for="confirmation-history-role">岗位<select id="confirmation-history-role" name="roleId">${roleOptions}</select></label>
+          <label for="confirmation-history-automatic">记录<select id="confirmation-history-automatic" name="automatic"><option value="">全部记录</option><option value="true" ${confirmationHistoryFilters.automatic ? "selected" : ""}>自动 Review 记录</option></select></label>
           <button class="secondary-button" id="confirmation-history-apply" type="submit">应用筛选</button>
         </form>
         <p class="employee-error" id="confirmation-history-error" role="status" ${confirmationHistoryError ? "" : "hidden"}>${escapeHtml(confirmationHistoryError)}</p>
@@ -904,13 +954,13 @@ function reviewFlowMarkup() {
     ["1", "分配", "主控或你把 PR 交给 PR 工程师"],
     ["2", "审查", "PR 工程师读取当前 Head、改动和检查结果"],
     ["3", "形成建议", "生成 Approve、Request changes 或 Comment"],
-    ["4", "你确认发布", "未确认前不会写入 GitHub"],
+    ["4", "发布 Review", "开启自动 Review 后，近期 Assign 给你的 PR 自动发布；按自动分配开关执行后续交接"],
     ["5", "交接推进", "按结论交给测试、开发或 PR 岗位；最终由合并负责人决定"],
   ];
   return `<section class="section review-flow-section" aria-labelledby="review-flow-title">
     <div class="section-heading">
       <h2 id="review-flow-title">PR Review 工作方式</h2>
-      <span>Approve 不会自动发布，也不会自动合并</span>
+      <span>自动 Review 和后续分配可在配置中心关闭；记录在下方查看</span>
     </div>
     <ol class="review-flow">${steps.map(([number, title, detail]) => `<li><span>${number}</span><div><strong>${title}</strong><small>${detail}</small></div></li>`).join("")}</ol>
   </section>`;
@@ -930,6 +980,7 @@ function employeesView() {
       : '<div class="empty">尚未配置数字员工。</div>';
   return `${reviewFlowMarkup()}
     ${confirmationCenterView()}
+    ${maintenanceAttentionMarkup(maintenanceAttention)}
     <section class="section">
       <div class="section-heading"><h2>岗位编制</h2><span>${employeeRoles.length} ROLES · 每个岗位可独立配置大脑与权限</span></div>
       ${loadError}
@@ -1192,7 +1243,7 @@ function activeAutomationTestSource(profileId) {
     activeConfigurationDocument()?.codeExecutor?.profiles?.[profileId],
   );
   const asset = plainRecord(profile?.asset);
-  return profile?.kind === "node-script" && typeof asset?.source === "string"
+  return ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && typeof asset?.source === "string"
     ? asset.source
     : "";
 }
@@ -1218,10 +1269,10 @@ function automationTestsView() {
   const pendingAssets = Object.values(
     plainRecord(pendingConfiguration?.codeExecutor?.profiles) || {},
   ).filter(
-    (profile) => profile?.kind === "node-script" && plainRecord(profile.asset),
+    (profile) => ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && plainRecord(profile.asset),
   ).length;
   const assets = Object.entries(profiles)
-    .filter(([, profile]) => profile?.kind === "node-script" && plainRecord(profile.asset))
+    .filter(([, profile]) => ["node-script", "windows-test", "windows-build"].includes(profile?.kind) && plainRecord(profile.asset))
     .sort(([left], [right]) => left.localeCompare(right, "zh-CN"));
   const activeVersion = Number.isSafeInteger(runtimeVersion) ? runtimeVersion : null;
   const rows = assets.map(([profileId, profile]) => {
@@ -1234,19 +1285,27 @@ function automationTestsView() {
       .filter(([, workspaceId]) => workspaceIds.includes(workspaceId))
       .map(([repository]) => repository)
       .sort();
-    const automatic = activeVersion !== null && workspaceIds.length > 0;
+    const automatic = activeVersion !== null && executor.enabled === true && workspaceIds.length > 0;
+    const statusLabel = executor.enabled !== true
+      ? "执行器已关闭"
+      : activeVersion === null
+        ? "运行时未载入"
+        : automatic
+          ? "自动执行"
+          : "尚未绑定";
     return `<article class="automation-test-card">
       <header>
         <div>
           <p class="eyebrow">TEST ASSET / ${escapeHtml(profileId)}</p>
           <h2>${escapeHtml(asset.title)}</h2>
         </div>
-        <span class="status-pill ${automatic ? "status-active" : "status-waiting_user"}">${automatic ? "自动执行" : "尚未绑定"}</span>
+        <span class="status-pill ${automatic ? "status-active" : "status-waiting_user"}">${statusLabel}</span>
       </header>
       <p>${escapeHtml(asset.description)}</p>
       <dl>
         <div><dt>资产版本</dt><dd>v${escapeHtml(asset.version)}</dd></div>
-        <div><dt>运行镜像</dt><dd><code>${escapeHtml(profile.image)}</code></dd></div>
+        <div><dt>${profile.kind.startsWith("windows-") ? "Windows 运行程序" : "运行镜像"}</dt><dd><code>${escapeHtml(profile.nodeExecutable || profile.image)}</code></dd></div>
+        ${profile.kind === "windows-build" ? "<div><dt>验证类型</dt><dd>构建（不计为测试通过）</dd></div>" : ""}
         <div><dt>超时</dt><dd>${escapeHtml(profile.timeoutMs)} ms</dd></div>
         <div><dt>工作区</dt><dd>${workspaceIds.length ? workspaceIds.map(escapeHtml).join("、") : "未绑定"}</dd></div>
         <div><dt>自动复用仓库</dt><dd>${repositories.length ? repositories.map(escapeHtml).join("、") : "绑定工作区后生效"}</dd></div>
@@ -1262,7 +1321,7 @@ function automationTestsView() {
       <div>
         <p class="eyebrow">LOCAL / VERSIONED / REUSABLE</p>
         <h2>受控自动化测试资产</h2>
-        <p>脚本正文和版本随配置摘要封印。绑定工作区后，开发或测试岗位处理该仓库的每个代码任务时都会自动执行；脚本不能从模型返回值临时替换。</p>
+        <p>脚本正文和版本随配置摘要封印。执行器启用并绑定工作区后，开发或测试岗位处理该仓库的每个代码任务时都会自动执行；脚本不能从模型返回值临时替换。</p>
       </div>
       <button type="button" class="secondary-button" data-open-test-library-configuration>在配置中心管理</button>
     </div>
@@ -1638,6 +1697,7 @@ function configurationView() {
         <div><dt>当前草稿</dt><dd>${draftId ? `${escapeHtml(draftId)} · r${draftRevision ?? "?"}` : "尚未保存"}</dd></div>
         <div><dt>运行时</dt><dd>${escapeHtml(runtime.label)}</dd></div>
       </dl>
+      <p><a href="/jenkins.html">连接 Jenkins 构建日志</a>：让岗位自动读取失败检查的具体原因。</p>
       ${migrationError ? `<p class="configuration-migration-error"><strong>启动配置未导入：</strong>${escapeHtml(migrationError)}</p>` : ""}
     </section>
     ${editor}
@@ -1689,6 +1749,13 @@ function bindConfirmationHistoryView() {
 function render() {
   pageTitle.textContent = viewTitles[currentView];
   document.title = `${viewTitles[currentView]} · Development Intelligence Hub`;
+  document.querySelector('#task-runs').hidden = currentView !== 'workbench';
+  content.hidden = currentView === 'workbench';
+  if (currentView === 'workbench') return;
+  if (lanReadOnly && localViews.has(currentView)) {
+    content.innerHTML = '<div class="empty">此页面的详细内容仅在本机工作台可见。</div>';
+    return;
+  }
   if (!isConfigurationBackedView() && currentView !== "system" && !dashboard) {
     content.innerHTML = '<div class="empty">正在建立第一次数据快照。配置恢复不依赖该快照，可从“配置中心”继续。</div>';
     return;
@@ -1715,7 +1782,7 @@ function render() {
     versions: versionsView,
     signals: () =>
       dingtalkReportView() +
-      section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、公告、@我或待办。"),
+      section("钉钉今日重点", dashboard.groups.dingtalk, "今天没有重要消息、邮件、公告、@我或待办。"),
     employees: employeesView,
     memory: memoryView,
     workflow: () => workflowView.render(),
@@ -1754,6 +1821,13 @@ function render() {
   });
   content.querySelectorAll("[data-role-run]").forEach((button) => {
     button.addEventListener("click", handleRoleRun);
+  });
+  content.querySelector("[data-maintenance-reload]")?.addEventListener("click", () => void loadMaintenanceAttention());
+  content.querySelectorAll("[data-maintenance-attention]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = maintenanceAttention.items.find(({ requestId }) => requestId === button.dataset.maintenanceAttention);
+      if (item) showConfirmationEntry({ kind: "internal_request", item, key: `internal:${item.requestId}:${item.contentDigest}` }, 1);
+    });
   });
   content.querySelectorAll("[data-role-work]").forEach((button) => {
     button.addEventListener("click", handleRoleWork);
@@ -2493,6 +2567,11 @@ function detailRows(item) {
   };
   const relationLabels = {
     assigned: "分配给我",
+    mentioned: "明确 @我",
+    direct: "直接收件",
+    copied: "抄送给我",
+    followed: "订阅动态",
+    participated: "我参与的讨论",
     authored: "我创建的",
     review_requested: "等待我 Review",
   };
@@ -2567,6 +2646,8 @@ function listMarkup(items) {
 function showEmployeeJob(job) {
   if (!job) return;
   codeJobDetailFocusIntent = null;
+  const historical = historicalPrJobStatuses.has(job.status);
+  const summary = job.summary || job.triggerReason || job.error || "";
   const review = job.reviewBody
     ? `<section class="review-preview">
         <strong>${escapeHtml(reviewVerdictLabel(job.reviewVerdict))}</strong>
@@ -2606,7 +2687,8 @@ function showEmployeeJob(job) {
     <article class="detail employee-detail">
       <p class="eyebrow">PR EMPLOYEE / ${escapeHtml(jobStateLabel(job.status))}</p>
       <h2>${escapeHtml(job.repo)} #${job.number} · ${escapeHtml(job.title)}</h2>
-      <p>${escapeHtml(job.summary || job.triggerReason || job.error || "")}</p>
+      ${historical ? "<p>这是历史作业。以下判断和触发原因记录的是当时的 PR 状态，不代表当前仍需处理。</p>" : ""}
+      ${summary ? `<p>${historical ? "当时判断：" : ""}${escapeHtml(summary)}</p>` : ""}
       <h3>依据</h3>
       ${listMarkup(job.evidence)}
       <h3>建议步骤</h3>
@@ -2715,7 +2797,11 @@ function applyDashboard(
 }
 
 function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSequence) {
-  if (!nextState || sequence < lastAppliedConfirmationRequest) return false;
+  if (
+    !nextState ||
+    sequence < confirmationRequestSequence ||
+    sequence < lastAppliedConfirmationRequest
+  ) return false;
   lastAppliedConfirmationRequest = sequence;
   confirmationQueueState = {
     available: Boolean(nextState.available),
@@ -2724,14 +2810,24 @@ function applyConfirmationQueue(nextState, sequence = ++confirmationRequestSeque
     queueRevision:
       nextState.externalQueueRevision || nextState.queueRevision || 0,
     pendingCount: nextState.pendingCount || 0,
+    automaticReviewEnabled: nextState.automaticReviewEnabled === true,
+    systemManagedCount: nextState.systemManagedCount || 0,
     item: nextState.item || null,
   };
   confirmationQueueLoaded = true;
+  void reconcileActiveExternalConfirmation();
+  void reconcileActiveInternalConfirmation();
   return true;
 }
 
-function invalidateConfirmationQueueSnapshot() {
-  lastAppliedConfirmationRequest = ++confirmationRequestSequence;
+function invalidateConfirmationQueueSnapshot(
+  sequence = ++confirmationRequestSequence,
+) {
+  if (
+    sequence < confirmationRequestSequence ||
+    sequence < lastAppliedConfirmationRequest
+  ) return false;
+  lastAppliedConfirmationRequest = sequence;
   confirmationQueueLoaded = false;
   confirmationQueueState = {
     available: false,
@@ -2741,6 +2837,7 @@ function invalidateConfirmationQueueSnapshot() {
     pendingCount: 0,
     item: null,
   };
+  return true;
 }
 
 async function handleEmployeeControl(event) {
@@ -2794,6 +2891,7 @@ async function handleEmployeeRun(event) {
 }
 
 async function loadEmployeeRoles() {
+  if (currentView === "employees") void loadMaintenanceAttention();
   const sequence = ++employeeRolesRequestSequence;
   employeeRolesAbortController?.abort();
   const controller = new AbortController();
@@ -2835,6 +2933,39 @@ async function loadEmployeeRoles() {
       employeeRolesAbortController = null;
     }
   }
+}
+
+function loadMaintenanceAttention({ afterCurrent = false } = {}) {
+  if (maintenanceReadInFlight) {
+    return afterCurrent
+      ? maintenanceReadInFlight.then(() => loadMaintenanceAttention())
+      : maintenanceReadInFlight;
+  }
+  const tracked = readMaintenanceAttention().finally(() => {
+    if (maintenanceReadInFlight === tracked) maintenanceReadInFlight = null;
+  });
+  maintenanceReadInFlight = tracked;
+  return tracked;
+}
+
+async function readMaintenanceAttention() {
+  const sequence = ++maintenanceRequestSequence;
+  try {
+    const response = await fetch("/api/attention/maintenance", { cache: "no-store", signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`读取系统故障失败（${response.status}）`);
+    const payload = await response.json();
+    if (!Array.isArray(payload.items) || !Number.isSafeInteger(payload.total) || payload.total < payload.items.length) {
+      throw new Error("系统故障列表格式无效");
+    }
+    if (sequence !== maintenanceRequestSequence) return;
+    const next = { items: payload.items, total: payload.total, loaded: true, error: "" };
+    if (JSON.stringify(next) === JSON.stringify(maintenanceAttention)) return;
+    maintenanceAttention = next;
+  } catch (error) {
+    if (sequence !== maintenanceRequestSequence) return;
+    maintenanceAttention = { ...maintenanceAttention, loaded: true, error: error.message || "读取系统故障失败" };
+  }
+  if (dashboard && currentView === "employees") render();
 }
 
 async function handleRoleControl(event) {
@@ -2993,6 +3124,7 @@ function normalizedConfirmationHistoryFilters(filters = {}) {
     status: allowedStatuses.has(status) ? status : "",
     kind: allowedKinds.has(kind) ? kind : "",
     roleId: validConfirmationHistoryRoleId(roleId) ? roleId : "",
+    ...(filters.automatic === true || filters.automatic === "true" ? { automatic: "true" } : {}),
   };
 }
 
@@ -3012,7 +3144,7 @@ function confirmationHistoryFiltersFromForm(form) {
 }
 
 function sameConfirmationHistoryFilters(left, right) {
-  return ["status", "kind", "roleId"].every(
+  return ["status", "kind", "roleId", "automatic"].every(
     (key) => left[key] === right[key],
   );
 }
@@ -3065,6 +3197,16 @@ function normalizedConfirmationHistoryItems(value) {
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
       retryable: item.retryable === true,
+      ...(["push", "code_task"].includes(item.automaticOwnPrRepair?.stage)
+        ? { automaticOwnPrRepair: { stage: item.automaticOwnPrRepair.stage } } : {}),
+      ...(item.automaticReview && ["APPROVE", "REQUEST_CHANGES", "COMMENT"].includes(item.automaticReview.event) &&
+        /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(item.automaticReview.headRefOid || "") &&
+        /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+#[1-9]\d*$/.test(item.automaticReview.resourceId || "")
+        ? { automaticReview: { event: item.automaticReview.event, headRefOid: item.automaticReview.headRefOid,
+            url: (() => {
+              const prUrl = `https://github.com/${item.automaticReview.resourceId.replace("#", "/pull/")}`;
+              return typeof item.automaticReview.publishedUrl === "string" && item.automaticReview.publishedUrl.startsWith(`${prUrl}#pullrequestreview-`) && /^\d+$/.test(item.automaticReview.publishedUrl.slice(`${prUrl}#pullrequestreview-`.length)) ? item.automaticReview.publishedUrl : prUrl;
+            })() } } : {}),
       ...(reviewHandoff ? { reviewHandoff } : {}),
       ...(typeof item.diagnosticCode === "string" &&
           /^[A-Z][A-Z0-9_]{2,63}$/.test(item.diagnosticCode)
@@ -3096,6 +3238,8 @@ function updateConfirmationHistoryView({ syncFilters = false } = {}) {
   const role = form?.querySelector("#confirmation-history-role");
   if (syncFilters && status) status.value = confirmationHistoryFilters.status;
   if (syncFilters && kind) kind.value = confirmationHistoryFilters.kind;
+  const automatic = form?.querySelector("#confirmation-history-automatic");
+  if (syncFilters && automatic) automatic.value = confirmationHistoryFilters.automatic || "";
   if (role) {
     const options = confirmationHistoryRoleOptionsMarkup();
     if (role.innerHTML !== options) role.innerHTML = options;
@@ -3448,55 +3592,17 @@ function showDetail(item) {
       ${dingtalkDetailMarkup(item)}
       ${prLifecycleStatusMarkup(item)}
       ${brainAssessment(item)}
+      ${issuePrDetailMarkup(item)}
       ${githubItemDetailMarkup(item)}
       <dl class="detail-grid">${detailRows(item)}</dl>
       ${item.url ? `<a class="detail-source-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">${["issue", "pull_request"].includes(item.kind) ? "在 GitHub 查看完整内容" : "在来源中打开"} →</a>` : ""}
-      ${manualWorkAssignmentMarkup(item)}
+      ${["pull_request", "issue"].includes(item.kind) ? '<div data-manual-work-assignment-container></div>' : ""}
     </article>`;
-  const assignmentForm = dialogContent.querySelector("[data-manual-work-assignment]");
-  assignmentForm?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    const button = form.querySelector("button[type=submit]");
-    if (button.disabled) return;
-    const status = form.querySelector("[data-manual-work-assignment-status]");
-    const data = new FormData(form);
-    button.disabled = true;
-    status.textContent = "正在创建共享任务…";
-    let request;
-    try {
-      request = manualWorkAssignmentAttempts.requestFor(item, {
-        workType: String(data.get("workType") || ""),
-        priority: String(data.get("priority") || ""),
-      });
-      const response = await fetch("/api/work/requests", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-mydashboard-action": "1",
-        },
-        body: JSON.stringify(request),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(result.error || `分配失败（${response.status}）`);
-      }
-      manualWorkAssignmentAttempts.complete(request.requestId);
-      form.closest(".manual-work-assignment").outerHTML =
-        manualWorkAssignmentMarkup(item, {
-          requestId: result.requestId,
-          workItemId: result.workItemId,
-          target: result.assignment?.target?.id,
-        });
-    } catch (error) {
-      status.textContent = `${error.message || "分配失败"}${request
-        ? ` 本页重试会继续原请求（${request.requestId}）。`
-        : ""}`;
-      if (request) button.textContent = "重试原请求";
-      button.disabled = false;
-    }
-  });
   dialog.showModal();
+  return bindManualWorkAssignment(
+    dialogContent.querySelector("[data-manual-work-assignment-container]"), item,
+    { fetchImpl: fetch, attempts: manualWorkAssignmentAttempts },
+  );
 }
 
 function codeJobActionFocusIntent(element) {
@@ -3657,6 +3763,58 @@ function closeExternalConfirmation(owner) {
   activeExternalConfirmation = null;
   return true;
 }
+
+const reconcileActiveExternalConfirmation = createExternalConfirmationReconciler({
+  getCurrent() {
+    const owner = confirmationDialogOwnership.current();
+    if (!confirmationDialog.open || !activeExternalConfirmation || owner === null) return null;
+    return { owner, key: activeConfirmationKey, item: activeExternalConfirmation,
+      requestSequence: lastAppliedConfirmationRequest,
+      submitting: confirmationDialogOwnership.ownsSubmission(owner),
+      automaticReviewEnabled: confirmationQueueState.automaticReviewEnabled };
+  },
+  async readItem(id) {
+    const response = await fetch(`/api/confirmations/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    const result = await response.json();
+    return result.available === true ? result.item : null;
+  },
+  onResolved(owner) {
+    if (!closeConfirmationDialog(owner)) return false;
+    activeExternalConfirmation = null;
+    activeConfirmationKey = "";
+    invalidateConfirmationQueueSnapshot();
+    statusBanner.hidden = false;
+    statusBanner.textContent = "这项确认已由系统接管、处理或失效，旧弹窗已关闭。";
+    void refreshConfirmationQueue().catch(error => { statusBanner.textContent = error.message; });
+    return true;
+  },
+});
+
+const reconcileActiveInternalConfirmation = createInternalConfirmationReconciler({
+  getCurrent() {
+    const owner = confirmationDialogOwnership.current();
+    if (!confirmationDialog.open || !activeInternalAttention || owner === null) return null;
+    return { owner, key: activeConfirmationKey, item: activeInternalAttention,
+      requestSequence: lastAppliedConfirmationRequest,
+      submitting: confirmationDialogOwnership.ownsSubmission(owner) };
+  },
+  async readItem(id) {
+    const response = await fetch(`/api/attention/internal/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    return (await response.json()).item ?? null;
+  },
+  onResolved(owner) {
+    if (!closeConfirmationDialog(owner)) return false;
+    activeInternalAttention = null;
+    activeConfirmationKey = "";
+    invalidateConfirmationQueueSnapshot();
+    statusBanner.hidden = false;
+    statusBanner.textContent = "这项请示已处理或归档，旧弹窗已关闭。";
+    void refreshConfirmationQueue().catch(error => { statusBanner.textContent = error.message; });
+    return true;
+  },
+});
 
 function pendingConfirmations() {
   if (!confirmationQueueLoaded) return [];
@@ -4267,9 +4425,10 @@ function internalContextMarkup(context = []) {
 
 function showInternalAttention(entry, remaining) {
   const item = structuredClone(entry.item);
+  const display = internalAttentionDisplay(item);
   activeInternalAttention = item;
   activeExternalConfirmation = null;
-  const choices = (item.choices || [])
+  const choices = display.choices
     .map(
       (choice) => `
         <button type="button" data-internal-choice="${escapeHtml(choice.id)}">
@@ -4281,7 +4440,7 @@ function showInternalAttention(entry, remaining) {
   confirmationContent.innerHTML = `
     <article class="confirmation internal-attention">
       <p class="eyebrow">EMPLOYEE CONSULTATION / 还剩 ${remaining} 项（含当前项）</p>
-      <h2>${escapeHtml(item.question || "员工需要你做一个决定")}</h2>
+      <h2>${escapeHtml(display.question || "员工需要你做一个决定")}</h2>
       <p class="confirmation-reason">来自 ${escapeHtml(item.producer?.roleId || "orchestrator")} · 提交后写入本地台账，并唤醒原任务</p>
       ${internalContextMarkup(item.context)}
       ${choices ? `<div class="confirmation-actions internal-choice-actions">${choices}</div>` : ""}
@@ -4316,7 +4475,7 @@ async function submitInternalAttention(operation, answer) {
   const submissionOwner = beginConfirmationSubmission(setInternalButtonsDisabled);
   if (submissionOwner === null) return;
   try {
-    const response = await fetch(
+    const response = await postAttentionDuringFactRefresh(
       `/api/attention/internal/${encodeURIComponent(item.requestId)}/${operation}`,
       {
         method: "POST",
@@ -4330,7 +4489,15 @@ async function submitInternalAttention(operation, answer) {
           answer,
         }),
       },
+      {
+        isCurrent: () => confirmationDialogOwnership.ownsSubmission(submissionOwner),
+        onWaiting: () => {
+          statusBanner.hidden = false;
+          statusBanner.textContent = "正在核对最新事实，将自动重试提交这条请示…";
+        },
+      },
     );
+    if (response === null) return;
     if (response.status === 409) {
       if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       if (!closeConfirmationSubmission(submissionOwner)) return;
@@ -4339,33 +4506,16 @@ async function submitInternalAttention(operation, answer) {
       invalidateConfirmationQueueSnapshot();
       statusBanner.hidden = false;
       statusBanner.textContent = "员工请示内容已经变化，请查看最新问题后重新答复。";
-      await refreshConfirmationQueue({ showConfirmation: false });
+      try {
+        await refreshConfirmationQueue({ showConfirmation: false });
+      } catch (error) {
+        statusBanner.textContent += ` ${error.message}。页面会自动重试。`;
+      }
       queueMicrotask(showNextConfirmation);
       return;
     }
     if (!response.ok) throw new Error(`员工请示处理失败（${response.status}）`);
     await response.json();
-    if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
-    if (operation === "later") {
-      rememberDeferredConfirmation(activeConfirmationKey);
-    }
-    if (!closeConfirmationSubmission(submissionOwner)) return;
-    activeInternalAttention = null;
-    activeConfirmationKey = "";
-    invalidateConfirmationQueueSnapshot();
-    if (operation === "later") {
-      await refreshAfterDeferral();
-    } else {
-      await refreshConfirmationQueue({ showConfirmation: false });
-    }
-    if (currentView === "work") await workView.load();
-    statusBanner.hidden = false;
-    statusBanner.textContent = operation === "answer"
-      ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
-      : operation === "reject"
-        ? "驳回已写入本地台账，原任务将转入“阻塞”；可在“主动工作台账”追踪。"
-        : "此项仍在待确认队列，本页暂不再弹出；可点击“重新查看稍后项”恢复。";
-    if (operation !== "later") queueMicrotask(showNextConfirmation);
   } catch (error) {
     if (!restoreConfirmationSubmission(
       submissionOwner,
@@ -4375,7 +4525,32 @@ async function submitInternalAttention(operation, answer) {
     }
     statusBanner.hidden = false;
     statusBanner.textContent = error.message;
+    return;
   }
+  if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
+  if (operation === "later") rememberDeferredConfirmation(activeConfirmationKey);
+  if (!closeConfirmationSubmission(submissionOwner)) return;
+  activeInternalAttention = null;
+  activeConfirmationKey = "";
+  invalidateConfirmationQueueSnapshot();
+  if (item.maintenanceCode) void loadMaintenanceAttention({ afterCurrent: true });
+  const completedMessage = operation === "answer"
+    ? `答复已写入本地台账，原任务将重新排队给 ${roleId} 继续处理；可在“主动工作台账”追踪。`
+    : operation === "reject"
+      ? "驳回已写入本地台账，原任务将转入“阻塞”；可在“主动工作台账”追踪。"
+      : "此项仍在待确认队列，本页暂不再弹出；可点击“重新查看稍后项”恢复。";
+  let refreshError = null;
+  try {
+    await refreshConfirmationQueue({ showConfirmation: false });
+    if (currentView === "work") await workView.load();
+  } catch (error) {
+    refreshError = error;
+  }
+  statusBanner.hidden = false;
+  statusBanner.textContent = refreshError
+    ? `${completedMessage} ${refreshError.message}。页面会自动重试。`
+    : completedMessage;
+  queueMicrotask(showNextConfirmation);
 }
 
 function handleInternalAttentionClick(event) {
@@ -4597,9 +4772,10 @@ function externalConfirmationOutcomeMessage(item, result, operation) {
 function reviewHandoffStatusText(item) {
   const handoff = item?.reviewHandoff;
   if (!handoff) return "";
-  const person = handoff.selection.responsiblePerson?.login;
+  const person = handoff.assignedLogin || handoff.selection.responsiblePerson?.login;
   const destination = `${handoff.selection.workType}${person ? ` · @${person}` : ""}`;
   if (handoff.status === "completed") return `下一步已分配：${destination}；工作项 ${handoff.workItemId}。`;
+  if (handoff.status === "stale") return `交接已停止：PR 状态、Head 或分配策略已变化（${handoff.diagnosticCode}），请核对最新 PR。`;
   if (item.status !== "completed") return `已保存交接选择：${destination}；只有 GitHub Review 明确完成后才会分配。`;
   if (handoff.status === "retrying") return `交接待重试：${destination}（${handoff.diagnosticCode}）。服务端会继续恢复，不会重新发布 Review。`;
   return `交接已持久保存：${destination}；服务端正在分配，关闭页面不影响推进。可在确认历史查看结果。`;
@@ -4664,7 +4840,7 @@ async function handleExternalConfirmation(event) {
   const submissionOwner = beginExternalConfirmationSubmission(button, operation);
   if (submissionOwner === null) return;
   try {
-    const response = await fetch(
+    const response = await postAttentionDuringFactRefresh(
       `/api/confirmations/${encodeURIComponent(item.id)}/${operation}`,
       {
       method: "POST",
@@ -4690,7 +4866,15 @@ async function handleExternalConfirmation(event) {
           : {}),
       }),
       },
+      {
+        isCurrent: () => confirmationDialogOwnership.ownsSubmission(submissionOwner),
+        onWaiting: () => {
+          statusBanner.hidden = false;
+          statusBanner.textContent = "正在核对最新事实，确认请求将自动重试，请勿重复点击…";
+        },
+      },
     );
+    if (response === null) return;
     if (response.status === 409) {
       if (!confirmationDialogOwnership.ownsSubmission(submissionOwner)) return;
       invalidateConfirmationQueueSnapshot();
@@ -4698,16 +4882,21 @@ async function handleExternalConfirmation(event) {
       statusBanner.hidden = false;
       statusBanner.textContent = "确认内容或目标状态已经变化，请查看最新内容后重新确认。";
       try {
-        await refreshConfirmationQueue({ showConfirmation: false });
+        const applied = await refreshConfirmationQueue({ showConfirmation: false });
+        if (applied) queueMicrotask(showNextConfirmation);
+      } catch (error) {
+        statusBanner.textContent += ` ${error.message}。成功读取最新确认内容前不会再次弹出。`;
+        return;
+      }
+      try {
         if (item.kind === "local.configuration-activate") {
           await loadConfiguration();
         }
         const sequence = ++requestSequence;
         const nextDashboard = await fetchDashboard();
         if (nextDashboard) applyDashboard(nextDashboard, sequence);
-        queueMicrotask(showNextConfirmation);
       } catch (error) {
-        statusBanner.textContent = `${error.message}。成功读取最新确认内容前不会再次弹出。`;
+        statusBanner.textContent += ` ${error.message}。其他页面数据会自动重试。`;
       }
       return;
     }
@@ -4729,8 +4918,15 @@ async function handleExternalConfirmation(event) {
       (item.display?.payload?.action || item.action)?.type === "pull_request_review";
     invalidateConfirmationQueueSnapshot();
     if (!closeExternalConfirmation(submissionOwner)) return;
-    await load({ showConfirmation: false });
-    if (configurationCompleted) await loadConfiguration();
+    const loadResult = await load({ showConfirmation: false });
+    let refreshError = loadResult?.refreshError || null;
+    if (configurationCompleted) {
+      try {
+        await loadConfiguration();
+      } catch (error) {
+        refreshError ||= error;
+      }
+    }
     let outcomeMessage = externalConfirmationOutcomeMessage(
       item,
       confirmationResult,
@@ -4740,6 +4936,9 @@ async function handleExternalConfirmation(event) {
       outcomeMessage = `${outcomeMessage || "确认结果已记录。"} ${reviewHandoffStatusText(confirmationResult.item)}`;
     } else if (reviewPublished && !handoffWorkType) {
       outcomeMessage = "GitHub 已确认发布成功；你选择了不创建下一步任务。";
+    }
+    if (refreshError) {
+      outcomeMessage = `${outcomeMessage || "确认结果已记录。"} ${refreshError.message}。页面会自动重试。`;
     }
     if (outcomeMessage) {
       statusBanner.hidden = false;
@@ -4826,7 +5025,7 @@ function updateChrome() {
       : []),
   ];
   const brainLabel = brain.enabled
-    ? `${brain.provider || "AI"} / ${brain.model || "未配置模型"}`
+    ? `${brain.provider || "AI"} / ${brain.model || "未配置模型"}${brain.fallbackUsed ? `（已回退 ${brain.fallbackProvider || "本地模型"} / ${brain.fallbackModel || ""}）` : ""}`
     : "确定性规则";
   lastUpdated.textContent = `更新于 ${relativeTime(dashboard.meta.refreshedAt)} · ${dashboard.meta.durationMs} ms`;
   sourceHealth.classList.toggle("error", errors.length > 0);
@@ -4838,7 +5037,7 @@ function updateChrome() {
     </div>`;
   statusBanner.hidden = errors.length === 0;
   statusBanner.textContent = errors.length
-    ? `部分数据未能刷新：${errors.join("；")}`
+    ? `部分数据未能刷新：${summarizeDashboardErrors(errors).join("；")}`
       : "";
 }
 
@@ -5206,7 +5405,7 @@ async function refreshConfirmationQueue({
   const applied = applyConfirmationQueue(nextState, sequence);
   if (applied && dashboard && renderView) render();
   if (applied) refreshLoadedConfirmationHistory();
-  if (showConfirmation) queueMicrotask(showNextConfirmation);
+  if (applied && showConfirmation) queueMicrotask(showNextConfirmation);
   return applied;
 }
 
@@ -5235,16 +5434,21 @@ async function restoreDeferredConfirmations() {
   deferredConfirmationStore.clear();
   if (dashboard && currentView === "employees") render();
   try {
-    await refreshConfirmationQueue({
+    const applied = await refreshConfirmationQueue({
       showConfirmation: false,
       sequence: restore.sequence,
     });
     const superseded = lastAppliedConfirmationRequest > restore.sequence;
+    if (!applied && !superseded) {
+      for (const key of restore.deferred) rememberDeferredConfirmation(key);
+      statusBanner.hidden = false;
+      statusBanner.textContent = "确认列表正在更新；稍后项已保留，请再次点击重新查看。";
+    }
     if (deferredConfirmationRestore === restore) {
       deferredConfirmationRestore = null;
       if (dashboard && currentView === "employees") render();
     }
-    if (!superseded) queueMicrotask(showNextConfirmation);
+    if (applied && !superseded) queueMicrotask(showNextConfirmation);
   } catch (error) {
     const superseded = lastAppliedConfirmationRequest > restore.sequence;
     if (!superseded) {
@@ -5270,6 +5474,23 @@ async function refreshAfterDeferral() {
 }
 
 async function load({ showConfirmation = true } = {}) {
+  if (lanReadOnly) {
+    const sequence = ++requestSequence;
+    try {
+      void loadEmployeeRoles();
+      const snapshot = await fetchDashboard();
+      if (snapshot) applyDashboard(snapshot, sequence);
+      else render();
+      if (currentView === "work") await workView.load();
+      if (currentView === "workflow") await workflowView.load();
+      if (currentView === "system") await loadSystemStatus();
+      if (currentView === "automation-tests") await loadConfiguration();
+    } catch {
+      statusBanner.hidden = false;
+      statusBanner.textContent = "局域网查看暂不可用，页面会自动重试。";
+    }
+    return;
+  }
   if (isConfigurationBackedView()) {
     try {
       await loadConfigurationBackedView({ showConfirmation });
@@ -5293,39 +5514,52 @@ async function load({ showConfirmation = true } = {}) {
       fetchDashboard(),
       fetchConfirmationQueue(),
     ]);
+    let currentConfirmationFailure = false;
     if (confirmationResult.status === "fulfilled") {
-      applyConfirmationQueue(confirmationResult.value, confirmationSequence);
-      if (showConfirmation) queueMicrotask(showNextConfirmation);
+      const applied = applyConfirmationQueue(
+        confirmationResult.value,
+        confirmationSequence,
+      );
+      if (applied && showConfirmation) queueMicrotask(showNextConfirmation);
     } else {
-      invalidateConfirmationQueueSnapshot();
+      currentConfirmationFailure = invalidateConfirmationQueueSnapshot(
+        confirmationSequence,
+      );
     }
     if (dashboardResult.status === "rejected") throw dashboardResult.reason;
+    const refreshError = currentConfirmationFailure
+      ? confirmationResult.reason
+      : null;
     if (!dashboardResult.value) {
       render();
       refreshLoadedConfirmationHistory();
-      if (confirmationResult.status === "rejected") {
+      if (confirmationResult.status === "rejected" && currentConfirmationFailure) {
         statusBanner.hidden = false;
         statusBanner.textContent =
           `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
       }
-      return;
+      return { refreshError };
     }
     applyDashboard(dashboardResult.value, sequence);
     if (currentView === "workflow") await workflowView.load();
     if (currentView === "work") await workView.load();
     refreshLoadedConfirmationHistory();
-    if (confirmationResult.status === "rejected") {
+    if (confirmationResult.status === "rejected" && currentConfirmationFailure) {
       statusBanner.hidden = false;
       statusBanner.textContent =
         `${confirmationResult.reason.message}。主页面仍可使用，确认队列会自动重试。`;
     }
+    return { refreshError };
   } catch (error) {
     statusBanner.hidden = false;
     statusBanner.textContent = `${error.message}。页面会自动重试。`;
+    return { refreshError: error };
   }
 }
 
 async function refresh() {
+  void taskRunsView.refresh();
+  if (lanReadOnly) return load();
   refreshButton.disabled = true;
   refreshButton.classList.add("loading");
   if (isConfigurationBackedView()) {
@@ -5391,7 +5625,17 @@ function activateView(view, { focusHeading = true } = {}) {
     });
   }
   currentView = view;
+  try { sessionStorage.setItem('mydashboard.active-view', view); } catch { /* Navigation works without browser storage. */ }
   render();
+  if (lanReadOnly) {
+    if (focusHeading) pageTitle.focus({ preventScroll: true });
+    if (view === "automation-tests") void loadConfiguration();
+    if (view === "work") void workView.load();
+    if (view === "workflow") void workflowView.load();
+    if (view === "system") void loadSystemStatus();
+    return;
+  }
+  if (currentView === "employees") void loadMaintenanceAttention();
   if (focusHeading) pageTitle.focus({ preventScroll: true });
   if (currentView === "configuration") {
     void loadConfiguration();
@@ -5470,6 +5714,7 @@ confirmationDialog.addEventListener("close", () => {
   confirmationCloseButton.disabled = false;
 });
 document.addEventListener("keydown", (event) => {
+  if (document.querySelector("dialog[open]")) return;
   if (event.target.closest?.("input, textarea, select, [contenteditable=true]")) return;
   if (/^[1-9]$/.test(event.key)) {
     document.querySelectorAll(".nav-item")[Number(event.key) - 1]?.click();
@@ -5485,5 +5730,9 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+try {
+  if (sessionStorage.getItem('mydashboard.active-view') === 'workbench') activateView('workbench', {focusHeading: false});
+} catch { /* Browser storage is optional. */ }
+void taskRunsView.start();
 await load();
 setInterval(load, 60_000);

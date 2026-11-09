@@ -4,7 +4,6 @@ import {
 } from "../domain/code-job-contract.js";
 import {
   isActiveCodeJobBrowserStatus,
-  normalizeCodeJobBrowserProjection,
 } from "../domain/code-job-browser-projection.js";
 import { normalizeConfirmationPlan } from "../domain/confirmation-contract.js";
 import {
@@ -23,11 +22,18 @@ import {
   workProposalDataEntries,
   workProposalError,
 } from "../domain/work-proposal-contract.js";
+import { normalizeCodeJobConfirmationResult } from "./code-job-confirmation-result.js";
 import { WorkProposalRunnerService } from "./work-proposal-runner.js";
 
 const FAILURE_CODE = /^[A-Z][A-Z0-9_]{0,127}$/;
 const REQUEST_ID = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{6,126}[A-Za-z0-9])$/;
 const MAX_POLL_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+const VERIFICATION_FAILURE_SUMMARIES = Object.freeze({
+  CODE_JOB_VERIFICATION_FAILED: "本地验证未通过；请查看测试记录，尚不能认定为产品代码缺陷",
+  CODE_JOB_VERIFICATION_TIMEOUT: "本地验证超时；请检查测试耗时和执行环境",
+  CODE_JOB_VERIFICATION_ENVIRONMENT_UNAVAILABLE: "本地验证环境不可用；请检查执行器及依赖",
+  CODE_JOB_VERIFICATION_UNKNOWN: "本地验证结果无法判断；请查看执行记录",
+});
 const CONFIRMATION_STATUSES = new Set([
   "pending",
   "executing",
@@ -73,6 +79,7 @@ const FACTORY_KEYS = new Set([
   "enabled",
   "runner",
   "confirmationProducer",
+  "automaticOwnPrRepair",
   "codeJobReader",
   "grantFactory",
   "clock",
@@ -448,50 +455,6 @@ function confirmationFailureTransition(item, clock, pollIntervalMs) {
   );
 }
 
-function normalizeCodeJobProjection(value, grant, receipt) {
-  const error = invalidJob();
-  const job = normalizeCodeJobBrowserProjection(value, error);
-  const expectedJobId = codeJobIdForGrant(grant);
-  const expected = {
-    requestedBy: grant.requestedBy,
-    subject: grant.subject,
-    ...(Object.hasOwn(grant, "inputBinding")
-      ? { inputBinding: grant.inputBinding }
-      : {}),
-    ...(Object.hasOwn(grant, "executionSource")
-      ? { executionSource: grant.executionSource }
-      : {}),
-    acceptanceCriteria: grant.acceptanceCriteria,
-    evidence: grant.evidence,
-    allowedActions: grant.allowedActions,
-    writablePaths: grant.writablePaths,
-    requiredProfiles: grant.requiredProfiles.map(({ id }) => id),
-  };
-  const actual = Object.fromEntries(
-    Object.keys(expected).map((key) => [key, job[key]]),
-  );
-  if (
-    job.jobId !== expectedJobId ||
-    receipt.id !== expectedJobId ||
-    job.proposalId !== grant.proposalId ||
-    normalizeWorkProposalDigest(job.proposalContentDigest, error) !==
-      grant.contentDigest ||
-    normalizeWorkProposalDigest(job.grantDigest, error) !== grant.grantDigest ||
-    job.repository !== grant.repository ||
-    job.workspaceId !== grant.workspaceId ||
-    job.operation !== grant.operation ||
-    job.objective !== grant.objective ||
-    job.summary !== grant.summary ||
-    job.reason !== grant.reason ||
-    !sameValue(actual, expected) ||
-    job.createdAt !== receipt.createdAt ||
-    (job.pendingActionType !== null &&
-      !grant.allowedActions.includes(job.pendingActionType))
-  ) {
-    throw error;
-  }
-  return job;
-}
 
 function factoryOptions(value = {}) {
   if (
@@ -520,11 +483,13 @@ export class CodeActionProposalHandler {
   #createGrant;
   #clock;
   #pollIntervalMs;
+  #automaticOwnPrRepair;
 
   constructor({
     confirmationProducer,
     codeJobReader,
     grantFactory,
+    automaticOwnPrRepair = null,
     clock = () => new Date(),
     pollIntervalMs = 15_000,
   } = {}) {
@@ -534,6 +499,7 @@ export class CodeActionProposalHandler {
       "confirmationProducer",
     );
     this.#enqueue = confirmation.enqueue;
+    this.#automaticOwnPrRepair = automaticOwnPrRepair;
     this.#getConfirmation = confirmation.get;
     this.#invalidateConfirmation = confirmation.invalidate;
     this.#getCodeJob = requirePort(codeJobReader, ["get"], "codeJobReader").get;
@@ -597,6 +563,16 @@ export class CodeActionProposalHandler {
         ],
       };
     }
+    // Completed confirmation is a durable handoff. Validate its sealed identity
+    // and observe the executor; the executor owns authority checks before effects.
+    if (existingItem?.status === 'completed' &&
+        ['running', 'waiting_confirmation', 'waiting_retry'].includes(input.status)) {
+      const grant = normalizeCodeJobGrant(existingValue.display.payload.action.grant);
+      const expected = normalizeConfirmationPlan(createCodeActionProposalConfirmationPlan(input.proposal, {
+        grant, allowedOperationsByRole: { [input.proposal.requestedBy.roleId]: [input.proposal.payload.operation] },
+      }));
+      return this.#transitionConfirmation(normalizeConfirmationItem(existingValue, expected), grant);
+    }
     let authority;
     try {
       authority = await this.#createGrant(
@@ -653,14 +629,14 @@ export class CodeActionProposalHandler {
 
     if (input.status === "waiting_confirmation") {
       return this.#transitionConfirmation(
-        normalizeConfirmationItem(existingValue, expected),
+        normalizeConfirmationItem(await this.#approveAutomatically(existingValue), expected),
         grant,
       );
     }
 
     if (input.status === "waiting_retry" && input.downstreamRef !== null) {
       return this.#transitionConfirmation(
-        normalizeConfirmationItem(existingValue, expected),
+        normalizeConfirmationItem(await this.#approveAutomatically(existingValue), expected),
         grant,
       );
     }
@@ -681,8 +657,12 @@ export class CodeActionProposalHandler {
       );
       return this.#invalidateChangedAuthorization(owned, input.proposal);
     }
-    const item = normalizeConfirmationItem(queued, expected);
+    const item = normalizeConfirmationItem(await this.#approveAutomatically(queued), expected);
     return this.#transitionConfirmation(item, grant);
+  }
+
+  #approveAutomatically(item) {
+    return this.#automaticOwnPrRepair === null ? item : this.#automaticOwnPrRepair.approveCodeJob(item);
   }
 
   async #findOwnedConfirmation(proposal, knownMissingId = null) {
@@ -773,7 +753,7 @@ export class CodeActionProposalHandler {
       id: jobId,
       createdAt: receipt.createdAt ?? value.createdAt,
     };
-    const job = normalizeCodeJobProjection(value, grant, effectiveReceipt);
+    const job = normalizeCodeJobConfirmationResult(value, grant, effectiveReceipt);
     if (
       isActiveCodeJobBrowserStatus(job.status) ||
       job.memoryProjection === null
@@ -803,9 +783,11 @@ export class CodeActionProposalHandler {
     if (job.status === "failed") {
       return terminal(
         "failed",
-        "本地代码任务执行失败",
+        VERIFICATION_FAILURE_SUMMARIES[job.verificationOutcome] ?? "本地代码任务执行失败",
         { id: confirmationId },
-        evidence,
+        job.verificationOutcome === undefined
+          ? evidence
+          : [...evidence, `verification-outcome:${job.verificationOutcome}`],
       );
     }
     if (job.status === "cancelled") {
@@ -835,6 +817,7 @@ export function createCodeActionProposalRunnerService(value = {}) {
     confirmationProducer: options.confirmationProducer,
     codeJobReader: options.codeJobReader,
     grantFactory: options.grantFactory,
+    automaticOwnPrRepair: options.automaticOwnPrRepair,
     clock: options.clock,
     pollIntervalMs: options.pollIntervalMs,
   });

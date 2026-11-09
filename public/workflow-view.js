@@ -15,6 +15,84 @@ const dryRunExample = JSON.stringify(
   2,
 );
 
+const OWNER_PENDING_REQUEST_KEY = "mydashboard:owner-work-request-pending:v1";
+
+function currentTabStorage() {
+  try {
+    return globalThis.sessionStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingOwnerRequest(storage) {
+  try {
+    storage?.removeItem(OWNER_PENDING_REQUEST_KEY);
+  } catch {
+    // The in-memory retry remains available if tab storage is unavailable.
+  }
+}
+
+function storedPendingOwnerRequest(storage) {
+  let serialized;
+  try {
+    serialized = storage?.getItem(OWNER_PENDING_REQUEST_KEY);
+  } catch {
+    return null;
+  }
+  if (!serialized) return null;
+  try {
+    if (serialized.length > 72 * 1024) throw new TypeError("pending request is too large");
+    const request = JSON.parse(serialized);
+    const hasPullRequest = request?.schemaVersion === 2;
+    const keys = [
+      "schemaVersion", "requestId", "workType", "priority", "title",
+      "description", "acceptanceCriteria",
+      ...(hasPullRequest ? ["pullRequest"] : []),
+    ];
+    if (
+      !request || typeof request !== "object" || Array.isArray(request) ||
+      ![1, 2].includes(request.schemaVersion) ||
+      Object.keys(request).length !== keys.length ||
+      keys.some((key) => !Object.hasOwn(request, key)) ||
+      typeof request.requestId !== "string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(request.requestId) ||
+      !["general", "requirements", "development", "testing", "pull_request"].includes(request.workType) ||
+      (hasPullRequest !== (request.workType === "pull_request")) ||
+      !["normal", "high", "urgent"].includes(request.priority) ||
+      typeof request.title !== "string" ||
+      typeof request.description !== "string" ||
+      !Array.isArray(request.acceptanceCriteria) ||
+      request.acceptanceCriteria.some((criterion) => typeof criterion !== "string") ||
+      (hasPullRequest && (
+        !request.pullRequest ||
+        typeof request.pullRequest !== "object" ||
+        Array.isArray(request.pullRequest) ||
+        Object.keys(request.pullRequest).length !== 2 ||
+        typeof request.pullRequest.repository !== "string" ||
+        !Number.isSafeInteger(request.pullRequest.number) ||
+        request.pullRequest.number < 1
+      ))
+    ) {
+      throw new TypeError("pending request is invalid");
+    }
+    return request;
+  } catch {
+    clearPendingOwnerRequest(storage);
+    return null;
+  }
+}
+
+function savePendingOwnerRequest(storage, request) {
+  if (!storage) return typeof globalThis.document === "undefined";
+  try {
+    storage.setItem(OWNER_PENDING_REQUEST_KEY, JSON.stringify(request));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function emptyOwnerDraft() {
   return {
     workType: "general",
@@ -27,7 +105,7 @@ function emptyOwnerDraft() {
   };
 }
 
-function initialState(requestIdFactory) {
+function initialState(requestIdFactory, pendingRequest = null) {
   return {
     loaded: false,
     loading: false,
@@ -39,8 +117,18 @@ function initialState(requestIdFactory) {
     dryRunLoading: false,
     dryRunResult: null,
     dryRunError: "",
-    ownerRequestId: requestIdFactory(),
-    ownerDraft: emptyOwnerDraft(),
+    ownerRequestId: pendingRequest?.requestId || requestIdFactory(),
+    ownerDraft: pendingRequest ? {
+      workType: pendingRequest.workType,
+      priority: pendingRequest.priority,
+      title: pendingRequest.title,
+      description: pendingRequest.description,
+      acceptanceCriteria: pendingRequest.acceptanceCriteria.join("\n"),
+      pullRequestRepository: pendingRequest.pullRequest?.repository || "",
+      pullRequestNumber: pendingRequest.pullRequest
+        ? String(pendingRequest.pullRequest.number) : "",
+    } : emptyOwnerDraft(),
+    ownerPendingRequest: pendingRequest,
     ownerRequestLoading: false,
     ownerRequestResult: null,
     ownerRequestError: "",
@@ -202,6 +290,9 @@ function ownerRequestFeedback(state) {
   }
   const result = state.ownerRequestResult;
   if (!result) {
+    if (state.ownerPendingRequest) {
+      return '<p class="workflow-help">上次请求的结果尚未确认。重试会使用相同请求标识和内容；开始新请求会创建另一项任务。</p>';
+    }
     return '<p class="workflow-help">请求会先写入本地审计，再经可信路由进入唯一共享任务图；提交不会授予代码或 GitHub 权限。</p>';
   }
   return `<div class="workflow-dry-run-result" role="status">
@@ -214,13 +305,15 @@ function ownerRequestFeedback(state) {
 function ownerRequestPanel(state) {
   const draft = state.ownerDraft || emptyOwnerDraft();
   const loading = state.ownerRequestLoading === true;
+  const pending = Boolean(state.ownerPendingRequest);
+  const fieldsDisabled = loading || pending;
   return `<section class="section workflow-panel workflow-owner-request">
     <div class="section-heading"><h2>创建共享工作</h2><span>OWNER → ROUTER → ORCHESTRATOR</span></div>
     <p class="workflow-safety-note">这里只收集业务目标。岗位、内部节点、工具与权限由可信配置决定，页面不能指定。</p>
     <form id="owner-work-request-form" class="workflow-owner-form">
       <div class="workflow-owner-fields">
         <label>工作类型
-          <select name="workType"${loading ? " disabled" : ""}>
+          <select name="workType"${fieldsDisabled ? " disabled" : ""}>
             <option value="general"${selectedOption(draft.workType, "general")}>综合协调</option>
             <option value="requirements"${selectedOption(draft.workType, "requirements")}>需求梳理</option>
             <option value="development"${selectedOption(draft.workType, "development")}>开发实现</option>
@@ -229,7 +322,7 @@ function ownerRequestPanel(state) {
           </select>
         </label>
         <label>优先级
-          <select name="priority"${loading ? " disabled" : ""}>
+          <select name="priority"${fieldsDisabled ? " disabled" : ""}>
             <option value="normal"${selectedOption(draft.priority, "normal")}>普通</option>
             <option value="high"${selectedOption(draft.priority, "high")}>高</option>
             <option value="urgent"${selectedOption(draft.priority, "urgent")}>紧急</option>
@@ -240,24 +333,25 @@ function ownerRequestPanel(state) {
         <legend>指定 PR（工作类型选择“PR 推进”时必填）</legend>
         <div class="workflow-owner-fields">
           <label>仓库
-            <input name="pullRequestRepository" maxlength="140" value="${escapeWorkflowHtml(draft.pullRequestRepository)}" placeholder="owner/repository"${loading ? " disabled" : ""} />
+            <input name="pullRequestRepository" maxlength="140" value="${escapeWorkflowHtml(draft.pullRequestRepository)}" placeholder="owner/repository"${fieldsDisabled ? " disabled" : ""} />
           </label>
           <label>PR 编号
-            <input name="pullRequestNumber" type="number" min="1" step="1" value="${escapeWorkflowHtml(draft.pullRequestNumber)}" placeholder="123"${loading ? " disabled" : ""} />
+            <input name="pullRequestNumber" type="number" min="1" step="1" value="${escapeWorkflowHtml(draft.pullRequestNumber)}" placeholder="123"${fieldsDisabled ? " disabled" : ""} />
           </label>
         </div>
         <small>系统会用当前 GitHub 登录读取并冻结这一 PR 的当前 Head；不会因此直接评论、Review、push 或 merge。</small>
       </fieldset>
       <label>标题
-        <input name="title" maxlength="256" required value="${escapeWorkflowHtml(draft.title)}" placeholder="一句话说明要完成什么"${loading ? " disabled" : ""} />
+        <input name="title" maxlength="256" required value="${escapeWorkflowHtml(draft.title)}" placeholder="一句话说明要完成什么"${fieldsDisabled ? " disabled" : ""} />
       </label>
       <label>目标与背景
-        <textarea name="description" maxlength="12288" required placeholder="说明结果、约束和必要背景"${loading ? " disabled" : ""}>${escapeWorkflowHtml(draft.description)}</textarea>
+        <textarea name="description" maxlength="12288" required placeholder="说明结果、约束和必要背景"${fieldsDisabled ? " disabled" : ""}>${escapeWorkflowHtml(draft.description)}</textarea>
       </label>
       <label>验收条件（每行一条，最多 20 条，每条最多 1000 字节）
-        <textarea name="acceptanceCriteria" maxlength="20019" placeholder="例如：真实浏览器验证通过"${loading ? " disabled" : ""}>${escapeWorkflowHtml(draft.acceptanceCriteria)}</textarea>
+        <textarea name="acceptanceCriteria" maxlength="20019" placeholder="例如：真实浏览器验证通过"${fieldsDisabled ? " disabled" : ""}>${escapeWorkflowHtml(draft.acceptanceCriteria)}</textarea>
       </label>
-      <button class="refresh-button" type="submit"${loading ? " disabled" : ""}>${loading ? "正在创建…" : "创建并交给中枢"}</button>
+      <button class="refresh-button" type="submit"${loading ? " disabled" : ""}>${loading ? "正在创建…" : pending ? "重试原请求" : "创建并交给中枢"}</button>
+      ${pending ? `<button class="secondary-button" type="button" data-owner-request-new${loading ? " disabled" : ""}>开始新请求</button>` : ""}
     </form>
     ${ownerRequestFeedback(state)}
   </section>`;
@@ -335,8 +429,9 @@ export function createWorkflowView({
   onChange = () => {},
   clock = () => Date.now(),
   requestIdFactory = () => globalThis.crypto.randomUUID(),
+  sessionStorage = currentTabStorage(),
 } = {}) {
-  let state = initialState(requestIdFactory);
+  let state = initialState(requestIdFactory, storedPendingOwnerRequest(sessionStorage));
 
   function change(patch) {
     state = { ...state, ...patch };
@@ -406,7 +501,8 @@ export function createWorkflowView({
   }
 
   async function submitOwnerRequest(input) {
-    const draft = {
+    if (state.ownerRequestLoading) return;
+    const draft = state.ownerPendingRequest ? state.ownerDraft : {
       workType: String(input.workType || ""),
       priority: String(input.priority || ""),
       title: String(input.title || ""),
@@ -415,13 +511,7 @@ export function createWorkflowView({
       pullRequestRepository: String(input.pullRequestRepository || "").trim(),
       pullRequestNumber: String(input.pullRequestNumber || "").trim(),
     };
-    change({
-      ownerDraft: draft,
-      ownerRequestLoading: true,
-      ownerRequestResult: null,
-      ownerRequestError: "",
-    });
-    const request = {
+    const request = state.ownerPendingRequest || {
       schemaVersion: draft.workType === "pull_request" ? 2 : 1,
       requestId: state.ownerRequestId,
       workType: draft.workType,
@@ -433,12 +523,26 @@ export function createWorkflowView({
         .map((line) => line.trim())
         .filter(Boolean),
     };
-    if (draft.workType === "pull_request") {
+    if (!state.ownerPendingRequest && draft.workType === "pull_request") {
       request.pullRequest = {
         repository: draft.pullRequestRepository,
         number: Number(draft.pullRequestNumber),
       };
     }
+    if (!savePendingOwnerRequest(sessionStorage, request)) {
+      change({
+        ownerDraft: draft,
+        ownerRequestError: "当前标签页无法保存请求，请允许会话存储后重试。",
+      });
+      return;
+    }
+    change({
+      ownerDraft: draft,
+      ownerPendingRequest: request,
+      ownerRequestLoading: true,
+      ownerRequestResult: null,
+      ownerRequestError: "",
+    });
     try {
       const response = await fetchImpl("/api/work/requests", {
         method: "POST",
@@ -449,9 +553,11 @@ export function createWorkflowView({
         body: JSON.stringify(request),
       });
       const result = await responseJson(response, "创建共享工作");
+      clearPendingOwnerRequest(sessionStorage);
       change({
         ownerRequestId: requestIdFactory(),
         ownerDraft: emptyOwnerDraft(),
+        ownerPendingRequest: null,
         ownerRequestLoading: false,
         ownerRequestResult: result,
         ownerRequestError: "",
@@ -465,7 +571,22 @@ export function createWorkflowView({
     }
   }
 
+  function startNewOwnerRequest() {
+    if (state.ownerRequestLoading) return;
+    clearPendingOwnerRequest(sessionStorage);
+    change({
+      ownerRequestId: requestIdFactory(),
+      ownerPendingRequest: null,
+      ownerRequestResult: null,
+      ownerRequestError: "",
+    });
+  }
+
   function bind(root) {
+    root.querySelector("[data-owner-request-new]")?.addEventListener(
+      "click",
+      startNewOwnerRequest,
+    );
     root.querySelector("#owner-work-request-form")?.addEventListener(
       "submit",
       (submitEvent) => {

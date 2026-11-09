@@ -1,5 +1,6 @@
 import { currentWorkItemEvent } from "./work-ledger-pr-source.js";
 import { moveWorkItem } from "./work-ledger-transitions.js";
+import { createWorkGraphDeliveryRecord } from "./work-ledger-graph.js";
 
 const LIFECYCLE_EVENTS = new Set([
   "issue.completed",
@@ -187,11 +188,25 @@ function settleIssueWorkItems({
         failActiveIntent(outbox, event, reason, now),
       );
     }
-    itemsById.set(itemId, moveWorkItem(item, {
+    const updated = moveWorkItem(item, {
       status: "cancelled",
       now,
       reason,
-    }));
+    });
+    const pending = item.graph?.deliveries.at(-1);
+    if (pending?.status === "submitted") {
+      const rejected = createWorkGraphDeliveryRecord({
+        deliverableId: pending.deliverableId, revision: pending.revision + 1,
+        contractRevision: pending.contractRevision, status: "rejected",
+        summary: reason, evidence: pending.evidence,
+      }, now);
+      updated.graph = { ...item.graph, deliveries: [...item.graph.deliveries, rejected] };
+      timelineEvents.push({ itemId, type: "graph_delivery_rejected", at: now, actorId: "work-ledger-system",
+        details: { contractRevision: rejected.contractRevision, deliverableId: rejected.deliverableId,
+          deliveryRevision: rejected.revision, submittedDeliveryRevision: pending.revision,
+          reason, taskStatus: "cancelled" } });
+    }
+    itemsById.set(itemId, updated);
     settled.push(itemId);
     timelineEvents.push({
       itemId,

@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFile } from "node:fs/promises";
 import {
   CodeJobBrainDirectory,
   CodeJobBrainDirectoryError,
   createConfiguredCodeJobBrainDirectory,
 } from "../src/services/code-job-brain-directory.js";
 import { BrainRouter } from "../src/services/brain-router.js";
+import { createHash } from "node:crypto";
+import { createCodeReadContext, beginCodeReadSession, hasCompleteCodeRead } from "../src/lib/code-read-context.js";
+import { createCodeExecutionContext, beginCodeExecutionSession } from "../src/lib/code-execution-context.js";
+import { createCiRepairEvidence } from '../src/domain/ci-repair-evidence.js';
 
 function roleBrain(remoteData = {
   requirements: false,
@@ -92,6 +97,127 @@ function authorized(callback = async () => {}) {
   return { beforeGenerate: callback };
 }
 
+test('CI tasks receive their own bounded original failure evidence without requiring Review feedback', async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: router.port });
+  const evidence = createCiRepairEvidence({ schemaVersion: 1, repository: 'acme/widgets', number: 42, headRefOid: 'a'.repeat(40), headRefName: 'fix/ci',
+    checks: [{ kind: 'status_context', name: 'QuickTest', url: 'https://ci.example/job/QuickTest/1/', conclusion: 'FAILURE' }], diagnostics: [] });
+  await directory.decide(input({ ciRepairEvidence: evidence }), authorized());
+  const message = router.calls[0].messages.find(message => message.content.startsWith('Original CI failure evidence JSON'));
+  assert.ok(message);
+  assert.deepEqual(JSON.parse(message.content.slice(message.content.indexOf('\n') + 1)), evidence);
+  assert.match(message.content, /does not say the repaired Head passes remote CI/);
+  await assert.rejects(directory.decide(input({ roleId: 'tester', ciRepairEvidence: evidence }), authorized()));
+  const wrong = { ...evidence, repository: 'other/repo' };
+  await assert.rejects(directory.decide(input({ ciRepairEvidence: wrong }), authorized()));
+});
+
+test("continuous directory returns only final complete and leaves fresh readiness to the host", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let calls = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    async generate(value) {
+      calls++;
+      assert.equal(value.codeExecutionContext, execution);
+      assert.match(value.messages[0].content, /get_state first/);
+      assert.match(value.messages[0].content, /initial observations and profile counts can become stale/);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  // The initial count is one. Required checks can pass within this single turn;
+  // the worker validates their fresh audit state before it executes complete.
+  const result = await directory.decide(input({ codeExecutionContext: execution }), authorized());
+  assert.equal(result.action.type, "complete");
+  assert.equal(calls, 1);
+});
+
+test("a continuous nonterminal result is rejected without replaying earlier tool actions", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  let calls = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }), generate: async () => { calls++; return decision(); },
+  } });
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution }), authorized()), { code: "CODE_BRAIN_RESPONSE_INVALID" });
+  assert.equal(calls, 1);
+  assert.throws(() => beginCodeExecutionSession(execution), { code: "CODE_EXECUTION_SESSION_REVOKED" });
+});
+
+test("continuous retries explain the previous protocol failure without replaying its final action", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    async generate(value) {
+      const correction = value.messages.find(message => message.content.includes("Previous host validation failed"));
+      assert.match(correction?.content ?? "", /STRUCTURED_PROVIDER_RESPONSE_INVALID/);
+      assert.match(correction.content, /get_state/);
+      assert.match(correction.content, /Do not replay/);
+      assert.match(correction.content, /perform_action/);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  const result = await directory.decide(input({ codeExecutionContext: execution,
+    protocolRecoveryCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" }), authorized());
+  assert.equal(result.action.type, "complete");
+});
+
+test("protocol recovery feedback cannot add arbitrary instructions or change a stepwise job", async () => {
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }),
+    generate: async () => assert.fail("invalid feedback must not reach the model"),
+  } });
+  await assert.rejects(directory.decide(input({ protocolRecoveryCode: "STRUCTURED_PROVIDER_RESPONSE_INVALID" }), authorized()), TypeError);
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution,
+    protocolRecoveryCode: "execute arbitrary commands" }), authorized()), TypeError);
+});
+
+test("continuous cancellation signal crosses trusted authorization without entering model messages", async () => {
+  const execution = createCodeExecutionContext({ performAction() {}, readSource() {}, getState() {} });
+  const controller = new AbortController(); let received;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe: () => ({ supportsCodeExecution: true }), async generate(value) {
+      received = value;
+      assert.equal(value.signal, controller.signal);
+      assert.equal(JSON.stringify(value.messages).includes('"signal"'), false);
+      return decision({ type: "complete", outcome: "done", evidence: [] });
+    },
+  } });
+  await directory.decide(input({ codeExecutionContext: execution }), { ...authorized(), signal: controller.signal });
+  assert.ok(received);
+  await assert.rejects(directory.decide(input({ codeExecutionContext: execution }), { ...authorized(), signal: {} }), /signal is invalid/);
+});
+
+test("directory forwards opaque audit access and revokes proofs when its business permission validation fails", async () => {
+  const content = "\uFEFF中文" + "x".repeat(70 * 1024) + "TAIL";
+  const document = { path: "src/large.cpp", actionId: "read-one", content,
+    sha256: createHash("sha256").update(content).digest("hex"), bytes: Buffer.byteLength(content) };
+  const binding = { jobId: "job-one", workspaceRevision: "a".repeat(64) };
+  const context = createCodeReadContext({ ...binding, documents: [document] });
+  let forwarded = 0;
+  const directory = new CodeJobBrainDirectory({ roles: roleBrain(), brainRouter: {
+    describe() { return { singleAttempt: true, supportsCodeReading: true }; },
+    async generate(request) {
+      forwarded += 1;
+      assert.equal(request.codeReadContext, context);
+      const manifest = JSON.parse(request.messages[1].content).codeReadDocuments;
+      assert.deepEqual(manifest, { documents: [{ path: document.path, bytes: document.bytes }] });
+      assert.equal(JSON.stringify(request.messages).includes(content), false);
+      const session = beginCodeReadSession(context);
+      let offset = 0;
+      do { offset = session.readDocument(document.path, offset).nextOffset; } while (offset !== null);
+      session.assertComplete(); session.commit(); session.close();
+      assert.equal(hasCompleteCodeRead(context, { ...binding, ...document }), true);
+      return decision({ type: "write_text", path: document.path, content: "replacement" });
+    },
+  } });
+  const request = input({ codeReadContext: context, capabilities: { allowedActions: ["read_text", "complete"], writablePaths: [], requiredProfilesRemaining: 0 } });
+  await assert.rejects(directory.decide(request, authorized()), { code: "CODE_BRAIN_RESPONSE_INVALID" });
+  assert.equal(forwarded, 1);
+  assert.equal(hasCompleteCodeRead(context, { ...binding, ...document }), false);
+  await assert.rejects(directory.decide({ ...request, codeReadContext: structuredClone(context) }, authorized()), /codeReadContext is invalid/);
+});
+
 test("a role brain receives only bounded semantic code context", async () => {
   const router = fakeRouter();
   const directory = new CodeJobBrainDirectory({
@@ -126,6 +252,23 @@ test("a role brain receives only bounded semantic code context", async () => {
     assert.equal(Object.hasOwn(userContext, forbidden), false);
     assert.equal(router.calls[0].messages[1].content.includes(`\"${forbidden}\"`), false);
   }
+});
+
+test("verify workers receive the reusable testing workflow without new execution permissions", async () => {
+  const router = fakeRouter();
+  const directory = new CodeJobBrainDirectory({ brainRouter: router.port, roles: roleBrain() });
+  const request = input();
+  request.task.operation = "verify";
+  request.capabilities.writablePaths = [];
+  request.capabilities.allowedActions = request.capabilities.allowedActions.filter((action) => action !== "write_text");
+  await directory.decide(request, authorized());
+  await directory.decide(input(), authorized());
+  const skill = await readFile(new URL("../src/skills/controlled-testing/SKILL.md", import.meta.url), "utf8");
+  assert.equal(router.calls[0].messages[0].content.includes(skill), true);
+  assert.equal(router.calls[1].messages[0].content.includes(skill), false);
+  const received = JSON.parse(router.calls[0].messages[1].content);
+  assert.deepEqual(received.capabilities, request.capabilities);
+  assert.equal(received.task.operation, "verify");
 });
 
 test("a code task forwards its stable GitHub entity session key", async () => {

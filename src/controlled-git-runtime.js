@@ -1,5 +1,6 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { isWindowsGitImplementationPath } from "./lib/windows-git-implementation.js";
 import { types as utilTypes } from "node:util";
 
 import { GitBareMirrorInspector } from "./adapters/git-bare-mirror-inspector.js";
@@ -34,6 +35,7 @@ const DEPENDENCY_KEYS = new Set([
   "mirrorInspector",
   "processRunner",
   "controlledGitServiceFactory",
+  "limits",
 ]);
 
 export class ControlledGitRuntimeError extends Error {
@@ -290,10 +292,6 @@ async function trustedGitExecutable(value) {
     );
   }
   const permissions = initial.mode & 0o7777;
-  const windowsSegments = path.win32
-    .normalize(canonical)
-    .toLowerCase()
-    .split("\\");
   if (
     initial.isSymbolicLink() ||
     !initial.isFile() ||
@@ -302,11 +300,7 @@ async function trustedGitExecutable(value) {
     !samePath(canonical, value) ||
     !sameIdentity(initial, final) ||
     (process.platform === "win32"
-      ? !(
-          windowsSegments.at(-1) === "git.exe" &&
-          windowsSegments.at(-2) === "bin" &&
-          /^mingw(?:32|64)$/u.test(windowsSegments.at(-3) ?? "")
-        )
+      ? !isWindowsGitImplementationPath(canonical)
       : (permissions & 0o111) === 0 || (permissions & 0o7022) !== 0)
   ) {
     throw runtimeError(
@@ -335,6 +329,13 @@ function normalizeDependencies(value) {
   const entries = dataEntries(value, error);
   if (entries.some(([key]) => !DEPENDENCY_KEYS.has(key))) throw error;
   const result = Object.fromEntries(entries);
+  if (Object.hasOwn(result, "limits")) {
+    const limits = dataEntries(result.limits, error);
+    const allowed = new Set(["maxFiles", "maxDirectories", "maxBlobBytes", "maxTotalBytes"]);
+    if (limits.some(([key, value]) => !allowed.has(key) || !Number.isSafeInteger(value) || value < 1)) throw error;
+    if ((result.limits.maxBlobBytes ?? 1_000_000) > (result.limits.maxTotalBytes ?? 8_000_000)) throw error;
+    result.limits = Object.freeze(Object.fromEntries(limits));
+  }
   if (
     Object.hasOwn(result, "controlledGitServiceFactory") &&
     (typeof result.controlledGitServiceFactory !== "function" ||
@@ -508,6 +509,20 @@ function lookupMirror(mirrors, repository, role) {
   return mirrorRoot;
 }
 
+function assertPreparationInputUnchanged(value, expected) {
+  let current;
+  try {
+    current = normalizePullRequestExecutionBinding(value);
+  } catch (cause) {
+    throw runtimeError("CONFLICT_PREPARATION_INPUT_CHANGED",
+      "PR 执行绑定在 conflict preparation 期间发生变化", cause);
+  }
+  if (!samePullRequestExecutionBinding(expected, current)) {
+    throw runtimeError("CONFLICT_PREPARATION_INPUT_CHANGED",
+      "PR 执行绑定在 conflict preparation 期间发生变化");
+  }
+}
+
 function createPorts(service, { baseMirrors, headMirrors }) {
   const createControlledCommit = method(
     service,
@@ -524,12 +539,14 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     "verifyControlledCommit",
     "ControlledGitService",
   );
+  const readSealedControlledCommit = method(service, "readSealedControlledCommit", "ControlledGitService");
   const publishControlledCommit = method(
     service,
     "publishControlledCommit",
     "ControlledGitService",
   );
   const inspectConflict = method(service, "inspectConflict", "ControlledGitService");
+  const readConflictInspection = method(service, "readConflictInspection", "ControlledGitService");
   const verifyConflictPreparation = method(
     service,
     "verifyConflictPreparation",
@@ -549,6 +566,7 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     create: (request) => createControlledCommit(request),
     find: (request) => findControlledCommit(request),
     verify: (request) => verifyControlledCommit(request),
+    readSealed: (request) => readSealedControlledCommit(request),
   });
   const publisher = Object.freeze({
     publish: (request) => publishControlledCommit(request),
@@ -556,6 +574,8 @@ function createPorts(service, { baseMirrors, headMirrors }) {
   const verifier = Object.freeze({
     verify: (binding) => verifyConflictPreparation({ binding }),
   });
+  // Reuse material across inspection and dispatch; verification remains fresh.
+  const preparationBindings = new Map();
   const preparer = Object.freeze({
     async prepare(inputBindingValue) {
       let inputBinding;
@@ -576,65 +596,37 @@ function createPorts(service, { baseMirrors, headMirrors }) {
         );
       }
       const gitTarget = inputBinding.gitTarget;
-      const preparation = await inspectConflict({
-        gitTarget,
-        baseMirrorRoot: lookupMirror(
-          baseMirrors,
-          gitTarget.baseRepository,
-          "Base",
-        ),
-        headMirrorRoot: lookupMirror(
-          headMirrors,
-          gitTarget.headRepository,
-          "Head",
-        ),
-      });
-      let currentInputBinding;
-      try {
-        currentInputBinding = normalizePullRequestExecutionBinding(
-          inputBindingValue,
-        );
-      } catch (cause) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_INPUT_CHANGED",
-          "PR 执行绑定在 conflict preparation 期间发生变化",
-          cause,
-        );
-      }
-      if (!samePullRequestExecutionBinding(inputBinding, currentInputBinding)) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_INPUT_CHANGED",
-          "PR 执行绑定在 conflict preparation 期间发生变化",
-        );
-      }
-      if (preparation?.status !== "conflicted") {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_NOT_CONFLICTED",
-          "PR 当前镜像不再产生受支持的冲突",
-        );
-      }
-      let preparationBinding;
-      try {
-        preparationBinding = createConflictPreparationBinding({
-          preparation,
+      const cacheKey = JSON.stringify(inputBinding);
+      let preparationBinding = preparationBindings.get(cacheKey);
+      if (preparationBinding === undefined) {
+        const preparation = await inspectConflict({
           gitTarget,
+          baseMirrorRoot: lookupMirror(baseMirrors, gitTarget.baseRepository, "Base"),
+          headMirrorRoot: lookupMirror(headMirrors, gitTarget.headRepository, "Head"),
         });
-      } catch (cause) {
-        throw runtimeError(
-          "INVALID_CONFLICT_PREPARATION_RESULT",
-          "Controlled Git preparation 结果无效",
-          cause,
-        );
+        assertPreparationInputUnchanged(inputBindingValue, inputBinding);
+        if (preparation?.status !== "conflicted") {
+          throw runtimeError("CONFLICT_PREPARATION_NOT_CONFLICTED",
+            "PR 当前镜像不再产生受支持的冲突");
+        }
+        try {
+          preparationBinding = deepFreeze(createConflictPreparationBinding({ preparation, gitTarget }));
+        } catch (cause) {
+          throw runtimeError("INVALID_CONFLICT_PREPARATION_RESULT",
+            "Controlled Git preparation 结果无效", cause);
+        }
       }
-      const verified = await verifyConflictPreparation({
-        binding: preparationBinding,
-      });
-      if (!sameConflictPreparationBinding(verified, preparationBinding)) {
-        throw runtimeError(
-          "CONFLICT_PREPARATION_VERIFICATION_MISMATCH",
-          "Controlled Git preparation 校验结果不一致",
-        );
+      try {
+        const verified = await verifyConflictPreparation({ binding: preparationBinding });
+        if (!sameConflictPreparationBinding(verified, preparationBinding)) {
+          throw runtimeError("CONFLICT_PREPARATION_VERIFICATION_MISMATCH",
+            "Controlled Git preparation 校验结果不一致");
+        }
+      } catch (error) {
+        preparationBindings.delete(cacheKey);
+        throw error;
       }
+      assertPreparationInputUnchanged(inputBindingValue, inputBinding);
       const executionSource = createConflictCodeExecutionSource({
         inputBinding,
         preparationBinding,
@@ -652,6 +644,10 @@ function createPorts(service, { baseMirrors, headMirrors }) {
           "Conflict execution source 构造失败",
         );
       }
+      preparationBindings.set(cacheKey, preparationBinding);
+      if (preparationBindings.size > 32) {
+        preparationBindings.delete(preparationBindings.keys().next().value);
+      }
       return deepFreeze(normalizedSource);
     },
   });
@@ -661,6 +657,17 @@ function createPorts(service, { baseMirrors, headMirrors }) {
     publisher,
     verifier,
     preparer,
+    sourceReader: typeof service.readConflictSources !== "function" ? null : Object.freeze({ async read(value) {
+      const source = normalizeCodeExecutionSource(value);
+      if (source.kind !== "conflict_preparation") throw runtimeError("INVALID_CONFLICT_PREPARATION_INPUT", "Conflict source requires a sealed conflict preparation");
+      const documents = await service.readConflictSources({ binding: source.preparationBinding });
+      return deepFreeze({ inputBinding: source.inputBinding, preparationBinding: source.preparationBinding, documents });
+    } }),
+    inspectionReader: Object.freeze({ async read(inputBinding) {
+      const source = await preparer.prepare(inputBinding);
+      const inspection = await readConflictInspection({ binding: source.preparationBinding });
+      return Object.freeze({ ...inspection, inputBinding: source.inputBinding });
+    } }),
   });
 }
 
@@ -686,6 +693,8 @@ export async function createControlledGitRuntimeBundle(
       gitCommand: normalized.gitCommand,
       mirrorInspector,
       preparationRoot: normalized.preparationRoot,
+      headMirrorsByRepository: Object.fromEntries(normalized.headMirrors),
+      ...(normalizedDependencies.limits ? { limits: normalizedDependencies.limits } : {}),
       ...(normalizedDependencies.processRunner
         ? { processRunner: normalizedDependencies.processRunner }
         : {}),

@@ -13,6 +13,7 @@ const REVIEW_EVIDENCE_KINDS = Object.freeze([
 const MODIFY_EVIDENCE_KINDS = Object.freeze(["change-package"]);
 const VERIFY_EVIDENCE_KINDS = Object.freeze(["test-report"]);
 const NO_EVIDENCE_KINDS = Object.freeze([]);
+export const DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE = "DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE";
 
 function invalid(message = "Delivery evidence target is invalid") {
   return new TypeError(message);
@@ -219,7 +220,9 @@ function selectCompatibleDeliverable(
     compatibleKinds.includes(kind)
   );
   if (compatible.length === 0) {
-    throw invalid("proposal action cannot produce an expected deliverable");
+    throw Object.assign(invalid("proposal action cannot produce an expected deliverable"), {
+      code: DELIVERY_EVIDENCE_ACTION_INCOMPATIBLE,
+    });
   }
   if (compatible.length > 1) {
     throw invalid("deliverableId is required for multiple compatible deliverables");

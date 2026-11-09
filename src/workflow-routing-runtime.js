@@ -29,6 +29,10 @@ export async function createWorkflowRoutingRuntime(
     clock,
     operationQueue,
     actionAdmissionGate,
+    scopeExitRecoveryReader,
+    scopeReentryReader,
+    roleHandoffReader,
+    headAncestryReader,
     createGuard = (options) => new ProcessExclusiveGuard(options),
   } = {},
 ) {
@@ -68,6 +72,10 @@ export async function createWorkflowRoutingRuntime(
         config.githubRead?.issueActiveWindowDays ??
         DEFAULT_ISSUE_ACTIVE_WINDOW_DAYS,
       ...(actionAdmissionGate === undefined ? {} : { actionAdmissionGate }),
+      ...(scopeExitRecoveryReader === undefined ? {} : { scopeExitRecoveryReader }),
+      ...(scopeReentryReader === undefined ? {} : { scopeReentryReader }),
+      ...(roleHandoffReader === undefined ? {} : { roleHandoffReader }),
+      ...(headAncestryReader === undefined ? {} : { headAncestryReader }),
       ...(clock ? { clock } : {}),
       ...(operationQueue ? { operationQueue } : {}),
     });

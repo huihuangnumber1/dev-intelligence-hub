@@ -11,9 +11,13 @@ schemas, and documentation may change before the first stable release.
 | Local dashboard and source aggregation | Implemented | Safe example configuration keeps all real sources disabled. |
 | Versioned routing and durable work ledger | Implemented | Routing assigns work but cannot grant model, executor, or GitHub authority. |
 | Orchestrator and specialist roles | Implemented | Roles start paused and require explicit configuration and provider availability. |
+| Running tasks and owner adjustments | Implemented, deployment acceptance pending | Real model/action observations; instructions and pause/cancel settle at checkpoints; existing authority remains required. |
+| Native Codex live steering | Implemented; Windows native default | Contained App Server, exact thread/turn controls and confirmed process stop; deployment acceptance remains separate from protocol tests. |
+| Model admission and execution receipts | Implemented | Waiting for capacity precedes work claim; execution budgets start after admission. Bounded metadata receipts survive restart without conversation text. Native parallelism defaults to one until explicitly validated. |
+| Repair publication and internal review | Implemented | Durable Head-bound handoff follows completed push; restart retries handoff only. Internal review does not publish a GitHub self-approval. |
 | Cited local memory | Implemented | Remote use remains subject to explicit requirements, code, and memory data grants. |
 | Controlled code jobs and change packages | Implemented | Execution occurs in an isolated copy; applying a package requires a separate confirmation. |
-| GitHub reviews and PR actions | Implemented behind confirmation | Every write is bound to an account, repository, PR, and exact Head. |
+| GitHub reviews and PR actions | Implemented | Activated automatic policies execute without individual prompts; other writes require confirmation. Every write binds the account, repository, PR and exact Head. |
 | Versioned configuration and recovery | Implemented | Security-relevant changes invalidate affected authority and require a managed restart. |
 | Open-source distribution baseline | Verified | Apache-2.0, safe example configuration, tracked-tree privacy checks, and clean installation are covered. |
 | Whole-system U12 acceptance | Pending | Current Docker, browser, recovery, independent review, and product-run live PR evidence must be completed on one clean source state. |
@@ -34,9 +38,12 @@ Maintainers preparing a public version should also use the
   `npm start` is available for foreground development diagnostics.
 - Ollama, third-party model providers, Docker Desktop, GitHub access, and
   collaboration-system integrations are optional and disabled until configured.
-- The current Docker test library runs fixed Node profiles. Windows, Qt, and
-  FastBuild workloads require a future controlled Windows sandbox and are not
-  executed through unrestricted host PowerShell.
+- The test library supports fixed Docker Node profiles and version-bound Windows
+  test/build assets. Windows assets run in a copied workspace under LPAC with
+  actual token evidence, pinned Node and hashed read-only resources. Job Objects
+  contain descendants; confirmed stops precede removal of large copies. A build
+  alone does not count as passing tests; desktop and hardware acceptance still
+  require their own evidence.
 
 ## Release readiness
 

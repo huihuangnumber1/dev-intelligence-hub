@@ -5,7 +5,7 @@ import {
   OpenAICompatibleProvider,
   OpenAiCompatibleProvider,
 } from "../src/adapters/openai-compatible-provider.js";
-import { normalizeStructuredBrainRequest } from "../src/lib/structured-brain-request.js";
+import { normalizeStructuredBrainRequest, readStructuredBrainGenerateInput } from "../src/lib/structured-brain-request.js";
 import { BrainRouter } from "../src/services/brain-router.js";
 
 const SCHEMA = Object.freeze({
@@ -18,6 +18,21 @@ const MESSAGES = Object.freeze([
   Object.freeze({ role: "system", content: "Return JSON." }),
   Object.freeze({ role: "user", content: "{}" }),
 ]);
+
+test("structured scheduling identity stays separate from authorized session history", () => {
+  const source = { model: "bounded-model", messages: MESSAGES, schema: SCHEMA,
+    sessionKey: `auth-v2:${"a".repeat(64)}`, admissionEntityKey: "github:pull_request:Owner/Repo#42" };
+  const input = readStructuredBrainGenerateInput(source);
+  const normalized = normalizeStructuredBrainRequest(source, { maxRequestBytes: 8 * 1024 });
+  assert.equal(input.admissionEntityKey, source.admissionEntityKey);
+  assert.equal(normalized.admissionEntityKey, "github:pull_request:owner/repo#42");
+  assert.equal(normalized.sessionKey, source.sessionKey);
+  let getterCalls = 0;
+  Object.defineProperty(source, "admissionEntityKey", { enumerable: true, get() { getterCalls++; return "untrusted"; } });
+  assert.throws(() => readStructuredBrainGenerateInput(source), /structured request is invalid/);
+  assert.throws(() => normalizeStructuredBrainRequest(source, { maxRequestBytes: 8 * 1024 }), /structured request is invalid/);
+  assert.equal(getterCalls, 0);
+});
 
 function textResponse(value, { ok = true, status = 200 } = {}) {
   const text = typeof value === "string" ? value : JSON.stringify(value);
@@ -82,6 +97,43 @@ test("the shared structured request normalizer returns a detached deep-frozen re
   assert.equal(Object.isFrozen(normalized.messages), true);
   assert.equal(Object.isFrozen(normalized.messages[0]), true);
   assert.equal(Object.isFrozen(normalized.schema.properties.nested.items), true);
+});
+
+test("structured messages preserve multiline prompts and code indentation", () => {
+  const messages = [
+    { role: "system", content: "# Review\r\n\r\n- 检查代码\n\t保留缩进" },
+    { role: "user", content: "diff --git a/app.js b/app.js\n+\treturn true;\n" },
+  ];
+  const normalized = normalizeStructuredBrainRequest({
+    model: "bounded-model", messages, schema: SCHEMA,
+  }, { maxRequestBytes: 8 * 1024 });
+
+  assert.deepEqual(normalized.messages, messages);
+});
+
+test("structured messages reject non-text controls and keep identifier validation strict", () => {
+  const normalize = (overrides) => normalizeStructuredBrainRequest({
+    model: "bounded-model", messages: MESSAGES, schema: SCHEMA, ...overrides,
+  }, { maxRequestBytes: 8 * 1024 });
+  const forbiddenCodes = [...Array(32).keys(), 127]
+    .filter((code) => ![9, 10, 13].includes(code));
+  for (const code of forbiddenCodes) {
+    assert.throws(
+      () => normalize({ messages: [{ role: "user", content: `text${String.fromCharCode(code)}text` }] }),
+      /message\.content is invalid/,
+      `reject control character ${code}`,
+    );
+  }
+  for (const content of ["", " \t\r\n"]) {
+    assert.throws(
+      () => normalize({ messages: [{ role: "user", content }] }),
+      /message\.content is invalid/,
+    );
+  }
+  for (const control of ["\t", "\n", "\r"]) {
+    assert.throws(() => normalize({ model: `model${control}name` }), /model is invalid/);
+    assert.throws(() => normalize({ sessionKey: `session${control}key` }), /sessionKey is invalid/);
+  }
 });
 
 test("the shared structured request normalizer rejects hostile data before touching it", () => {

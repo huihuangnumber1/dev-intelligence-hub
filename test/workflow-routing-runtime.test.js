@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createWorkflowRouter } from "../src/domain/workflow-router.js";
+import { normalizeWorkflowEvent } from "../src/domain/workflow-events.js";
 import { createWorkflowRoutingRuntime } from "../src/workflow-routing-runtime.js";
 
 class MemoryStore {
@@ -80,6 +81,34 @@ function assignedIssue(number, updatedAt) {
   };
 }
 
+test("runtime admits a host role handoff only from complete fresh facts and the configured approved route", async () => {
+  let calls = 0;
+  const handoff = normalizeWorkflowEvent({ schemaVersion: 1, eventType: "pull_request.role_handoff",
+    occurredAt: "2026-08-02T04:00:00.000Z", source: { provider: "github", scopeId: "github-dashboard" },
+    subject: { id: "github:pr:acme/repo#42", repository: "acme/repo", number: 42 },
+    payload: { relation: "authored", actionState: "waiting_other", nextAction: "wait_merge",
+      reviewDecision: "APPROVED", state: "open", headRefOid: "a".repeat(40), roleHandoffProof: "b".repeat(64) } });
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: definition() }, {
+    store: new MemoryStore(), clock: () => "2026-08-02T04:00:00.000Z", createGuard: guardFactory(),
+    roleHandoffReader: { async read() { calls++; return [handoff]; } },
+  });
+  await assert.rejects(runtime.ingest({ event: { schemaVersion: 1, eventType: handoff.eventType,
+    occurredAt: "2026-08-02T03:59:00.000Z", source: handoff.source, subject: handoff.subject, payload: handoff.payload } }),
+    error => error.code === "WORKFLOW_EVENT_HOST_ONLY");
+  for (const [index, health] of [{ ok: true, complete: false }, { ok: false, complete: true },
+    { ok: true, complete: true, stale: true }, { ok: true, complete: true, stale: false }].entries()) {
+    const result = await runtime.ingestSnapshot({ snapshot: { refreshedAt: `2026-08-02T04:0${index}:00.000Z`,
+      sourceStatus: { githubPullRequests: health, githubIssues: { ok: true } }, items: [] } });
+    if (index < 3) assert.equal(calls, 0);
+    else {
+      assert.equal(calls, 1);
+      assert.deepEqual(result.assignments.map(x => x.target), [{ type: "node", id: "system-pull-request-scope-lifecycle" },
+        { type: "role", id: "tester" }]);
+    }
+  }
+  await runtime.close();
+});
+
 test("an absent workflow definition constructs no routing state", async () => {
   const store = new MemoryStore();
 
@@ -87,6 +116,22 @@ test("an absent workflow definition constructs no routing state", async () => {
 
   assert.equal(runtime, null);
   assert.equal(store.writes, 0);
+});
+
+test('automatic scope reentry reads only complete healthy GitHub snapshots', async () => {
+  let calls = 0;
+  const runtime = await createWorkflowRoutingRuntime({ workflowRouting: definition() }, {
+    store: new MemoryStore(), createGuard: guardFactory(),
+    scopeReentryReader: { async read() { calls++; return []; } },
+  });
+  try {
+    for (const [index, health] of [{ ok: false, complete: true }, { ok: true, complete: false },
+      { ok: true, complete: true, stale: true }, { ok: true, complete: true, stale: false }].entries()) {
+      await runtime.ingestSnapshot({ snapshot: { refreshedAt: `2026-08-02T04:0${index}:00.000Z`, items: [],
+        sourceStatus: { githubPullRequests: health, githubIssues: { ok: true } } } });
+      assert.equal(calls, index === 3 ? 1 : 0);
+    }
+  } finally { await runtime.close(); }
 });
 
 test("startup records the local definition once and reuses the same version", async () => {

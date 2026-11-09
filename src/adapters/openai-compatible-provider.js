@@ -1,4 +1,5 @@
 import { types as utilTypes } from "node:util";
+import { currentTaskExecution } from "../lib/task-execution-context.js";
 
 import {
   normalizeAbortSignal,
@@ -501,6 +502,7 @@ export class OpenAICompatibleProvider {
       operation: async () => {
         let response;
         try {
+          currentTaskExecution()?.reportModelState?.("running");
           response = await this.#fetch(this.#requestUrl, {
             method: "POST",
             redirect: "error",

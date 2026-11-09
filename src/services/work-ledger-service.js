@@ -1,5 +1,39 @@
 import { scheduler } from "node:timers/promises";
+import { isAutomaticChildWait } from "./work-graph-wait-marker.js";
+import { triageRetirementCandidate, planTriageRetirement } from './work-ledger-triage-retirement.js';
+import { isReviewTestingRetirementCandidate, reviewTestingRetirementCandidate, matchesAutomaticReviewTestingHandoff,
+  planAutomaticReviewTestingRetirement } from './automatic-review-testing-retirement.js';
+import { indexRecordedDecisionFailures } from './work-ledger-decision-failure.js';
+import { indexRecordedProposalFailures } from './work-ledger-proposal-failure.js';
+import { indexUnstartedCodeDispatchFailures } from './work-ledger-delivery-failure.js';
+import { consumeHeadAncestryCredential } from './automatic-head-ancestry-reader.js';
+import { headAncestrySourceMatches } from '../domain/head-ancestry-receipt.js';
+import { recordedFailureParentIds } from './work-ledger-graph-progress.js';
+import { isParentCoordinationReturn, indexParentCoordinationReturns } from './work-ledger-graph-responsibility.js';
+import { ciMaterialRecoveryCandidate, ciMaterialRetirement, planCiMaterialRecovery } from "./work-ledger-ci-material-recovery.js";
+import { hostContextRecoveryCandidate, planHostContextRecovery, hostContextRetirement, hasPendingHostContextRecovery } from "./work-ledger-host-context-recovery.js";
+import { automaticRoleHandoffCandidate } from "./work-ledger-role-handoff.js";
+import { currentPrRoleHandoffProof } from './work-ledger-role-handoff-evidence.js';
+import { completedRepairEvidenceRecoveryProof, repairDecisionAttemptBudget } from "./work-ledger-inspection-continuation.js";
+import { automaticReviewWorkAdmission, automaticReviewContinuationEligibility } from "../domain/automatic-review-policy.js";
+import { inactivePullRequestTakeoverRecoveryProof, sameHeadInternalReviewTakeoverRecoveryProof } from "./work-ledger-pr-retirement-recovery.js";
+import { createWorkIntentDispatchBinding } from "../domain/work-intent-dispatch-binding.js";
+import { planWorkItemRunControl } from './work-ledger-run-control.js';
+import {
+  createRevokedCodeConfirmationSettlement,
+  completedCodeConfirmationForSettlement,
+  createCompletedCodeConfirmationSettlement,
+  isChangedCodeConfirmationDecision,
+  codeConfirmationSettlementId,
+  unstartedCodeConfirmationForSettlement,
+  createUnstartedCodeConfirmationSettlement,
+} from "./work-ledger-code-confirmation-settlement.js";
+import { isChangedReviewConfirmationDecision, reviewConfirmationSettlementIds,
+  createCompletedReviewConfirmationSettlement, hasReviewConfirmationSettlement } from "./work-ledger-review-confirmation-settlement.js";
 import { OperationQueue } from "../lib/operation-queue.js";
+import { normalizeStoredWorkflowEvent } from "../domain/workflow-events.js";
+import { samePullRequestGitTarget, normalizePullRequestGitTarget } from "../domain/git-tool-contract.js";
+import { normalizeAbortSignal } from "../lib/structured-provider-request.js";
 import {
   isTrustedPullRequestScopeLifecycleAssignment,
 } from "../domain/pull-request-scope-lifecycle.js";
@@ -10,7 +44,12 @@ import {
   planWorkItemRetry,
   planWorkItemTransition,
 } from "./work-ledger-item-commands.js";
-import { planAttentionBatchApplication } from "./work-ledger-attention-commands.js";
+import {
+  attentionResultInputBinding,
+  planAttentionBatchApplication,
+  planSystemMaintenanceRetry,
+  systemMaintenanceRetirement,
+} from "./work-ledger-attention-commands.js";
 import { planProposalBatchApplication } from "./work-ledger-proposal-commands.js";
 import { planConditionWake } from "./work-ledger-condition-commands.js";
 import {
@@ -19,6 +58,7 @@ import {
 } from "./work-ledger-graph-commands.js";
 import {
   planScopedWorkGraphCancellation,
+  planWorkGraphReviewReplacement,
   planWorkGraphEscalation,
   planWorkGraphTaskPause,
   planWorkGraphTaskReassignment,
@@ -68,7 +108,12 @@ import {
   applyPullRequestScopeLifecycle,
   appendPullRequestWorkSource,
   currentWorkItemEvent,
+  currentWorkItemInputBinding,
+  currentWorkItemExecutionBinding,
+  pendingInternalReviewMatchesDiscovery,
   pullRequestHeadAdmission,
+  pullRequestScopeLifecycleMatchesSource,
+  pullRequestScopeLifecycleTargetRole,
   pullRequestWorkDescriptor,
   pullRequestTrustedPredecessor,
   verifyPullRequestExecutionBinding as verifyPullRequestExecutionAuthority,
@@ -87,6 +132,7 @@ import {
   crossRootPullRequestCutoverPendingReason,
   crossRootPullRequestCutoverPredecessorId,
   inspectPullRequestSourceCutover,
+  normalizePullRequestSourceReconciliationCommand,
   planPullRequestSourceReconciliation,
   retireCrossRootPullRequestPredecessor,
 } from "./work-ledger-pr-cutover-commands.js";
@@ -94,9 +140,11 @@ import {
   emptyWorkLedgerState,
   normalizeWorkLedgerLimits,
   normalizeWorkLedgerPersistedState,
+  retainWorkLedgerTimelineForCapacity,
   WORK_LEDGER_STATE_KEY,
   workLedgerPersistedStateDigest,
 } from "./work-ledger-state.js";
+import { MAX_WORKFLOW_RECORDS } from "./workflow-routing-state.js";
 import {
   boundedLedgerString,
   ledgerDigest,
@@ -110,6 +158,7 @@ import {
   WORK_LEDGER_STATUSES,
 } from "./work-ledger-values.js";
 import { projectWorkLedgerGraphView } from "./work-ledger-graph.js";
+import { indexWorkLedgerGraphProgress } from "./work-ledger-graph-progress.js";
 import { createLocalWorkLedgerCandidateProcessor } from
   "./work-ledger-candidate-processor.js";
 
@@ -153,6 +202,15 @@ const PR_SOURCE_AUTHORITY_FENCE_SAFE_STATUSES = new Set([
 ]);
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 
+function assertLedgerRevisionProgress(durable, baseline) {
+  if (durable === baseline) return;
+  if (durable.revision < baseline.revision ||
+      (durable.revision === baseline.revision &&
+        workLedgerPersistedStateDigest(durable) !== workLedgerPersistedStateDigest(baseline))) {
+    throw workLedgerError("WORK_LEDGER_STATE_REVISION_CONFLICT", "员工工作台账持久状态发生回退或分叉", 409);
+  }
+}
+
 function isContentVersion(value) {
   return (
     isPlainLedgerObject(value) &&
@@ -177,6 +235,7 @@ function normalizeVersionedRead(result, expectedVersion) {
 }
 
 function canRequeueAdvancedPullRequestRoot(root, nextSource) {
+  if (nextSource.scope.active !== true) return false;
   const sameHead =
     root.source?.current?.headRefOid === nextSource?.current?.headRefOid;
   if (
@@ -186,11 +245,24 @@ function canRequeueAdvancedPullRequestRoot(root, nextSource) {
   ) {
     return false;
   }
+  if (isAutomaticChildWait(root) && root.currentTarget?.id === "orchestrator" &&
+      root.source?.scope.kind === "owner_requested" && nextSource.scope.kind === "owner_requested" &&
+      (!sameHead || root.source.current.event.payload.gitTarget?.baseRefOid !==
+        nextSource.current.event.payload.gitTarget?.baseRefOid)) return true;
   return PR_SOURCE_REQUEUE_STATUSES.has(root.status) ||
     (root.kind === "source_root" &&
       root.source?.kind === "pull_request" &&
       root.status === "superseded" &&
       root.statusReason === CROSS_ROOT_REPLACED_REASON);
+}
+
+function isIgnoredProtectedPullRequestReentry(root, envelope, observed) {
+  return ["completed", "superseded", "paused"].includes(root.status) &&
+    root.source.scope.active === false && envelope.event.eventType === "pull_request.created" &&
+    observed.disposition.startsWith("ignored_") && observed.authorityChanged !== true &&
+    observed.source.scope.active === false &&
+    observed.source.authorityEpoch === root.source.authorityEpoch &&
+    observed.source.activeRevision === root.source.activeRevision;
 }
 
 function fencedPullRequestRootPatch(root, disposition) {
@@ -231,16 +303,19 @@ function hasNewerIssueAssignment(items, item) {
   );
 }
 
-function pullRequestRootForLifecycle(itemsById, envelope) {
+function pullRequestRootsForLifecycle(itemsById, envelope) {
   const descriptor = pullRequestWorkDescriptor(envelope);
-  if (descriptor === null || !descriptor.trustedLifecycle) return null;
-  return [...itemsById.values()].find((item) =>
-    item?.source?.kind === "pull_request" &&
-    item.source.workKey === descriptor.workKey
-  ) ?? null;
+  if (descriptor === null || !descriptor.trustedLifecycle) return [];
+  return [...itemsById.values()].filter((item) =>
+    item.kind === "source_root" &&
+    item.status !== "paused" &&
+    pullRequestScopeLifecycleMatchesSource(item.source, envelope)
+  );
 }
 
-function operationalPullRequestPredecessor(itemsById, root, authority) {
+function operationalPullRequestPredecessor(itemsById, root, authority, event) {
+  // History from a source that left scope cannot take over live work.
+  if (root.source.scope.active !== true) return null;
   const canonicalItemId = authority?.canonicalRootItemId ??
     authority?.lastTrustedRootItemId ?? null;
   if (canonicalItemId === null || canonicalItemId === root.itemId) return null;
@@ -261,6 +336,7 @@ function operationalPullRequestPredecessor(itemsById, root, authority) {
     candidate = itemsById.get(pendingPredecessorItemId) ?? null;
   }
   if (candidate?.itemId === root.itemId) return null;
+  if (root.source.scope.kind === "automatic" && pendingInternalReviewMatchesDiscovery(candidate, event)) return null;
   if (
     candidate?.kind !== "source_root" ||
     !samePullRequestSubject(candidate, root)
@@ -272,6 +348,14 @@ function operationalPullRequestPredecessor(itemsById, root, authority) {
     );
   }
   return candidate;
+}
+
+function ownsHeadAncestryPredecessor(state, root) {
+  const predecessor = pullRequestTrustedPredecessor(state, root);
+  return predecessor !== null && predecessor.headRefOid === root.source.current.headRefOid &&
+    predecessor.sourceRootItemId === root.itemId &&
+    (predecessor.canonicalRootItemId === null || predecessor.canonicalRootItemId === root.itemId) &&
+    (predecessor.lastTrustedRootItemId === null || predecessor.lastTrustedRootItemId === root.itemId);
 }
 
 function newWorkAdmissionRun(value) {
@@ -416,6 +500,7 @@ function queryClaimCandidatePage(records, options = {}) {
   const start = queryPageStart(records, "itemId", boundary.cursor);
   const selected = records.slice(start).filter((item) =>
     isClaimCandidateAt(item, at) &&
+    !isParentCoordinationReturn(item) &&
     (
       roleId === undefined ||
       (
@@ -432,23 +517,17 @@ function queryClaimCandidatePage(records, options = {}) {
         ? pageItems.at(-1).itemId
         : null,
   };
-  const statusById = new Map(records.map((item) => [item.itemId, item.status]));
-  const childrenByParent = new Map();
-  for (const item of records) {
-    const parentItemId = item.graph?.parentItemId;
-    if (typeof parentItemId !== "string") continue;
-    const children = childrenByParent.get(parentItemId) ?? [];
-    children.push(item);
-    childrenByParent.set(parentItemId, children);
-  }
+  const { byId, childrenByParent, graphProgressDigest } = indexWorkLedgerGraphProgress(records);
   const facts = page.items.map((item) => {
     const children = childrenByParent.get(item.itemId) ?? [];
     const dependencies = item.graph?.dependsOnItemIds ?? [];
+    const progress = graphProgressDigest(item);
     return {
       itemId: item.itemId,
+      ...(progress === null ? {} : { graphProgressDigest: progress }),
       graphBlocked:
         dependencies.some((dependencyId) =>
-          !CLAIM_DEPENDENCY_SATISFIED_STATUSES.has(statusById.get(dependencyId))
+          !CLAIM_DEPENDENCY_SATISFIED_STATUSES.has(byId.get(dependencyId)?.status)
         ) ||
         children.some((child) =>
           !CLAIM_CHILD_SETTLED_STATUSES.has(child.status)
@@ -556,6 +635,10 @@ export class WorkLedgerService {
     limits,
     postCommitYield = DEFAULT_POST_COMMIT_YIELD,
     candidateProcessor = createLocalWorkLedgerCandidateProcessor(),
+    confirmationSettlementReader = null,
+    obsoleteCodeJobSettler = null,
+    hostContextRecoveryReader = null,
+    reviewTestingRetirementReader = null,
   } = {}) {
     if (
       !store ||
@@ -582,6 +665,16 @@ export class WorkLedgerService {
     if (typeof postCommitYield !== "function") {
       throw new TypeError("postCommitYield must be a function");
     }
+    if (confirmationSettlementReader !== null &&
+      typeof confirmationSettlementReader?.read !== "function") {
+      throw new TypeError("confirmationSettlementReader must provide read");
+    }
+    if (obsoleteCodeJobSettler !== null && typeof obsoleteCodeJobSettler?.settle !== "function") {
+      throw new TypeError("obsoleteCodeJobSettler must provide settle");
+    }
+    if (hostContextRecoveryReader !== null && typeof hostContextRecoveryReader?.read !== "function") {
+      throw new TypeError("hostContextRecoveryReader must provide read");
+    }
     if (
       !candidateProcessor ||
       typeof candidateProcessor.prepare !== "function" ||
@@ -601,13 +694,23 @@ export class WorkLedgerService {
     this.idFactory = idFactory;
     this.postCommitYield = postCommitYield;
     this.candidateProcessor = candidateProcessor;
+    this.confirmationSettlementReader = confirmationSettlementReader;
+    this.obsoleteCodeJobSettler = obsoleteCodeJobSettler;
+    this.hostContextRecoveryReader = hostContextRecoveryReader;
+    if (reviewTestingRetirementReader !== null && typeof reviewTestingRetirementReader?.read !== 'function') {
+      throw new TypeError('reviewTestingRetirementReader must provide read');
+    }
+    this.reviewTestingRetirementReader = reviewTestingRetirementReader;
+    this.reviewTestingRetirementCursor = 0;
     this.limits = normalizeWorkLedgerLimits(limits);
     this.state = emptyWorkLedgerState();
     this.durableContentVersion = undefined;
+    this.committedAuthoritySnapshot = null;
     this.graphSnapshotCache = null;
     this.roleWorkloadCache = null;
     this.ready = false;
     this.recoveryPromise = null;
+    this.pullRequestScopeRecoveryPending = true;
   }
 
   async recover() {
@@ -616,6 +719,9 @@ export class WorkLedgerService {
       this.exclusiveLease.run(async () => {
         try {
           this.state = await this.#readDurableState();
+          await this.#reconcileRecoveredPullRequestScopes();
+          await this.#recoverInactivePullRequestTakeovers();
+          await this.#recoverCompletedRepairEvidence();
           await this.#reconcileRecoveredPullRequestAuthorityFences();
           await this.#reconcileRecoveredIssueScopes();
           this.ready = true;
@@ -714,9 +820,130 @@ export class WorkLedgerService {
     return queryWorkItemPage(this.state.items, options);
   }
 
+  async readAutomaticRoleHandoffCandidates({ events, afterSubjectId = null }) {
+    this.#assertReady();
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const candidates = events.map(event => {
+        const candidate = automaticRoleHandoffCandidate(this.state, event);
+        return candidate === null ? null : { ...candidate, event };
+      }).filter(Boolean).sort((a, b) => a.event.subject.id.localeCompare(b.event.subject.id, "en"));
+      const after = afterSubjectId === null ? 0 : candidates.findIndex(candidate => candidate.event.subject.id.localeCompare(afterSubjectId, "en") > 0);
+      const start = after < 0 ? 0 : after;
+      return cloneLedgerValue([...candidates.slice(start), ...candidates.slice(0, start)].slice(0, 10));
+    }));
+  }
+
+  async canReconnectOwnPullRequest({ itemId, expectedRevision, event }) {
+    this.#assertReady();
+    event = normalizeStoredWorkflowEvent(event);
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const previous = this.state.items.find(item => item.itemId === itemId);
+      if (!previous || previous.revision !== expectedRevision || previous.kind !== "source_root" ||
+          previous.source?.kind !== "pull_request" || previous.source.scope.kind !== "automatic" ||
+          previous.source.scope.active !== false || previous.source.pendingRevision !== null ||
+          previous.status !== "blocked" || previous.statusReason !== "pr_source_left_scope" ||
+          previous.sourceQuarantine !== null || previous.activeIntentId !== null ||
+          previous.ownerId !== null || previous.leaseId !== null || previous.leaseUntil !== null ||
+          previous.source.identity.subjectId !== event.subject.id ||
+          previous.source.identity.repository !== event.subject.repository ||
+          previous.source.identity.pullRequestNumber !== event.subject.number) return false;
+      // This only supplies discovery lineage; normal intake still owns cutover.
+      // The live Base may have advanced while the missing Head bridge was fenced.
+      const target = this.state.items.find(item => samePullRequestSubject(previous, item) &&
+        item.source.scope.kind === "automatic" && item.source.scope.active === true &&
+        item.currentTarget.id === "developer" && item.status === "blocked" &&
+        item.statusReason === PR_SOURCE_AUTHORITY_FENCED_REASON && item.source.pendingRevision === null &&
+        item.sourceQuarantine === null && item.activeIntentId === null && item.decisionContext === null &&
+        item.ownerId === null && item.leaseId === null && item.leaseUntil === null &&
+        item.source.current.headRefOid === event.payload.headRefOid &&
+        item.source.current.event.source.provider === event.source.provider &&
+        item.source.current.event.source.scopeId === event.source.scopeId &&
+        samePullRequestGitTarget({ ...item.source.current.event.payload.gitTarget,
+          baseRefOid: event.payload.gitTarget.baseRefOid }, event.payload.gitTarget));
+      if (!target) return false;
+      const authority = pullRequestTrustedPredecessor(this.state, target);
+      if (authority?.canonicalRootItemId !== null || authority.authorityFenced !== true ||
+          authority.sourceRootItemId !== previous.itemId || authority.headRefOid !== previous.source.current.headRefOid) return false;
+      const participants = this.state.items.filter(item =>
+        [previous.itemId, target.itemId].includes(currentWorkItemInputBinding(item)?.rootItemId));
+      return !participants.some(item => item.itemId !== previous.itemId && item.itemId !== target.itemId &&
+        !CLAIM_CHILD_SETTLED_STATUSES.has(item.status));
+    }));
+  }
+
+  async readItemProgress(itemIds) {
+    this.#assertReady();
+    if (!Array.isArray(itemIds) || itemIds.length > MAX_WORK_LEDGER_QUERY_PAGE ||
+      itemIds.some((id) => typeof id !== "string" || !id || id.length > 192)) {
+      throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "工作项进度查询无效");
+    }
+    const requested = new Set(itemIds);
+    const { graphProgressDigest } = indexWorkLedgerGraphProgress(this.state.items);
+    return this.state.items.filter((item) => requested.has(item.itemId)).map((item) => {
+      const progress = graphProgressDigest(item);
+      return cloneLedgerValue({
+        itemId: item.itemId, status: item.status, statusReason: item.statusReason,
+        currentTarget: item.currentTarget, updatedAt: item.updatedAt,
+        ...(progress === null ? {} : { graphProgressDigest: progress }),
+      });
+    });
+  }
+
+  async readRepairDecisionBudget({ itemId, expectedRevision }) {
+    this.#assertReady();
+    const item = this.state.items.find(entry => entry.itemId === itemId);
+    if (!item || item.revision !== expectedRevision) return null;
+    return cloneLedgerValue(repairDecisionAttemptBudget(this.state, item));
+  }
+
   async listClaimCandidates(options = {}) {
     this.#assertReady();
-    return queryClaimCandidatePage(this.state.items, options);
+    const page = queryClaimCandidatePage(this.state.items, options);
+    const failures = new Map([...indexRecordedDecisionFailures(this.state), ...indexUnstartedCodeDispatchFailures(this.state),
+      ...indexRecordedProposalFailures(this.state)]);
+    const failedChildParents = recordedFailureParentIds(this.state, failures);
+    const coordinationParents = new Set(indexParentCoordinationReturns(this.state).values());
+    page.items.forEach((item, index) => {
+      if (hasPendingHostContextRecovery(this.state, item) || failedChildParents.has(item.itemId) ||
+          coordinationParents.has(item.itemId)) page.facts[index].orchestrationReady = true;
+    });
+    return page;
+  }
+
+  // These host producer ports are intentionally absent from public runtime,
+  // native, HTTP and CLI facades. A plain or replayed object never writes proof.
+  async readHostHeadAncestryCandidates({ events, afterItemId = null }) {
+    this.#assertReady();
+    const current = new Map(events.map(event => [event.subject.id, event]));
+    const candidates = this.state.items.filter(item => item.kind === "source_root" && item.currentTarget?.id === "developer" &&
+      item.source?.scope?.kind === "automatic" && item.source.scope.active === false &&
+      current.has(currentWorkItemEvent(item).subject.id) && ownsHeadAncestryPredecessor(this.state, item)).sort((a, b) => a.itemId.localeCompare(b.itemId));
+    const start = afterItemId === null ? 0 : candidates.findIndex(item => item.itemId > afterItemId);
+    const index = start < 0 ? 0 : start;
+    return cloneLedgerValue({ items: [...candidates.slice(index), ...candidates.slice(0, index)].slice(0, 2)
+      .map(root => ({ root, event: current.get(currentWorkItemEvent(root).subject.id) })) });
+  }
+
+  async recordHostHeadAncestry(credential) {
+    const receipt = consumeHeadAncestryCredential(credential);
+    if (receipt === null) return null;
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
+      const root = this.state.items.find(item => item.itemId === receipt.rootItemId), source = root?.source;
+      if (root?.revision !== receipt.rootRevision || root.kind !== "source_root" || root.currentTarget?.id !== "developer" ||
+          source?.scope?.kind !== "automatic" || source.scope.active !== false || root.sourceQuarantine !== null ||
+          root.ownerId !== null || root.leaseId !== null || root.leaseUntil !== null ||
+          !["blocked", "waiting_external"].includes(root.status) || source.pendingRevision !== null ||
+          source.workKey !== receipt.sourceWorkKey || source.inputRevision !== receipt.sourceInputRevision ||
+          source.current.inputDigest !== receipt.sourceInputDigest || source.authorityEpoch !== receipt.authorityEpoch ||
+          source.current.headRefOid !== receipt.ancestorHeadRefOid || !ownsHeadAncestryPredecessor(this.state, root)) return null;
+      const at = this.#now(), updated = { ...root, revision: root.revision + 1, updatedAt: at,
+        source: { ...source, headAncestryReceipt: receipt } };
+      return this.#commitMutation({ patch: { items: this.state.items.map(item => item.itemId === root.itemId ? updated : item) },
+        timelineEvents: [{ itemId: root.itemId, type: "pr_source_ignored", at, actorId: "host-head-ancestry-reader",
+          details: { disposition: "host_ancestry_attested", receiptId: receipt.receiptId } }], result: receipt });
+    }));
   }
 
   async listPendingPullRequestSources(options = {}) {
@@ -741,11 +968,21 @@ export class WorkLedgerService {
 
   async listTimeline(options = {}) {
     this.#assertReady();
+    if (isPlainLedgerObject(options) && Object.hasOwn(options, "itemId")) {
+      const { itemId: suppliedItemId, ...pageOptions } = options;
+      const itemId = boundedLedgerString(suppliedItemId, "itemId", 192);
+      return queryPage(this.state.timeline.filter((entry) => entry.itemId === itemId), "timelineId", pageOptions);
+    }
     return queryPage(this.state.timeline, "timelineId", options);
   }
 
   async listOutbox(options = {}) {
     this.#assertReady();
+    if (isPlainLedgerObject(options) && Object.hasOwn(options, "itemId")) {
+      const { itemId: suppliedItemId, ...pageOptions } = options;
+      const itemId = boundedLedgerString(suppliedItemId, "itemId", 192);
+      return queryPage(this.state.outbox.filter(entry => entry.itemId === itemId), "intentId", pageOptions, WORK_LEDGER_OUTBOX_STATUSES);
+    }
     return queryPage(
       this.state.outbox,
       "intentId",
@@ -771,19 +1008,59 @@ export class WorkLedgerService {
         "工作项恢复查询无效",
       );
     }
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        const item = this.state.items.find(
-          (candidate) => candidate.itemId === itemId,
-        );
-        return item ? cloneLedgerValue(item) : null;
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    const item = state.items.find(candidate => candidate.itemId === itemId);
+    return item ? cloneLedgerValue(item) : null;
+  }
+
+  async readReviewAdoptionContext(input = {}) {
+    this.#assertReady();
+    if (!hasExactLedgerKeys(input, ["itemId"])) throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "Review 采用上下文查询无效");
+    let itemId;
+    try { itemId = boundedLedgerString(input.itemId, "itemId", 192); }
+    catch { throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "Review 采用上下文查询无效"); }
+    const state = await this.#readCommittedAuthorityState();
+    const item = state.items.find(candidate => candidate.itemId === itemId);
+    if (!item) return null;
+    const inputBinding = currentWorkItemExecutionBinding(item);
+    const root = inputBinding === null ? null : state.items.find(candidate => candidate.itemId === inputBinding.rootItemId) ?? null;
+    const activeDispatch = item.activeIntentId === null ? null : state.outbox.find(candidate => candidate.intentId === item.activeIntentId) ?? null;
+    return cloneLedgerValue({ item, root, activeDispatch });
+  }
+
+  async readInternalReviewHandoff(input = {}) {
+    this.#assertReady();
+    if (!hasExactLedgerKeys(input, ["itemId"])) throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部复审交接查询无效");
+    let itemId;
+    try { itemId = boundedLedgerString(input.itemId, "itemId", 192); }
+    catch { throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部复审交接查询无效"); }
+    return this.operationQueue.enqueue(() => this.exclusiveLease.run(async () => {
+      this.state = await this.#readDurableState();
+      const item = this.state.items.find((entry) => entry.itemId === itemId);
+      const proof = currentPrRoleHandoffProof(this.state, item, {
+        fromRoleId: 'developer', targetRoleId: 'pr-engineer', capability: 'pr-review',
+      });
+      return proof === null ? null : cloneLedgerValue({ kind: "developer_handoff", headRefOid: proof.executionBinding.headRefOid,
+        brief: proof.bound.payload.brief, evidence: proof.bound.payload.evidence, evidenceAuthority: "developer_report" });
+    }));
   }
 
   async isAttentionRequestCurrent(input = {}) {
+    return (await this.areAttentionRequestsCurrent([input]))[0];
+  }
+
+  async areAttentionRequestsCurrent(inputs) {
     this.#assertReady();
+    if (!Array.isArray(inputs) || inputs.length > 1_000) {
+      throw workLedgerError("WORK_LEDGER_QUERY_INVALID", "内部请示授权查询无效");
+    }
+    const bindings = inputs.map((input) => this.#normalizeAttentionAuthority(input));
+    if (bindings.length === 0) return [];
+    const state = await this.#readCommittedAuthorityState();
+    return bindings.map((binding) => this.#attentionCurrentInState(state, binding));
+  }
+
+  #normalizeAttentionAuthority(input) {
     if (
       !hasExactLedgerKeys(input, ["requestKey", "producer"]) ||
       !isPlainLedgerObject(input.producer) ||
@@ -811,15 +1088,32 @@ export class WorkLedgerService {
         "内部请示授权查询无效",
       );
     }
-    const item = this.state.items.find(
+    return { requestKey, roleId, workItemId };
+  }
+
+  #attentionCurrentInState(state, { requestKey, roleId, workItemId }) {
+    const item = state.items.find(
       (candidate) => candidate.itemId === workItemId,
     );
+    const intent = state.outbox.find(
+      (candidate) => candidate.intentId === requestKey,
+    );
+    const ownsTarget =
+      item?.currentTarget?.type === "role" &&
+      item.currentTarget.id === roleId;
+    const orchestratorTakeover =
+      roleId === "orchestrator" &&
+      intent?.requestedBy?.workerId === "employee-orchestrator";
     return Boolean(
       item?.status === "waiting_user" &&
         item.activeIntentId === requestKey &&
-        item.currentTarget?.type === "role" &&
-        item.currentTarget.id === roleId &&
-        !hasNewerIssueAssignment(this.state.items, item),
+        intent?.itemId === workItemId &&
+        attentionResultInputBinding(state, item, intent) !== undefined &&
+        intent.status === "delivered" &&
+        intent.intent?.type === "ask_user" &&
+        intent.requestedBy?.roleId === roleId &&
+        (ownsTarget || orchestratorTakeover) &&
+        !hasNewerIssueAssignment(state.items, item),
     );
   }
 
@@ -898,14 +1192,8 @@ export class WorkLedgerService {
 
   async verifyPullRequestExecutionBinding(input = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        return cloneLedgerValue(
-          verifyPullRequestExecutionAuthority(this.state, input),
-        );
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    return cloneLedgerValue(verifyPullRequestExecutionAuthority(state, input));
   }
 
   async verifyPullRequestExecutionBindings(input = {}) {
@@ -951,46 +1239,95 @@ export class WorkLedgerService {
     );
   }
 
-  async readPullRequestExecutionContext(input = {}) {
+  async readAutomaticReviewAdmission(input = {}) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        this.state = await this.#readDurableState();
-        const inputBinding = verifyPullRequestExecutionAuthority(
-          this.state,
-          input,
-        );
-        const root = this.state.items.find(
-          (candidate) => candidate.itemId === inputBinding.rootItemId,
-        );
-        const author = root?.source?.current?.event?.payload?.author;
-        return cloneLedgerValue({
-          inputBinding,
-          author:
-            typeof author === "string" && GITHUB_LOGIN.test(author)
-              ? author
-              : null,
-        });
-      }),
-    );
+    const state = await this.#readCommittedAuthorityState();
+    const inputBinding = verifyPullRequestExecutionAuthority(state, input);
+    const root = state.items.find(item => item.itemId === inputBinding.rootItemId);
+    return cloneLedgerValue({ inputBinding, admission: automaticReviewWorkAdmission(root, inputBinding.inputRevision) });
   }
 
-  async getGraphSnapshot() {
+  // The low-risk promoter may point to work already admitted by the GitHub
+  // source. Reusing this pointer creates no owner request or execution authority.
+  async readCurrentAutomaticReviewWork({ repository, number, headRefOid, gitTarget }) {
     this.#assertReady();
-    return this.operationQueue.enqueue(() =>
-      this.exclusiveLease.run(async () => {
-        // Graph reads are also used to reconcile uncertain writes. Refresh
-        // from durable state so an applied write with a lost ACK is visible in
-        // the same recovery cycle rather than only after another mutation.
-        this.state = await this.#readDurableState();
-        return this.#currentGraphSnapshot();
-      }),
-    );
+    const target = normalizePullRequestGitTarget(gitTarget);
+    if (!Number.isSafeInteger(number) || number < 1 || typeof repository !== "string" ||
+        target.baseRepository !== repository || target.headRefOid !== headRefOid) return null;
+    const state = await this.#readCommittedAuthorityState();
+    for (const root of state.items) {
+      if (root.kind !== "source_root" || root.currentTarget?.id !== "pr-engineer" ||
+          root.graph.parentItemId !== null || ["completed", "cancelled", "superseded"].includes(root.status) ||
+          root.source?.scope.kind !== "automatic" || root.source.scope.active !== true ||
+          root.sourceQuarantine !== null || root.source.pendingRevision !== null ||
+          root.source.identity.repository !== repository || root.source.identity.pullRequestNumber !== number) continue;
+      const event = root.source.current.event;
+      const admission = automaticReviewWorkAdmission(root);
+      if (event.source.provider !== "github" || event.payload.relation !== "review_requested" || admission === null ||
+          automaticReviewContinuationEligibility({ ...event.payload, kind: "pull_request" }, target.sourceAccountId, this.#now(), admission) !== null) continue;
+      const binding = currentWorkItemExecutionBinding(root);
+      if (!binding?.gitTarget || !samePullRequestGitTarget(binding.gitTarget, target)) continue;
+      try { verifyPullRequestExecutionAuthority(state, binding); }
+      catch (error) { if (error.code === "WORK_LEDGER_PR_EXECUTION_BINDING_STALE") continue; throw error; }
+      return { workItemId: root.itemId };
+    }
+    return null;
+  }
+
+  async readPullRequestExecutionContext(input = {}) {
+    this.#assertReady();
+    const state = await this.#readCommittedAuthorityState();
+    const inputBinding = verifyPullRequestExecutionAuthority(state, input);
+    const root = state.items.find(candidate => candidate.itemId === inputBinding.rootItemId);
+    const author = root?.source?.current?.event?.payload?.author;
+    const reviewFeedbackDigest = root?.source?.current?.event?.payload?.reviewFeedbackDigest;
+    return cloneLedgerValue({
+      inputBinding,
+      author: typeof author === "string" && GITHUB_LOGIN.test(author) ? author : null,
+      ...(typeof reviewFeedbackDigest === "string" ? { reviewFeedbackDigest } : {}),
+    });
+  }
+
+  async getGraphSnapshot({ signal = null } = {}) {
+    this.#assertReady();
+    signal = normalizeAbortSignal(signal);
+    const assertActive = () => {
+      if (signal?.aborted) throw signal.reason ?? new DOMException("Graph read was aborted", "AbortError");
+    };
+    assertActive();
+    // Read the committed file even when an unrelated candidate holds the writer
+    // lease. A lost write ACK remains visible; an uncommitted candidate does not.
+    const state = await this.#readCommittedAuthorityState();
+    assertActive();
+    return this.#currentGraphSnapshot(state);
+  }
+
+  async readAttentionRequestRetirement(input = {}) {
+    // A temporarily non-current question is not proof that its task ended.
+    await this.isAttentionRequestCurrent(input);
+    const state = await this.#readCommittedAuthorityState();
+    const item = state.items.find((candidate) => candidate.itemId === input.producer.workItemId);
+    const intent = state.outbox.find((candidate) => candidate.intentId === input.requestKey);
+    const ciRetirement = ciMaterialRetirement(intent);
+    const hostRetirement = hostContextRetirement(intent);
+    const maintenance = systemMaintenanceRetirement(intent) ?? hostRetirement ?? ciRetirement;
+    if (item && intent?.itemId === item.itemId && intent.requestedBy.roleId === input.producer.roleId && maintenance !== null) {
+      return { status: ciRetirement || ["delivery", "review"].includes(hostRetirement?.failure.stage) ? "queued" : "retry_wait",
+        workItemRevision: maintenance.workItemRevision, reason: maintenance.reason };
+    }
+    if (
+      !item || !["cancelled", "completed", "superseded"].includes(item.status) ||
+      item.activeIntentId !== null || intent?.itemId !== item.itemId ||
+      intent.intent.type !== "ask_user" || intent.requestedBy.roleId !== input.producer.roleId
+    ) return null;
+    return {
+      status: item.status, workItemRevision: item.revision, reason: item.statusReason,
+    };
   }
 
   async getLastCommittedGraphSnapshot() {
     this.#assertReady();
-    return this.#currentGraphSnapshot();
+    return this.#currentGraphSnapshot(this.committedAuthoritySnapshot?.state ?? this.state);
   }
 
   async readGraphMemoryProjectionBatch(options = {}) {
@@ -1076,6 +1413,9 @@ export class WorkLedgerService {
       "limit",
     );
     return this.#admitNewWork(() => this.#writeTransaction(async () => {
+      if (this.pullRequestScopeRecoveryPending) {
+        await this.#reconcileRecoveredPullRequestScopes();
+      }
       const afterSequence = this.state.intakeCursor;
       let rawBatch;
       try {
@@ -1168,7 +1508,12 @@ export class WorkLedgerService {
   }
 
   async reconcilePullRequestSource(input = {}) {
-    return this.#executeCommand(planPullRequestSourceReconciliation, input);
+    this.#assertReady();
+    const command = normalizePullRequestSourceReconciliationCommand(input);
+    const confirmationSettlements = await this.#readConfirmationSettlements([command], command.expectedGraphRevision);
+    return this.#executeCommand((options) => planPullRequestSourceReconciliation({
+      ...options, confirmationSettlements,
+    }), command);
   }
 
   async reconcilePullRequestSourceBatch(input = {}) {
@@ -1193,6 +1538,10 @@ export class WorkLedgerService {
         "PR 来源批量对账请求无效",
       );
     }
+    const commands = input.items.map((item) => normalizePullRequestSourceReconciliationCommand({
+      ...item, expectedGraphRevision: input.expectedGraphRevision,
+    }));
+    const confirmationSettlements = await this.#readConfirmationSettlements(commands, input.expectedGraphRevision);
     return this.#writeTransaction(async () => {
       if (this.state.revision !== input.expectedGraphRevision) {
         throw workLedgerError(
@@ -1213,6 +1562,7 @@ export class WorkLedgerService {
             },
             clock: () => this.#now(),
             timelineLimit: this.limits.timelineLimit,
+            confirmationSettlements,
           });
         } catch (error) {
           if (
@@ -1240,6 +1590,99 @@ export class WorkLedgerService {
     });
   }
 
+  async #readConfirmationSettlements(commands, expectedGraphRevision) {
+    if (this.confirmationSettlementReader === null) return null;
+    if (!this.state.items.some((item) => item.status === "blocked" &&
+      item.activeIntentId === null && (isChangedCodeConfirmationDecision(item.decisionContext) ||
+        isChangedReviewConfirmationDecision(item.decisionContext)))) return null;
+    // Never hold the ledger lease while entering the confirmation queue: its
+    // executor can call back into this ledger when verifying code authority.
+    const snapshot = await this.#writeTransaction(() => {
+      if (this.state.revision !== expectedGraphRevision) {
+        throw workLedgerError("WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT", "PR 来源对账的台账版本已变化", 409);
+      }
+      const itemsById = new Map(this.state.items.map((item) => [item.itemId, item]));
+      const candidates = new Map();
+      const eligible = this.state.items.filter((item) => item.status === "blocked" &&
+        item.activeIntentId === null && (isChangedCodeConfirmationDecision(item.decisionContext) ||
+          isChangedReviewConfirmationDecision(item.decisionContext)))
+        .map((item) => ({ item, binding: currentWorkItemInputBinding(item) }));
+      for (const command of commands) {
+        const root = itemsById.get(command.itemId);
+        if (root?.source?.kind !== "pull_request") continue;
+        if (root.revision !== command.expectedRevision ||
+          (root.source.pendingRevision ?? root.source.activeRevision) !== command.expectedPendingRevision) {
+          throw workLedgerError("WORK_LEDGER_PR_SOURCE_RECONCILIATION_CONFLICT", "PR 来源对账的工作项版本已变化", 409);
+        }
+        const predecessorId = crossRootPullRequestCutoverPredecessorId(root);
+        if (root.source.pendingRevision === null && predecessorId === null) continue;
+        const participantRoot = predecessorId === null ? root : itemsById.get(predecessorId);
+        if (participantRoot === undefined) continue;
+        const active = currentWorkItemInputBinding(participantRoot);
+        for (const { item, binding } of eligible) {
+          if ((item.itemId === participantRoot.itemId ||
+              (binding?.rootItemId === participantRoot.itemId &&
+                binding.headRevision === active?.headRevision))) candidates.set(item.itemId, item);
+        }
+      }
+      return {
+        candidates: cloneLedgerValue([...candidates.values()].slice(0, MAX_WORK_LEDGER_QUERY_PAGE)),
+        outbox: cloneLedgerValue(this.state.outbox.filter(({ itemId }) => candidates.has(itemId))),
+      };
+    });
+    const outboxById = new Map(snapshot.outbox.map((entry) => [entry.intentId, entry]));
+    const proofs = new Map();
+    for (const item of snapshot.candidates) {
+      if (isChangedReviewConfirmationDecision(item.decisionContext)) {
+        const confirmations = [];
+        for (const confirmationId of reviewConfirmationSettlementIds(item, outboxById)) {
+          confirmations.push(await this.confirmationSettlementReader.read({ confirmationId }));
+        }
+        const proof = createCompletedReviewConfirmationSettlement(item, outboxById, confirmations);
+        if (proof !== null) proofs.set(item.itemId, proof);
+        continue;
+      }
+      const confirmation = await this.confirmationSettlementReader.read({
+        confirmationId: codeConfirmationSettlementId(item.decisionContext),
+      });
+      let proof = createRevokedCodeConfirmationSettlement(item, outboxById, confirmation);
+      if (proof === null && typeof this.obsoleteCodeJobSettler?.read === "function") {
+        const unstarted = unstartedCodeConfirmationForSettlement(item, outboxById, confirmation);
+        if (unstarted !== null) {
+          const job = await this.obsoleteCodeJobSettler.read(unstarted);
+          proof = createUnstartedCodeConfirmationSettlement(item, outboxById, confirmation, job);
+        }
+      }
+      if (proof === null && this.obsoleteCodeJobSettler !== null) {
+        const completed = completedCodeConfirmationForSettlement(item, outboxById, confirmation);
+        if (completed !== null) {
+          // A stored unknown result cannot authorize cancelling another live or
+          // uncertain job. Only its already terminal fence can enter settlement.
+          if (item.decisionContext.outcome === "unknown" &&
+              (typeof this.obsoleteCodeJobSettler.read !== "function" ||
+                (await this.obsoleteCodeJobSettler.read(completed))?.status !== "fenced")) continue;
+          const job = await this.obsoleteCodeJobSettler.settle({ grant: completed.grant, receipt: completed.receipt }, {
+            admitCancellation: (operation) => this.#writeTransaction(() => {
+              if (this.state.revision !== expectedGraphRevision) {
+                throw workLedgerError("WORK_LEDGER_STATE_REVISION_CONFLICT", "PR 来源在取消入场前已变化", 409);
+              }
+              // Enqueue under the source fence, then await outside the ledger
+              // lease: cancellation can itself need the ledger/session queues.
+              return { operation: operation() };
+            }),
+          });
+          proof = createCompletedCodeConfirmationSettlement(item, outboxById, confirmation, job);
+        }
+      }
+      if (proof !== null) proofs.set(item.itemId, proof);
+    }
+    // Revoked unstarted confirmations and terminal code jobs cannot resume.
+    // Their settlement remains valid while we reacquire the ledger lease.
+    // The planner re-reads durable state and checks its normal graph/item CAS;
+    // each opaque proof additionally binds the captured item and outbox versions.
+    return proofs;
+  }
+
   async claim(input = {}) {
     return this.#admitNewWork(() =>
       this.#executeCommand(planWorkItemClaim, input, true),
@@ -1248,6 +1691,67 @@ export class WorkLedgerService {
 
   async transition(input = {}) {
     return this.#executeCommand(planWorkItemTransition, input);
+  }
+
+  async #prepareUnstartedReviewRecovery({ itemId, expectedRevision }) {
+    if (!this.confirmationSettlementReader) return null;
+    const item = await this.readItemForReconciliation({ itemId });
+    const eligible = candidate => candidate?.revision === expectedRevision && candidate.kind === "source_root" &&
+      candidate.status === "blocked" && candidate.statusReason === "proposal_stale" &&
+      candidate.currentTarget?.id === "pr-engineer" && candidate.ownerId === null && candidate.leaseId === null &&
+      candidate.activeIntentId === null && candidate.sourceQuarantine === null && candidate.graph.deliveries.length === 0;
+    if (!eligible(item)) return null;
+    const outboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, cloneLedgerValue(entry)]));
+    if (![...outboxes.values()].some(entry => entry.outcome?.details?.downstreamRef === item.decisionContext.referenceId &&
+        entry.updatedAt === item.updatedAt)) return null;
+    const ids = reviewConfirmationSettlementIds(item, outboxes);
+    if (ids.length === 0) return null;
+    const confirmations = [];
+    for (const confirmationId of ids) confirmations.push(await this.confirmationSettlementReader.read({ confirmationId }));
+    // A revoked row is as settled as absence only when publication never began.
+    // The settlement proof below still binds every historical identity and row.
+    if (confirmations.some(value => value !== null && (
+      value?.item?.status !== "stale" || value.item.execution !== null || value.item.failure !== null ||
+      value.item.receipt !== null || value.item.rejection !== null ||
+      value.item.invalidation?.reason !== "authorization_changed"
+    ))) return null;
+    const proof = createCompletedReviewConfirmationSettlement(item, outboxes, confirmations);
+    if (proof === null) return null;
+    const timeline = this.state.timeline.filter(entry => entry.itemId === itemId);
+    if (timeline[0]?.type !== "pr_source_created" || timeline[0].at !== item.createdAt ||
+        timeline.some(entry => entry.details.reason === "review_authority_context_recovered") ||
+        this.state.items.some(candidate => candidate.graph?.parentItemId === itemId)) return null;
+    return { item, proof, eligible };
+  }
+
+  async canRecoverUnstartedReviewProposal(input) {
+    return await this.#prepareUnstartedReviewRecovery(input) !== null;
+  }
+
+  async recoverUnstartedReviewProposal({ itemId, expectedRevision }) {
+    const prepared = await this.#prepareUnstartedReviewRecovery({ itemId, expectedRevision });
+    if (prepared === null) return false;
+    const { item, proof, eligible } = prepared;
+    return this.#admitNewWork(() => this.#writeTransaction(async () => {
+      const current = this.state.items.find(candidate => candidate.itemId === itemId);
+      const currentOutboxes = new Map(this.state.outbox.filter(entry => entry.itemId === itemId).map(entry => [entry.intentId, entry]));
+      const timeline = this.state.timeline.filter(entry => entry.itemId === itemId);
+      if (!eligible(current) || ledgerDigest(current) !== ledgerDigest(item) ||
+          !hasReviewConfirmationSettlement(current, currentOutboxes, proof) ||
+          timeline[0]?.type !== "pr_source_created" || timeline[0].at !== current.createdAt ||
+          timeline.some(entry => entry.details.reason === "review_authority_context_recovered") ||
+          this.state.items.some(candidate => candidate.graph?.parentItemId === itemId)) return false;
+      verifyPullRequestExecutionAuthority(this.state, currentWorkItemExecutionBinding(current));
+      const mutation = planWorkItemTransition({ state: this.state, input: { itemId, expectedRevision, leaseId: null,
+        actorId: "work-ledger-system", toStatus: "queued", reason: "review_authority_context_recovered",
+        details: { evidenceRefs: [`proposal:${current.decisionContext.referenceId}`] } }, clock: () => this.#now() });
+      await this.#commitMutation(mutation);
+      return true;
+    }));
+  }
+
+  async controlModelRun(input = {}) {
+    return this.#executeCommand(planWorkItemRunControl, input);
   }
 
   async scheduleRetry(input = {}) {
@@ -1269,8 +1773,34 @@ export class WorkLedgerService {
     return this.#executeCommand(planner, input);
   }
 
+  async retireAutomaticReviewTestingWork({ limit = 10 } = {}) {
+    validatePositiveLimit(limit, 100, 'limit');
+    if (!this.confirmationSettlementReader || !this.reviewTestingRetirementReader) return { retired: 0 };
+    const captured = await this.#writeTransaction(() => {
+      const candidates = this.state.items.filter(isReviewTestingRetirementCandidate);
+      const start = this.reviewTestingRetirementCursor % Math.max(1, candidates.length);
+      this.reviewTestingRetirementCursor = start + limit;
+      return cloneLedgerValue([...candidates.slice(start), ...candidates.slice(0, start)].slice(0, limit)
+        .map(reviewTestingRetirementCandidate).filter(Boolean));
+    });
+    let retired = 0;
+    for (const candidate of captured) {
+      const snapshot = await this.confirmationSettlementReader.read({ confirmationId: candidate.confirmationId });
+      if (!matchesAutomaticReviewTestingHandoff(candidate, snapshot)) continue;
+      // Stop/cancel executor activity outside the ledger lease, then recheck
+      // the captured root under its normal writer and graph cancellation rules.
+      const stopped = await this.reviewTestingRetirementReader.read(candidate);
+      if (!stopped) continue;
+      const result = await this.#admitNewWork(() => this.#executeCommand(options =>
+        planAutomaticReviewTestingRetirement({ ...options, captured: candidate, snapshot, stopped }), {}));
+      retired += result.retired;
+    }
+    return { retired };
+  }
+
   async createGraphChild(input = {}) {
-    return this.#executeCommand(planWorkGraphChildCreation, input);
+    return this.#executeCommand(Object.hasOwn(input.command ?? {}, "reviewReplacement")
+      ? planWorkGraphReviewReplacement : planWorkGraphChildCreation, input);
   }
 
   async reviseGraphAcceptance(input = {}) {
@@ -1319,6 +1849,77 @@ export class WorkLedgerService {
 
   async applyAttentionBatch(input = {}) {
     return this.#executeCommand(planAttentionBatchApplication, input);
+  }
+
+  async retrySystemMaintenanceQuestions(input = {}) {
+    const result = await this.#executeCommand(planSystemMaintenanceRetry, input);
+    if (!this.hostContextRecoveryReader || result.retried >= input.limit) return result;
+    const retired = await this.#retireSupersededTriageQuestions(input, input.limit - result.retried);
+    if (retired > 0) result.retired = retired;
+    if (result.retried + retired >= input.limit) return result;
+    // Called while the inbox holds its pending-question mutation lease. Read
+    // task-run controls outside the ledger writer, then revalidate durable CAS.
+    const captured = await this.#writeTransaction(() => {
+      const pending = new Set(input.requestKeys);
+      const candidates = [];
+      for (const item of this.state.items) {
+        if (!pending.has(item.activeIntentId)) continue;
+        const ci = ciMaterialRecoveryCandidate(this.state, item);
+        const candidate = ci ?? hostContextRecoveryCandidate(this.state, item);
+        if (candidate) candidates.push({ itemId: item.itemId, snapshotDigest: candidate.snapshotDigest,
+          ...(ci ? { ciMaterials: true, inputBinding: ci.readBinding, event: ci.readEvent } : {}),
+          ...(candidate.reviewDiagnostics ? { reviewDiagnostics: true, confirmationIds: candidate.confirmationIds } : {}),
+          ...(candidate.decisionOwner ? { controlItemId: candidate.decisionOwner.itemId, childItemId: item.itemId }
+            : candidate.guardedChildItemId ? { childItemId: candidate.guardedChildItemId } : {}) });
+        if (candidates.length >= input.limit - result.retried - retired) break;
+      }
+      return candidates;
+    });
+    for (const candidate of captured) {
+      const control = candidate.reviewDiagnostics
+        ? await this.hostContextRecoveryReader.readReviewDiagnostics?.({ itemId: candidate.itemId, childItemId: candidate.childItemId,
+          confirmationIds: candidate.confirmationIds }) : candidate.ciMaterials
+        ? await this.hostContextRecoveryReader.readCiMaterials?.({ itemId: candidate.itemId, inputBinding: candidate.inputBinding, event: candidate.event })
+        : await this.hostContextRecoveryReader.read({ itemId: candidate.controlItemId ?? candidate.itemId,
+          ...(candidate.childItemId ? { childItemId: candidate.childItemId } : {}) });
+      const planner = candidate.ciMaterials ? planCiMaterialRecovery : planHostContextRecovery;
+      const commit = () => this.#executeCommand(context => planner({ ...context, captured: candidate, control }), {});
+      const recovered = await this.#admitNewWork(() => {
+        if (!candidate.childItemId && !candidate.ciMaterials) return commit();
+        if (!control || typeof this.hostContextRecoveryReader.withStoppedRuns !== "function") return { retried: 0 };
+        return this.hostContextRecoveryReader.withStoppedRuns(control, commit)
+          .then(guarded => guarded.executed ? guarded.result : { retried: 0 });
+      });
+      result.retried += recovered.retried;
+    }
+    return result;
+  }
+
+  async #retireSupersededTriageQuestions(input, limit) {
+    const reader = this.hostContextRecoveryReader;
+    if (input.requestKeys.length === 0 || typeof reader.readTriageRetirement !== 'function' || typeof reader.withStoppedRuns !== 'function') return 0;
+    const captured = await this.#writeTransaction(() => {
+      if (this.state.attentionCursor < this.state.attentionHighWatermark) return [];
+      const pending = new Set(input.requestKeys), candidates = [];
+      for (const item of this.state.items) {
+        if (!pending.has(item.activeIntentId)) continue;
+        const candidate = triageRetirementCandidate(this.state, item);
+        if (candidate) candidates.push({ itemId: item.itemId, childItemId: candidate.child.itemId,
+          snapshotDigest: candidate.snapshotDigest, inputBinding: candidate.inputBinding,
+          confirmationIds: candidate.failure.confirmationIds });
+        if (candidates.length >= limit) break;
+      }
+      return candidates;
+    });
+    let retired = 0;
+    for (const candidate of captured) {
+      const control = await reader.readTriageRetirement(candidate);
+      if (!control) continue;
+      const guarded = await this.#admitNewWork(() => reader.withStoppedRuns(control, () =>
+        this.#executeCommand(context => planTriageRetirement({ ...context, captured: candidate, control }), {})));
+      if (guarded.executed) retired += guarded.result.retired;
+    }
+    return retired;
   }
 
   async applyProposalBatch(input = {}) {
@@ -1448,7 +2049,7 @@ export class WorkLedgerService {
     });
   }
 
-  async #recordBatch(batch, now, deniedCutoverProofs = new Set()) {
+  async #recordBatch(batch, now, deniedCutoverProofs = new Set(), scopeRecoveryRoots = null) {
     if (batch.items.length === 0) {
       return cloneLedgerValue({
         received: 0,
@@ -1550,8 +2151,86 @@ export class WorkLedgerService {
       });
       return activation;
     };
+    const applyRoleHandoff = (envelope) => {
+      const candidate = automaticRoleHandoffCandidate({ items: [...itemsById.values()] }, envelope.event);
+      const skipped = { candidate, applied: false };
+      if (candidate === null || candidate.proofDigest !== envelope.event.payload.roleHandoffProof) return skipped;
+      let target = itemsById.get(candidate.targetItemId);
+      const predecessor = itemsById.get(candidate.predecessorItemId);
+      // A predecessor marker cannot represent two independent unknown-effect
+      // chains. Settle the target's own previous scope before activating it.
+      const ownCutover = applyCutoverProofPolicy(inspectPullRequestSourceCutover(target,
+        [...itemsById.values()], outboxById, { forceHeadChanged: true,
+          timelineIndex: currentCutoverTimelineIndex() }), `role-handoff-own:${envelope.assignment.assignmentId}:${target.itemId}`);
+      if (ownCutover.blockers.length !== 0) return skipped;
+      const activation = applyPullRequestScopeLifecycle(target.source, envelope, { attemptAtActivation: target.attempt });
+      if (!activation.authorityChanged || !activation.source.scope.active) return skipped;
+      target = applyReadyPullRequestSourceCutover({ root: target, activation: ownCutover,
+        itemsById, outboxById, nextInputRevision: activation.source.activeRevision,
+        nextHeadRevision: activation.source.headRevision, now, timelineEvents });
+      target = { ...target, source: activation.source, inputDigest: activation.source.current.inputDigest };
+      const cutover = applyCutoverProofPolicy(inspectPullRequestSourceCutover(predecessor,
+        [...itemsById.values()], outboxById, { forceHeadChanged: true, replacementRoot: target,
+          timelineIndex: currentCutoverTimelineIndex() }), `role-handoff:${envelope.assignment.assignmentId}:${predecessor.itemId}:${target.itemId}`);
+      if (cutover.blockers.length === 0) {
+        const settled = applyReadyPullRequestSourceCutover({ root: predecessor,
+          activation: crossRootPullRequestCutoverActivation(predecessor, cutover), itemsById, outboxById,
+          nextInputRevision: target.source.activeRevision, nextHeadRevision: target.source.headRevision, now, timelineEvents });
+        const retired = retirePredecessorInBatch(predecessor, settled);
+        itemsById.set(retired.itemId, retired);
+        rootByWorkKey.set(retired.source.workKey, retired);
+        target.status = "queued";
+        target.statusReason = "pr_source_role_handoff";
+      } else {
+        target.status = "blocked";
+        target.statusReason = crossRootPullRequestCutoverPendingReason(predecessor.itemId);
+        for (const blocker of cutover.blockers) {
+          if (blocker.status === "cancelled") continue;
+          const marked = { ...blocker, revision: initialItemIds.has(blocker.itemId) && !revisedItemIds.has(blocker.itemId)
+            ? blocker.revision + 1 : blocker.revision,
+            statusReason: crossRootPullRequestCutoverBlockerReason(target.itemId), updatedAt: now };
+          revisedItemIds.add(marked.itemId);
+          itemsById.set(marked.itemId, marked);
+          if (marked.source?.kind === "pull_request") rootByWorkKey.set(marked.source.workKey, marked);
+        }
+      }
+      target = { ...target, revision: initialItemIds.has(target.itemId) && !revisedItemIds.has(target.itemId)
+        ? target.revision + 1 : target.revision, ownerId: null, leaseId: null, leaseUntil: null,
+        activeIntentId: null, decisionContext: null, availableAt: null, updatedAt: now };
+      revisedItemIds.add(target.itemId);
+      itemsById.set(target.itemId, target);
+      rootByWorkKey.set(target.source.workKey, target);
+      touchedItemIds.add(target.itemId);
+      return { candidate, applied: true };
+    };
     let received = 0;
     let deduplicated = 0;
+    const ignoreProtectedPullRequestReentry = (root, envelope, assignmentItem, disposition, recordAssignment = true) => {
+      if (recordAssignment) {
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+      }
+      timelineEvents.push({
+        itemId: root.itemId,
+        type: "pr_source_ignored",
+        at: now,
+        actorId: "work-ledger-system",
+        details: {
+          workKey: root.source.workKey,
+          sourceSequence: envelope.sequence,
+          assignmentId: assignmentItem.assignmentId,
+          eventId: envelope.event.eventId,
+          eventDigest: envelope.event.contentDigest,
+          inputDigest: assignmentItem.inputDigest,
+          disposition,
+          observedHeadRefOid: envelope.event.payload.headRefOid,
+          scopeActive: root.source.scope.active,
+        },
+      });
+    };
     const latestIssueAssignmentByTarget = new Map();
     const latestIssueLifecycleBySubject = new Map();
     for (const envelope of batch.items) {
@@ -1584,7 +2263,32 @@ export class WorkLedgerService {
             409,
           );
         }
-        deduplicated += 1;
+        if (scopeRecoveryRoots === null) {
+          deduplicated += 1;
+          continue;
+        }
+      }
+      const cancelledSourceDescriptor = pullRequestWorkDescriptor(envelope);
+      const cancelledSourceRoot = cancelledSourceDescriptor === null ? null :
+        rootByWorkKey.get(cancelledSourceDescriptor.workKey);
+      if (cancelledSourceRoot?.status === "cancelled" && !cancelledSourceDescriptor.trustedLifecycle) {
+        // Keep owner cancellation final without rejecting the rest of the batch.
+        knownAssignments.set(assignmentItem.assignmentId, {
+          inputDigest: assignmentItem.inputDigest,
+          sourceSequence: assignmentItem.sourceSequence,
+        });
+        received += 1;
+        timelineEvents.push({
+          itemId: cancelledSourceRoot.itemId,
+          type: "pr_source_ignored",
+          at: now,
+          actorId: "work-ledger-system",
+          details: {
+            workKey: cancelledSourceRoot.source.workKey,
+            sourceSequence: envelope.sequence,
+            disposition: "ignored_cancelled_source",
+          },
+        });
         continue;
       }
       const trustedScopeLifecycle =
@@ -1592,62 +2296,84 @@ export class WorkLedgerService {
           envelope.assignment,
           envelope.event,
         );
-      const ordinaryRouteForLifecycle = batch.items.some(
-        (candidate) =>
-          candidate.event.eventId === envelope.event.eventId &&
-          candidate.assignment.target?.type === "role" &&
-          candidate.assignment.target?.id === "pr-engineer",
-      );
+      if (envelope.event.eventType === "pull_request.role_handoff" && !trustedScopeLifecycle) {
+        knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: assignmentItem.sourceSequence });
+        received += 1;
+        continue;
+      }
       if (trustedScopeLifecycle) {
-        let root = pullRequestRootForLifecycle(itemsById, envelope);
-        if (
-          root?.status === "superseded" &&
-          root.statusReason === CROSS_ROOT_REPLACED_REASON &&
-          envelope.event.eventType === "pull_request.left_scope"
-        ) {
-          knownAssignments.set(assignmentItem.assignmentId, {
-            inputDigest: assignmentItem.inputDigest,
-            sourceSequence: assignmentItem.sourceSequence,
-          });
+        if (envelope.event.eventType === "pull_request.role_handoff") {
+          const { candidate, applied } = applyRoleHandoff(envelope);
+          timelineEvents.push({ itemId: candidate?.targetItemId ?? null,
+            type: applied ? "pr_source_revised" : "pr_source_ignored", at: now, actorId: "work-ledger-system",
+            details: { sourceSequence: envelope.sequence, disposition: applied ? "role_handoff_applied" : "ignored_stale_role_handoff" } });
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: assignmentItem.sourceSequence });
           received += 1;
-          timelineEvents.push({
-            itemId: root.itemId,
-            type: "pr_source_ignored",
-            at: now,
-            actorId: "work-ledger-system",
-            details: {
-              workKey: root.source.workKey,
-              sourceSequence: envelope.sequence,
-              disposition: "ignored_superseded_scope_exit",
-              scopeActive: root.source.scope.active,
-            },
-          });
           continue;
         }
-        const lifecycleActive =
-          envelope.event.eventType === "pull_request.created";
-        if (root !== null && root.source.scope.active === lifecycleActive) {
-          knownAssignments.set(assignmentItem.assignmentId, {
-            inputDigest: assignmentItem.inputDigest,
-            sourceSequence: assignmentItem.sourceSequence,
-          });
-          received += 1;
-          timelineEvents.push({
-            itemId: root.itemId,
-            type: "pr_source_ignored",
-            at: now,
-            actorId: "work-ledger-system",
-            details: {
-              workKey: root.source.workKey,
-              sourceSequence: envelope.sequence,
-              disposition: "ignored_redundant_scope_lifecycle",
-              scopeActive: root.source.scope.active,
-            },
-          });
-          continue;
-        }
-        if (root !== null) {
-          const applied = applyPullRequestScopeLifecycle(root.source, envelope);
+        const lifecycleActive = envelope.event.eventType === "pull_request.created";
+        const lifecycleTargetRole = lifecycleActive ? pullRequestScopeLifecycleTargetRole(envelope) : null;
+        const routedWorkKeys = new Set(batch.items
+          .filter(candidate => candidate.event.eventId === envelope.event.eventId)
+          .map(candidate => pullRequestWorkDescriptor(candidate))
+          .filter(descriptor => descriptor !== null && !descriptor.trustedLifecycle)
+          .map(descriptor => descriptor.workKey));
+        for (let root of pullRequestRootsForLifecycle(itemsById, envelope)) {
+          if (scopeRecoveryRoots !== null &&
+              (scopeRecoveryRoots.get(root.itemId) !== envelope.sequence || !root.source.scope.active ||
+                envelope.sequence <= root.source.bindings.at(-1).sourceSequence)) continue;
+          if (root.status === "cancelled") {
+            timelineEvents.push({ itemId: root.itemId, type: "pr_source_ignored", at: now,
+              actorId: "work-ledger-system", details: { workKey: root.source.workKey,
+                sourceSequence: envelope.sequence, disposition: "ignored_cancelled_source" } });
+            continue;
+          }
+          const ordinaryRouteForLifecycle = routedWorkKeys.has(root.source.workKey) ||
+            (lifecycleActive && root.source.current.eventId === envelope.event.eventId &&
+              root.source.bindings.some(binding => binding.eventId === envelope.event.eventId && binding.scopeLifecycle !== true));
+          if (lifecycleActive && root.source.identity.targetRoleId !== lifecycleTargetRole) continue;
+          if (
+            root?.status === "superseded" &&
+            root.statusReason === CROSS_ROOT_REPLACED_REASON &&
+            envelope.event.eventType === "pull_request.left_scope"
+          ) {
+            timelineEvents.push({
+              itemId: root.itemId,
+              type: "pr_source_ignored",
+              at: now,
+              actorId: "work-ledger-system",
+              details: {
+                workKey: root.source.workKey,
+                sourceSequence: envelope.sequence,
+                disposition: "ignored_superseded_scope_exit",
+                scopeActive: root.source.scope.active,
+              },
+            });
+            continue;
+          }
+          if (root.source.scope.active === lifecycleActive) {
+            timelineEvents.push({
+              itemId: root.itemId,
+              type: "pr_source_ignored",
+              at: now,
+              actorId: "work-ledger-system",
+              details: {
+                workKey: root.source.workKey,
+                sourceSequence: envelope.sequence,
+                disposition: "ignored_redundant_scope_lifecycle",
+                scopeActive: root.source.scope.active,
+              },
+            });
+            continue;
+          }
+          const previousActiveRevision = root.source.activeRevision;
+          const previousActiveHeadRefOid = root.source.current.headRefOid;
+          const previousAttempt = root.attempt;
+          let applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt });
+          if (isIgnoredProtectedPullRequestReentry(root, envelope, applied)) {
+            ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, applied.disposition, false);
+            continue;
+          }
           const active = applied.source.scope.active;
           let cutover = inspectPullRequestSourceCutover(
             root,
@@ -1662,6 +2388,14 @@ export class WorkLedgerService {
             cutover,
             `lifecycle:${envelope.assignment.assignmentId}:${root.itemId}`,
           );
+          if (cutover.blockers.length > 0 && root.source.pending !== null &&
+              root.source.revisions.some(revision => revision.headAncestryProof !== undefined &&
+                revision.headRefOid === root.source.pending.headRefOid)) {
+            // The lineage witness proves a target, never execution settlement.
+            // Reentry may record responsibility while the old input remains
+            // current and the new target waits behind the existing cutover.
+            applied = applyPullRequestScopeLifecycle(root.source, envelope, { attemptAtActivation: previousAttempt, activate: false });
+          }
           if (cutover.blockers.length === 0) {
             root = applyReadyPullRequestSourceCutover({
               root,
@@ -1729,6 +2463,11 @@ export class WorkLedgerService {
               disposition: applied.disposition,
               scopeActive: active,
               authorityEpoch: root.source.authorityEpoch,
+              ...(previousActiveHeadRefOid !== root.source.current.headRefOid ? {
+                previousHeadRefOid: previousActiveHeadRefOid,
+                previousActiveRevision,
+                decisionAttemptOffset: previousAttempt,
+              } : {}),
             },
           });
         }
@@ -1826,6 +2565,11 @@ export class WorkLedgerService {
       let disposition = "accepted";
       let headAdvanced = false;
       if (!root) {
+        if (Object.hasOwn(envelope.event.payload, "headAncestryProof")) {
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: envelope.sequence });
+          received += 1;
+          continue;
+        }
         const pendingCrossRoot = [...itemsById.values()].find(
           (item) =>
             item.itemId !== rootCandidate.itemId &&
@@ -1864,6 +2608,7 @@ export class WorkLedgerService {
             outboxById,
             {
               forceHeadChanged: true,
+              replacementRoot: rootCandidate,
               timelineIndex: currentCutoverTimelineIndex(),
             },
           );
@@ -1876,6 +2621,7 @@ export class WorkLedgerService {
             rootCandidate.statusReason =
               crossRootPullRequestCutoverPendingReason(predecessor.itemId);
             for (const blocker of activation.blockers) {
+              if (blocker.status === "cancelled") continue;
               const marked = {
                 ...blocker,
                 revision:
@@ -1942,6 +2688,17 @@ export class WorkLedgerService {
           },
         });
       } else {
+        const previousActiveHeadRefOid = root.source.current.headRefOid;
+        if (Object.hasOwn(envelope.event.payload, "headAncestryProof") &&
+            (root.revision !== root.source.headAncestryReceipt?.rootRevision + 1 ||
+              !ownsHeadAncestryPredecessor({ items: [...itemsById.values()] }, root) ||
+              !headAncestrySourceMatches(root.source.headAncestryReceipt, root.source, envelope.event))) {
+          knownAssignments.set(assignmentItem.assignmentId, { inputDigest: assignmentItem.inputDigest, sourceSequence: envelope.sequence });
+          received += 1;
+          continue;
+        }
+        const previousActiveRevision = root.source.activeRevision;
+        const previousAttempt = root.attempt;
         const predecessor = pullRequestTrustedPredecessor(
           { items: [...itemsById.values()] },
           root,
@@ -1950,6 +2707,7 @@ export class WorkLedgerService {
           itemsById,
           root,
           predecessor,
+          envelope.event,
         );
         let appended = appendPullRequestWorkSource(
           root.source,
@@ -1966,6 +2724,10 @@ export class WorkLedgerService {
               predecessor.trustedSourceRootItemId === root.itemId,
           },
         );
+        if (isIgnoredProtectedPullRequestReentry(root, envelope, appended)) {
+          ignoreProtectedPullRequestReentry(root, envelope, assignmentItem, appended.disposition);
+          continue;
+        }
         if (
           PR_SOURCE_AUTHORITY_FENCE_DISPOSITIONS.has(
             appended.disposition,
@@ -1981,6 +2743,7 @@ export class WorkLedgerService {
             outboxById,
             {
               forceHeadChanged: true,
+              replacementRoot: root,
               timelineIndex: currentCutoverTimelineIndex(),
             },
           );
@@ -2004,6 +2767,7 @@ export class WorkLedgerService {
               ),
             };
             for (const blocker of activation.blockers) {
+              if (blocker.status === "cancelled") continue;
               const marked = {
                 ...blocker,
                 revision:
@@ -2029,6 +2793,7 @@ export class WorkLedgerService {
         if (appended.disposition === "accepted") {
           const obsoletePendingRoots = [...itemsById.values()].filter(
             (candidate) =>
+              appended.source.scope.active === true &&
               candidate.itemId !== root.itemId &&
               samePullRequestSubject(candidate, root) &&
               crossRootPullRequestCutoverPredecessorId(candidate) !== null &&
@@ -2098,6 +2863,7 @@ export class WorkLedgerService {
               outboxById,
               {
                 forceHeadChanged: true,
+                replacementRoot: pendingRoot,
                 timelineIndex: currentCutoverTimelineIndex(),
               },
             );
@@ -2120,6 +2886,7 @@ export class WorkLedgerService {
                 ),
               };
               for (const blocker of activation.blockers) {
+                if (blocker.status === "cancelled") continue;
                 const marked = {
                   ...blocker,
                   revision:
@@ -2159,6 +2926,7 @@ export class WorkLedgerService {
               rootByWorkKey.set(settled.source.workKey, settled);
               const activated = activatePendingPullRequestWorkSource(
                 appended.source,
+                { attemptAtActivation: root.attempt },
               );
               appended = {
                 ...appended,
@@ -2194,6 +2962,7 @@ export class WorkLedgerService {
               });
               const activated = activatePendingPullRequestWorkSource(
                 appended.source,
+                { attemptAtActivation: root.attempt },
               );
               appended = {
                 ...appended,
@@ -2212,6 +2981,9 @@ export class WorkLedgerService {
           root.statusReason === "pr_source_reentered_scope_without_route";
         const firstRevisionInBatch =
           initialItemIds.has(root.itemId) && !revisedItemIds.has(root.itemId);
+        const retireInactiveCompleted = root.status === "completed" &&
+          root.source.scope.kind === "automatic" && root.source.scope.active === false &&
+          appended.source.scope.active === false && appended.activeAdvanced;
         root = {
           ...root,
           source: appended.source,
@@ -2234,6 +3006,11 @@ export class WorkLedgerService {
               }
             : {}),
           ...fencedPullRequestRootPatch(root, appended.disposition),
+          ...(retireInactiveCompleted ? {
+            status: "blocked", statusReason: "pr_source_left_scope",
+            ownerId: null, leaseId: null, leaseUntil: null, activeIntentId: null,
+            availableAt: null, decisionContext: null,
+          } : {}),
           updatedAt: now,
         };
         revisedItemIds.add(root.itemId);
@@ -2269,6 +3046,11 @@ export class WorkLedgerService {
               .headRefOid,
             disposition,
             headAdvanced,
+            ...(appended.activeAdvanced && previousActiveHeadRefOid !== root.source.current.headRefOid ? {
+              previousHeadRefOid: previousActiveHeadRefOid,
+              previousActiveRevision,
+              decisionAttemptOffset: previousAttempt,
+            } : {}),
           },
         });
       }
@@ -2292,14 +3074,20 @@ export class WorkLedgerService {
         deduplicated,
       },
     });
-    const invalidCutoverProofs = cutoverProofChecks.filter(
-      ({ proofs }) => !arePullRequestCutoverProofsRetained({
-        timeline: this.state.timeline,
-        timelineLimit: this.limits.timelineLimit,
-        appendedEventCount: timelineEvents.length,
-        proofs,
-      }),
+    let nextState = this.#candidateWithTimeline(
+      { ...this.state, revision: this.state.revision + 1,
+        intakeCursor: batch.nextSequence, sourceHighWatermark: batch.highWatermark,
+        items: [...itemsById.values()], outbox: [...outboxById.values()] },
+      timelineEvents,
     );
+    if (cutoverProofChecks.length > 0) {
+      nextState = retainWorkLedgerTimelineForCapacity(this.state, nextState, this.limits);
+    }
+    const retainedProofIds = new Set(nextState.timeline.map(entry => entry.timelineId));
+    const invalidCutoverProofs = cutoverProofChecks.filter(({ proofs }) =>
+      !arePullRequestCutoverProofsRetained({ timeline: this.state.timeline,
+        timelineLimit: this.limits.timelineLimit, appendedEventCount: timelineEvents.length, proofs }) ||
+      proofs.some(proof => !retainedProofIds.has(proof.timelineId)));
     if (invalidCutoverProofs.length > 0) {
       const nextDeniedCutoverProofs = new Set(deniedCutoverProofs);
       for (const { checkId } of invalidCutoverProofs) {
@@ -2312,20 +3100,44 @@ export class WorkLedgerService {
           409,
         );
       }
-      return this.#recordBatch(batch, now, nextDeniedCutoverProofs);
+      return this.#recordBatch(batch, now, nextDeniedCutoverProofs, scopeRecoveryRoots);
     }
-    const nextState = this.#candidateWithTimeline(
-      {
-        ...this.state,
-        revision: this.state.revision + 1,
-        intakeCursor: batch.nextSequence,
-        sourceHighWatermark: batch.highWatermark,
-        items: [...itemsById.values()],
-        outbox: [...outboxById.values()],
-      },
-      timelineEvents,
-    );
-    await this.#persist(nextState);
+    if (scopeRecoveryRoots === null && batch.items.length > 1 &&
+        timelineEvents.length > this.limits.timelineLimit &&
+        timelineEvents.slice(0, timelineEvents.length - this.limits.timelineLimit).some(event => {
+          if (!["pr_source_revised", "pr_source_activated"].includes(event.type) ||
+              event.details?.decisionAttemptOffset === undefined) return false;
+          const previous = this.state.items.find(item => item.itemId === event.itemId);
+          const next = itemsById.get(event.itemId);
+          const budget = next?.source?.decisionBudget;
+          return previous?.source?.kind === "pull_request" && budget !== undefined &&
+            previous.source.current.headRefOid !== next.source.current.headRefOid &&
+            event.details.workKey === next.source.workKey &&
+            event.details.activeRevision === budget.activationRevision &&
+            event.details.headRefOid === next.source.current.headRefOid &&
+            event.details.previousHeadRefOid === previous.source.current.headRefOid &&
+            event.details.previousActiveRevision === previous.source.activeRevision &&
+            budget.previousActiveRevision === previous.source.activeRevision &&
+            event.details.decisionAttemptOffset === previous.attempt &&
+            budget.attemptOffset === previous.attempt;
+        })) {
+      // Nothing has been written. Replan a smaller feed prefix so its real
+      // activation receipt survives this commit; later intake consumes the rest.
+      const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
+      return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence }, now);
+    }
+    const stateBeforeCommit = this.state;
+    try {
+      await this.#persist(nextState);
+    } catch (error) {
+      if (error?.code !== "WORK_LEDGER_PR_SOURCE_TRANSITION_INVALID" ||
+          scopeRecoveryRoots !== null || batch.items.length < 2 || this.state !== stateBeforeCommit) throw error;
+      // The source validator rejected preparation before any write. Commit a
+      // valid prefix; retain all remaining feed entries for subsequent intake.
+      const items = batch.items.slice(0, Math.floor(batch.items.length / 2));
+      return this.#recordBatch({ ...batch, items, nextSequence: items.at(-1).sequence },
+        now, deniedCutoverProofs, scopeRecoveryRoots);
+    }
     return cloneLedgerValue({
       received,
       deduplicated,
@@ -2401,6 +3213,117 @@ export class WorkLedgerService {
       plan.timelineEvents,
     );
     await this.#persist(nextState);
+  }
+
+  async #reconcileRecoveredPullRequestScopes() {
+    const roots = this.state.items.filter(item => item.kind === "source_root" &&
+      item.source?.scope.kind === "automatic" && item.source.scope.active &&
+      !["paused", "cancelled", "superseded"].includes(item.status));
+    const consumedCursor = this.state.intakeCursor;
+    if (roots.length === 0 || consumedCursor === 0) {
+      this.pullRequestScopeRecoveryPending = false;
+      return;
+    }
+    let afterSequence = Math.min(...roots.map(root => root.source.bindings.at(-1).sourceSequence));
+    const latestByRoot = new Map();
+    let scanned = 0;
+    let started = false;
+    // Only a complete retained tail through the consumed cursor can prove
+    // that an old exit was not followed by a later discovery reentry.
+    while (afterSequence < consumedCursor) {
+      if (scanned >= MAX_WORKFLOW_RECORDS) return;
+      const limit = Math.min(MAX_WORK_LEDGER_INTAKE_BATCH, consumedCursor - afterSequence,
+        MAX_WORKFLOW_RECORDS - scanned);
+      let batch;
+      try {
+        const raw = await this.assignmentSource.readAssignmentBatch({ afterSequence, limit });
+        batch = normalizeAssignmentBatch(raw, { afterSequence, requestedLimit: limit,
+          itemByteBudget: this.limits.itemByteBudget });
+      } catch (error) {
+        const gap = normalizeReportedAssignmentGap(error, afterSequence);
+        if (!started && gap?.reason === "source_retention" && gap.actualSequence <= consumedCursor) {
+          afterSequence = gap.actualSequence - 1;
+          started = true;
+          continue;
+        }
+        return;
+      }
+      if (batch.highWatermark < this.state.sourceHighWatermark) return;
+      const gap = findAssignmentBatchGap(batch, afterSequence);
+      if (gap) {
+        if (!started && gap.reason === "source_retention" && gap.actualSequence <= consumedCursor) {
+          afterSequence = gap.actualSequence - 1;
+          started = true;
+          continue;
+        }
+        return;
+      }
+      started = true;
+      scanned += batch.items.length;
+      for (const envelope of batch.items) {
+        if (!isTrustedPullRequestScopeLifecycleAssignment(envelope.assignment, envelope.event)) continue;
+        for (const root of roots) {
+          if (envelope.sequence > root.source.bindings.at(-1).sourceSequence &&
+              pullRequestScopeLifecycleMatchesSource(root.source, envelope)) {
+            latestByRoot.set(root.itemId, envelope);
+          }
+        }
+      }
+      afterSequence = batch.nextSequence;
+    }
+    const exits = [...new Map([...latestByRoot.values()]
+      .filter(envelope => envelope.event.eventType === "pull_request.left_scope")
+      .map(envelope => [envelope.sequence, envelope])).values()]
+      .sort((left, right) => left.sequence - right.sequence);
+    if (exits.length > 0) {
+      await this.#recordBatch({ items: exits, nextSequence: consumedCursor,
+        highWatermark: this.state.sourceHighWatermark }, this.#now(), new Set(),
+      new Map([...latestByRoot].map(([itemId, envelope]) => [itemId, envelope.sequence])));
+    }
+    this.pullRequestScopeRecoveryPending = false;
+  }
+
+  async #recoverInactivePullRequestTakeovers() {
+    let items = this.state.items;
+    const timelineEvents = [];
+    const now = this.#now();
+    for (const item of this.state.items) {
+      const proof = inactivePullRequestTakeoverRecoveryProof(this.state, item) ??
+        sameHeadInternalReviewTakeoverRecoveryProof({ ...this.state, items }, item);
+      if (proof === null) continue;
+      const transition = planWorkItemTransition({
+        state: { ...this.state, items },
+        input: {
+          itemId: item.itemId,
+          expectedRevision: item.revision,
+          leaseId: null,
+          actorId: "work-ledger-system",
+          toStatus: "queued",
+          reason: proof.reason ?? "pr_source_inactive_takeover_recovered",
+          details: { evidenceRefs: [proof.timelineId, proof.rootStateTimelineId, proof.replacementRootItemId ?? proof.inactiveRootItemId] },
+        },
+        clock: () => now,
+      });
+      items = transition.patch.items;
+      timelineEvents.push(...transition.timelineEvents);
+    }
+    if (timelineEvents.length === 0) return;
+    await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
+  }
+
+  async #recoverCompletedRepairEvidence() {
+    const now = this.#now();
+    const timelineEvents = [];
+    const items = this.state.items.map(item => {
+      const proof = completedRepairEvidenceRecoveryProof(this.state, item);
+      if (proof === null) return item;
+      timelineEvents.push({ itemId: item.itemId, type: "transitioned", at: now, actorId: "work-ledger-system",
+        details: { fromStatus: "completed", toStatus: "queued", reason: proof.reason,
+          context: { evidenceRefs: [proof.intentId, proof.resultId] } } });
+      return { ...item, status: "queued", statusReason: proof.reason,
+        revision: item.revision + 1, updatedAt: now };
+    });
+    if (timelineEvents.length > 0) await this.#commitMutation({ patch: { items }, timelineEvents, result: null });
   }
 
   async #reconcileRecoveredPullRequestAuthorityFences() {
@@ -2486,6 +3409,9 @@ export class WorkLedgerService {
         isContentVersion(writtenVersion)
           ? writtenVersion
           : undefined;
+      this.committedAuthoritySnapshot = {
+        version: this.durableContentVersion, state: normalized,
+      };
     } catch (error) {
       await this.#discardPreparedCandidate();
       throw workLedgerError(
@@ -2516,14 +3442,13 @@ export class WorkLedgerService {
     }
   }
 
-  #currentGraphSnapshot() {
-    if (this.graphSnapshotCache?.state !== this.state) {
-      this.graphSnapshotCache = {
-        state: this.state,
-        value: projectWorkLedgerGraphView(this.state),
-      };
+  #currentGraphSnapshot(state) {
+    if (this.graphSnapshotCache?.state === state) return this.graphSnapshotCache.value;
+    const value = projectWorkLedgerGraphView(state);
+    if (!this.graphSnapshotCache || state.revision >= this.graphSnapshotCache.state.revision) {
+      this.graphSnapshotCache = { state, value };
     }
-    return this.graphSnapshotCache.value;
+    return value;
   }
 
   async #yieldAfterCommit() {
@@ -2544,14 +3469,17 @@ export class WorkLedgerService {
         }),
         this.durableContentVersion,
       );
-      if (!result.changed) return this.state;
+      if (!result.changed) {
+        if (this.ready) assertLedgerRevisionProgress(this.state, this.committedAuthoritySnapshot?.state ?? this.state);
+        return this.state;
+      }
       stored = result.value;
       observedVersion = result.version;
     } else {
       stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
     }
     if (stored === null) {
-      if (this.ready && this.state.revision !== 0) {
+      if (this.ready && (this.committedAuthoritySnapshot?.state ?? this.state).revision !== 0) {
         throw workLedgerError(
           "WORK_LEDGER_STATE_CORRUPTED",
           "员工工作台账持久状态意外消失",
@@ -2559,23 +3487,63 @@ export class WorkLedgerService {
         );
       }
       this.durableContentVersion = observedVersion;
-      return emptyWorkLedgerState();
+      const state = emptyWorkLedgerState();
+      this.committedAuthoritySnapshot = { version: observedVersion, state };
+      return state;
     }
-    const durable = normalizeWorkLedgerPersistedState(stored, this.limits);
-    if (
-      this.ready &&
-      (durable.revision < this.state.revision ||
-        (durable.revision === this.state.revision &&
-          workLedgerPersistedStateDigest(durable) !==
-            workLedgerPersistedStateDigest(this.state)))
-    ) {
-      throw workLedgerError(
-        "WORK_LEDGER_STATE_REVISION_CONFLICT",
-        "员工工作台账持久状态发生回退或分叉",
-        409,
-      );
-    }
+    const durable = observedVersion !== undefined && observedVersion === this.committedAuthoritySnapshot?.version
+      ? this.committedAuthoritySnapshot.state : normalizeWorkLedgerPersistedState(stored, this.limits);
+    if (this.ready) assertLedgerRevisionProgress(durable, this.committedAuthoritySnapshot?.state ?? this.state);
     this.durableContentVersion = observedVersion;
+    this.committedAuthoritySnapshot = { version: observedVersion, state: durable };
+    return durable;
+  }
+
+  async #readCommittedAuthorityState() {
+    // Authority reads need committed state, not a place behind pending writes.
+    // Keep their version cache separate from mutation bookkeeping, including
+    // when another instance commits or a durable write loses its ACK.
+    const snapshot = this.committedAuthoritySnapshot;
+    const baseline = snapshot?.state ?? this.state;
+    let stored;
+    let durable;
+    let observedVersion;
+    if (typeof this.store.readVersioned === "function") {
+      // The pair is published atomically after validation or a committed write.
+      const version = snapshot?.version;
+      const result = normalizeVersionedRead(
+        await this.store.readVersioned(WORK_LEDGER_STATE_KEY, null, {
+          ifVersion: version,
+        }),
+        version,
+      );
+      observedVersion = result.version;
+      // Every caller still performs fresh I/O. Concurrent reads may return the
+      // same token after another caller has already validated that content.
+      if (result.version === this.committedAuthoritySnapshot?.version) durable = this.committedAuthoritySnapshot.state;
+      else if (!result.changed) durable = snapshot.state;
+      else stored = result.value;
+    } else {
+      stored = await this.store.read(WORK_LEDGER_STATE_KEY, null);
+    }
+    if (durable === undefined) {
+      if (stored === null && baseline.revision !== 0) {
+        throw workLedgerError(
+          "WORK_LEDGER_STATE_CORRUPTED",
+          "员工工作台账持久状态意外消失",
+          503,
+        );
+      }
+      durable = stored === null ? emptyWorkLedgerState() : normalizeWorkLedgerPersistedState(stored, this.limits);
+    }
+    assertLedgerRevisionProgress(durable, baseline);
+    const latest = this.committedAuthoritySnapshot;
+    if (latest?.state.revision === durable.revision) assertLedgerRevisionProgress(durable, latest.state);
+    // A slower read cannot replace a newer committed snapshot published while
+    // its I/O was in flight. Its own result still describes that earlier read.
+    if (latest === snapshot || durable.revision > latest.state.revision) {
+      this.committedAuthoritySnapshot = { version: observedVersion, state: durable };
+    }
     return durable;
   }
 

@@ -9,6 +9,7 @@ export const PULL_REQUEST_SCOPE_LIFECYCLE_TARGET = Object.freeze({
 });
 
 const LIFECYCLE_EVENT_TYPES = new Set([
+  "pull_request.role_handoff",
   "pull_request.created",
   "pull_request.left_scope",
 ]);

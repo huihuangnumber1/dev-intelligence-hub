@@ -3,7 +3,9 @@ import {
   normalizeActionRequest,
 } from "./code-executor-contract.js";
 import { normalizeWorkspacePath } from "./code-execution-policy.js";
+import { normalizeCodeCompletionReport } from "./structured-code-action-contract.js";
 import {
+  codeExecutionSourceAllowsWrite,
   codeExecutionSourceWritablePaths,
   normalizeCodeExecutionSource,
   sameCodeExecutionSource,
@@ -48,7 +50,9 @@ const CANCELLABLE_JOB_STATUSES = new Set([
 const OBSERVATION_STATUSES = new Set(["succeeded", "failed", "interrupted"]);
 const MAX_OBSERVATIONS = 128;
 const MAX_DETAIL_BYTES = 128 * 1024;
-const MAX_PENDING_ACTION_BYTES = 128 * 1024;
+// Inline model replies keep their smaller transport bound. A trusted host
+// edit may preserve a larger file while still fitting this durable limit.
+export const CODE_JOB_MAXIMUM_ACTION_BYTES = 1024 * 1024;
 const MAX_JSON_DEPTH = 20;
 const MAX_JSON_COLLECTION_SIZE = 10_000;
 
@@ -711,11 +715,26 @@ function normalizeDetail(value, error) {
   return detail;
 }
 
+export function normalizeCodeJobCompletionReport(value, action, error = invalidJob()) {
+  const fields = exactObject(value, ["actionId", "actionDigest", "workspaceRevision", "outcome", "evidence"], error);
+  const actionId = safeId(fields.get("actionId"), "completionReport.actionId", error);
+  const actionDigest = sha256(fields.get("actionDigest"), "completionReport.actionDigest", error);
+  const workspaceRevision = sha256(fields.get("workspaceRevision"), "completionReport.workspaceRevision", error);
+  const expectedDigest = digestValue(action);
+  if (action.type !== "complete" || actionId !== action.actionId ||
+      actionDigest !== expectedDigest || workspaceRevision !== action.expectedWorkspaceRevision) throw error;
+  let report;
+  try { report = normalizeCodeCompletionReport({ outcome: fields.get("outcome"), evidence: fields.get("evidence") }); }
+  catch { throw error; }
+  return { actionId, actionDigest, workspaceRevision, ...report };
+}
+
 function normalizePendingAction(value, sessionId, error) {
   if (value === null) return null;
   const fields = exactObject(
     value,
-    ["turn", "actionId", "actionDigest", "action", "preparedAt"],
+    ["turn", "actionId", "actionDigest", "action", "preparedAt",
+      ...(Object.hasOwn(value ?? {}, "completionReport") ? ["completionReport"] : [])],
     error,
   );
   let action;
@@ -728,7 +747,7 @@ function normalizePendingAction(value, sessionId, error) {
     throw error;
   }
   if (
-    Buffer.byteLength(JSON.stringify(action), "utf8") > MAX_PENDING_ACTION_BYTES
+    Buffer.byteLength(JSON.stringify(action), "utf8") > CODE_JOB_MAXIMUM_ACTION_BYTES
   ) {
     throw error;
   }
@@ -750,6 +769,9 @@ function normalizePendingAction(value, sessionId, error) {
     actionId,
     actionDigest,
     action,
+    ...(fields.has("completionReport") ? {
+      completionReport: normalizeCodeJobCompletionReport(fields.get("completionReport"), action, error),
+    } : {}),
     preparedAt: normalizeCodeJobTimestamp(fields.get("preparedAt"), error),
   };
 }
@@ -801,7 +823,7 @@ function assertActionAllowedByGrant(action, grant, error) {
       throw error;
     }
     const writable = grant.schemaVersion === 3
-      ? grant.writablePaths.includes(relativePath)
+      ? codeExecutionSourceAllowsWrite(grant.executionSource, relativePath)
       : grant.writablePaths.some(
           (writablePath) =>
             relativePath === writablePath ||
@@ -833,6 +855,7 @@ function normalizeObservation(value, sessionId, grant, error) {
       "detail",
       "detailDigest",
       "recordedAt",
+      ...(Object.hasOwn(value ?? {}, "completionReport") ? ["completionReport"] : []),
     ],
     error,
   );
@@ -849,7 +872,7 @@ function normalizeObservation(value, sessionId, grant, error) {
   }
   if (
     Buffer.byteLength(JSON.stringify(action), "utf8") >
-      MAX_PENDING_ACTION_BYTES
+      CODE_JOB_MAXIMUM_ACTION_BYTES
   ) {
     throw error;
   }
@@ -893,6 +916,9 @@ function normalizeObservation(value, sessionId, grant, error) {
     actionType,
     actionDigest,
     action,
+    ...(fields.has("completionReport") ? {
+      completionReport: normalizeCodeJobCompletionReport(fields.get("completionReport"), action, error),
+    } : {}),
     status,
     workspaceRevision: sha256(
       fields.get("workspaceRevision"),
@@ -905,7 +931,23 @@ function normalizeObservation(value, sessionId, grant, error) {
   };
 }
 
-function normalizeTerminalResult(value, error) {
+function normalizeCompletionDetail(value, grant, error) {
+  if (!Object.hasOwn(value ?? {}, "completionReport")) return normalizeDetail(value, error);
+  const detail = normalizeJsonValue(value, error);
+  const report = normalizeCodeJobCompletionReport(detail.completionReport, {
+    type: "complete", actionId: detail.completedActionId, expectedWorkspaceRevision: detail.workspaceRevision,
+  }, error);
+  if (detail.schemaVersion !== 1 || detail.outcome !== report.outcome) throw error;
+  const hostDetail = { ...detail, outcome: grant.summary };
+  delete hostDetail.completionReport;
+  normalizeDetail(hostDetail, error);
+  // A bounded model report has its own budget; it cannot enlarge the host
+  // manifest/evidence budget or fail only after the executor has settled.
+  if (Buffer.byteLength(JSON.stringify(detail), "utf8") > MAX_DETAIL_BYTES + 100 * 1024) throw error;
+  return detail;
+}
+
+function normalizeTerminalResult(value, error, grant) {
   if (value === null) return null;
   const fields = exactObject(
     value,
@@ -914,7 +956,8 @@ function normalizeTerminalResult(value, error) {
   );
   const kind = fields.get("kind");
   if (!TERMINAL_JOB_STATUSES.has(kind)) throw error;
-  const detail = normalizeDetail(fields.get("detail"), error);
+  const detail = kind === "completed" ? normalizeCompletionDetail(fields.get("detail"), grant, error)
+    : normalizeDetail(fields.get("detail"), error);
   const detailDigest = sha256(
     fields.get("detailDigest"),
     "result.detailDigest",
@@ -1089,6 +1132,32 @@ function normalizeMemoryProjection(value, jobId, error) {
   };
 }
 
+export function codeJobTimeoutContinuationDelayMs(consecutiveNoProgress) {
+  return 60_000 * 2 ** Math.max(0, consecutiveNoProgress - 1);
+}
+
+export function normalizeCodeJobTimeoutContinuation(value, error = invalidJob()) {
+  const fields = exactObject(value, ["schemaVersion", "failedRunId", "errorCode", "failedAt", "recordedAt",
+    "retryAfter", "progressFingerprint", "consecutiveNoProgress"], error);
+  if (fields.get("schemaVersion") !== 1 ||
+      !["STRUCTURED_PROVIDER_TIMEOUT", "STRUCTURED_PROVIDER_IDLE_TIMEOUT"].includes(fields.get("errorCode"))) throw error;
+  const continuation = {
+    schemaVersion: 1,
+    failedRunId: safeId(fields.get("failedRunId"), "timeoutContinuation.failedRunId", error),
+    errorCode: fields.get("errorCode"),
+    failedAt: normalizeCodeJobTimestamp(fields.get("failedAt"), error),
+    recordedAt: normalizeCodeJobTimestamp(fields.get("recordedAt"), error),
+    retryAfter: normalizeCodeJobTimestamp(fields.get("retryAfter"), error),
+    progressFingerprint: sha256(fields.get("progressFingerprint"), "timeoutContinuation.progressFingerprint", error),
+    consecutiveNoProgress: safeInteger(fields.get("consecutiveNoProgress"), "timeoutContinuation.consecutiveNoProgress",
+      { minimum: 0, maximum: 3, error }),
+  };
+  const delay = codeJobTimeoutContinuationDelayMs(continuation.consecutiveNoProgress);
+  if (Date.parse(continuation.failedAt) > Date.parse(continuation.recordedAt) ||
+      Date.parse(continuation.retryAfter) !== Date.parse(continuation.recordedAt) + delay) throw error;
+  return continuation;
+}
+
 function emptyExecution() {
   return {
     sessionId: null,
@@ -1130,6 +1199,7 @@ function normalizeExecution(
   const admissionKeys = [...memoryKeys, "actionAdmission"];
   const currentKeys = [...admissionKeys, "uncertainty"];
   const settlementKeys = [...currentKeys, "cancellationSettlement"];
+  const hasTimeoutContinuation = executionKeys.includes("timeoutContinuation");
   const withoutMemory =
     executionKeys.length === baseKeys.length &&
     baseKeys.every((key) => executionKeys.includes(key));
@@ -1152,7 +1222,7 @@ function normalizeExecution(
           ? admissionKeys
           : withoutSettlement
             ? currentKeys
-            : settlementKeys,
+            : hasTimeoutContinuation ? [...settlementKeys, "timeoutContinuation"] : settlementKeys,
     error,
   );
   const sessionId = fields.get("sessionId") === null
@@ -1200,7 +1270,9 @@ function normalizeExecution(
         revision,
         error,
       );
-  const result = normalizeTerminalResult(fields.get("result"), error);
+  const result = normalizeTerminalResult(fields.get("result"), error, grant);
+  if (result?.kind === "completed" &&
+      digestValue(observations.at(-1)?.completionReport ?? null) !== digestValue(result.detail.completionReport ?? null)) throw error;
   const pause = normalizePause(fields.get("pause"), error);
   const uncertainty = legacyAdmittedPending
     ? {
@@ -1244,9 +1316,13 @@ function normalizeExecution(
     uncertainty,
     cancellationSettlement,
     memoryProjection,
+    ...(hasTimeoutContinuation ? { timeoutContinuation: normalizeCodeJobTimeoutContinuation(fields.get("timeoutContinuation"), error) } : {}),
   };
 
   if (
+    (hasTimeoutContinuation && (sessionId === null || workspaceRevision === null ||
+      Date.parse(execution.timeoutContinuation.failedAt) < Date.parse(createdAt) ||
+      Date.parse(execution.timeoutContinuation.recordedAt) > Date.parse(updatedAt))) ||
     observations.length !== turn ||
     observations.some(
       ({ actionType }) => !grant.allowedActions.includes(actionType),
@@ -1806,8 +1882,9 @@ export function updateCodeJobLifecycle(
   return normalizeCodeJob({ ...content, recordDigest: digestValue(content) });
 }
 
-export function createCodeJobDetail(value) {
-  return normalizeDetail(value, invalidJob("代码任务执行详情无效"));
+export function createCodeJobDetail(value, { completionGrant = null } = {}) {
+  const error = invalidJob("代码任务执行详情无效");
+  return completionGrant === null ? normalizeDetail(value, error) : normalizeCompletionDetail(value, completionGrant, error);
 }
 
 export function isTerminalCodeJobStatus(value) {

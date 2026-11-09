@@ -1,4 +1,6 @@
 import { OperationQueue } from "../lib/operation-queue.js";
+import { TargetedCycleQueue } from "../lib/targeted-cycle-queue.js";
+import { normalizeContinuationTarget } from "./work-continuation-state.js";
 
 function employeeError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
@@ -34,6 +36,7 @@ export class EmployeeController {
     projectRole = () => ({}),
     projectWork = () => ({}),
     operationQueue = null,
+    responsiveControls = false,
   }) {
     if (!definition?.id || typeof definition.id !== "string") {
       throw new Error("岗位 definition.id 不能为空");
@@ -64,7 +67,10 @@ export class EmployeeController {
     this.projectRoleDetails = projectRole;
     this.projectWork = projectWork;
     this.operationQueue = operationQueue || new OperationQueue();
+    this.responsiveControls = responsiveControls;
+    this.stateQueue = new OperationQueue();
     this.running = null;
+    this.targetedCycles = new TargetedCycleQueue();
   }
 
   get id() {
@@ -72,6 +78,15 @@ export class EmployeeController {
   }
 
   run(options = {}) {
+    const continuationTarget = normalizeContinuationTarget(options?.continuationTarget);
+    if (continuationTarget !== null) return this.targetedCycles.run(JSON.stringify(continuationTarget), {
+      signal: options.signal, current: () => this.running,
+      execute: () => this.#startRun({ ...options, signal: options.signal, continuationTarget }),
+    });
+    return this.#startRun(options);
+  }
+
+  #startRun(options) {
     if (this.running) return this.running;
     const operation = this.enqueue(async () => {
       const state = await this.readState();
@@ -101,7 +116,10 @@ export class EmployeeController {
   }
 
   control(command, expectedRevision) {
-    return this.enqueue(async () => {
+    const enqueue = this.responsiveControls
+      ? operation => this.stateQueue.enqueue(operation)
+      : operation => this.enqueue(operation);
+    return enqueue(async () => {
       if (!["pause", "resume"].includes(command)) {
         throw employeeError(400, "command 只能是 pause 或 resume");
       }
@@ -110,7 +128,7 @@ export class EmployeeController {
       const paused = command === "pause";
       if (state.paused === paused) return this.project(state);
       const controlled = this.applyControl(state, paused);
-      const next = await this.writeState({ ...controlled, paused });
+      const next = await this.#writeState({ ...controlled, paused });
       return this.project(next);
     });
   }
@@ -134,6 +152,17 @@ export class EmployeeController {
   }
 
   async writeState(state, { bumpRevision = true } = {}) {
+    if (!this.responsiveControls) return this.#writeState(state, { bumpRevision });
+    return this.stateQueue.enqueue(async () => {
+      const current = await this.readState();
+      // A cycle can finish with a snapshot taken before an owner paused it.
+      // Preserve the control without dropping the cycle's diagnostic results.
+      return this.#writeState({ ...state, paused: current.paused,
+        revision: Math.max(current.revision, state.revision ?? 0) }, { bumpRevision });
+    });
+  }
+
+  async #writeState(state, { bumpRevision = true } = {}) {
     const normalized = normalizeLifecycleState(state);
     const next = {
       ...normalized,

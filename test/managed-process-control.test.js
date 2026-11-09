@@ -9,6 +9,8 @@ import {
   stat,
 } from "node:fs/promises";
 import http from "node:http";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -371,6 +373,28 @@ test("a drain timeout publishes failure and retains the authoritative writer lea
   assertAuthenticatedReceipt(terminal, identity);
   assert.equal(applicationCloses, 0);
   assert.equal(leaseCloses, 0);
+});
+
+test("a full diagnostics disk cannot throw into background work and logging recovers", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "managed-log-full-"));
+  const append = fs.appendFileSync;
+  let full = true;
+  const mocked = t.mock.method(fs, "appendFileSync", (...args) => {
+    if (full) throw Object.assign(new Error("disk is full"), { code: "ENOSPC" });
+    return append(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(async () => { mocked.mock.restore(); syncBuiltinESMExports(); await rm(directory, { recursive: true, force: true }); });
+  const diagnostics = createManagedFileDiagnostics(directory);
+  assert.doesNotThrow(() => diagnostics.reportError(new Error("background failure")));
+  assert.deepEqual(diagnostics.writeStatus, { droppedRecords: 1, lastErrorCode: "ENOSPC" });
+  full = false;
+  diagnostics.log("service remains controllable");
+  assert.deepEqual(diagnostics.writeStatus, { droppedRecords: 0, lastErrorCode: null });
+  const content = await readFile(diagnostics.logPath, "utf8");
+  assert.match(content, /recovered after 1 dropped record/);
+  assert.match(content, /ENOSPC/);
+  assert.match(content, /service remains controllable/);
 });
 
 test("managed diagnostics rotate during a live process and stay globally bounded", async (t) => {
